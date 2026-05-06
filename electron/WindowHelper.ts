@@ -35,6 +35,11 @@ export class WindowHelper {
   // Constants
   private static readonly OVERLAY_DEFAULT_WIDTH = 600;
   private static readonly OVERLAY_MIN_HEIGHT = 216;
+  // Vertical offset for the meeting overlay's initial position, expressed as
+  // a fraction of the screen's work-area height. 0.035 places the top edge
+  // ~37 px below the work-area top on a 1055-tall display — comfortably
+  // below the menu bar with visible breathing room.
+  private static readonly OVERLAY_DEFAULT_TOP_RATIO = 0.035;
 
   // Movement variables (apply to active window)
   private step: number = 20
@@ -115,8 +120,7 @@ export class WindowHelper {
     const newX = Math.min(Math.max(currentX, workArea.x), maxX)
     const newY = Math.min(Math.max(currentY, workArea.y), maxY)
 
-    this.overlayWindow.setContentSize(newWidth, newHeight)
-    this.overlayWindow.setPosition(newX, newY)
+    this.overlayWindow.setBounds({ x: newX, y: newY, width: newWidth, height: newHeight })
     this.overlayBounds = this.overlayWindow.getBounds()
   }
 
@@ -145,8 +149,10 @@ export class WindowHelper {
     const maxY = workArea.y + workArea.height - newHeight
     const newY = Math.min(Math.max(currentBounds.y, workArea.y), maxY)
 
-    this.overlayWindow.setContentSize(newWidth, newHeight)
-    this.overlayWindow.setPosition(newX, newY)
+    // Atomic frame change: a single setBounds avoids the 1-frame split where
+    // the OS window has the new size but the old origin (or vice versa), which
+    // is what causes the shell to visibly slide and snap during code-expansion.
+    this.overlayWindow.setBounds({ x: newX, y: newY, width: newWidth, height: newHeight })
     this.overlayBounds = this.overlayWindow.getBounds()
   }
 
@@ -261,8 +267,7 @@ export class WindowHelper {
     // will also fall back to centered logic — but providing explicit x/y in the
     // constructor is the only reliable guard against OS-level position persistence.
     const overlayDefaultX = Math.floor(workArea.x + (workArea.width - WindowHelper.OVERLAY_DEFAULT_WIDTH) / 2);
-    // Use original vertical offset calculation that positions the overlay higher
-    const overlayDefaultY = Math.floor(workArea.y + (workArea.height - WindowHelper.OVERLAY_DEFAULT_WIDTH) / 2);
+    const overlayDefaultY = Math.floor(workArea.y + workArea.height * WindowHelper.OVERLAY_DEFAULT_TOP_RATIO);
 
     const overlaySettings: Electron.BrowserWindowConstructorOptions = {
       width: WindowHelper.OVERLAY_DEFAULT_WIDTH,
@@ -296,6 +301,13 @@ export class WindowHelper {
       this.overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
       this.overlayWindow.setHiddenInMissionControl(true)
       this.overlayWindow.setAlwaysOnTop(true, "floating")
+    } else if (process.platform === "win32") {
+      // 'floating' level (HWND_TOPMOST baseline) is not enough to render above
+      // fullscreen browser windows (F11). 'screen-saver' uses a higher TOPMOST
+      // priority that wins against window-mode fullscreen apps. macOS uses
+      // visibleOnFullScreen above; Windows has no equivalent flag, so the level
+      // itself is what controls fullscreen visibility. See issue #167.
+      this.overlayWindow.setAlwaysOnTop(true, "screen-saver")
     }
 
     this.overlayWindow.loadURL(`${startUrl}?window=overlay`).catch(e => {
@@ -389,6 +401,20 @@ export class WindowHelper {
           this.showContextMenu(this.overlayWindow!, point);
         }
       });
+
+      // Re-assert always-on-top on blur (Windows only). Screen-sharing tools
+      // (Zoom, Lark, Teams, etc.) hook the DWM compositor and can demote even
+      // HWND_TOPMOST windows below their shared content layer. Re-applying the
+      // 'screen-saver' level on every blur keeps the overlay above the share
+      // surface. Skipped on macOS — re-asserting setAlwaysOnTop there triggers
+      // [NSApp activate], which steals focus from the underlying app. See #130.
+      if (process.platform === 'win32') {
+        this.overlayWindow.on('blur', () => {
+          if (!this.overlayWindow || this.overlayWindow.isDestroyed()) return;
+          if (!this.overlayWindow.isVisible()) return;
+          this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+        });
+      }
 
       this.overlayWindow.on('close', (e) => {
         if (this.overlayWindow?.isVisible()) {
@@ -496,7 +522,7 @@ export class WindowHelper {
     // switchToOverlay(). Must come before show()/showInactive() so the window
     // lands at the correct level on first paint (issue #136).
     if (process.platform === 'win32') {
-      this.overlayWindow.setAlwaysOnTop(true, 'floating');
+      this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
     }
 
     if (this.appState.getOverlayMousePassthrough()) {
@@ -587,7 +613,7 @@ export class WindowHelper {
           }
         : {
             x: Math.floor(workArea.x + (workArea.width - WindowHelper.OVERLAY_DEFAULT_WIDTH) / 2),
-            y: Math.floor(workArea.y + (workArea.height - WindowHelper.OVERLAY_DEFAULT_WIDTH) / 2),
+            y: Math.floor(workArea.y + workArea.height * WindowHelper.OVERLAY_DEFAULT_TOP_RATIO),
             width: WindowHelper.OVERLAY_DEFAULT_WIDTH,
             height: Math.max(Math.min(currentBounds.height, maxAllowedHeight), WindowHelper.OVERLAY_MIN_HEIGHT)
           };
@@ -608,7 +634,7 @@ export class WindowHelper {
           if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
             this.overlayWindow.setOpacity(1);
             // Re-assert z-order on Windows — DWM can silently demote the HWND after hide/show
-            this.overlayWindow.setAlwaysOnTop(true, 'floating');
+            this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
             if (!inactive) this.overlayWindow.focus();
           }
         }, 60);
@@ -623,7 +649,7 @@ export class WindowHelper {
         // Skipped on macOS — calling setAlwaysOnTop triggers [NSApp activate] which
         // steals focus from Zoom/browser even when showInactive() was used.
         if (process.platform === 'win32') {
-          this.overlayWindow.setAlwaysOnTop(true, 'floating');
+          this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
         }
         if (inactive) this.overlayWindow.showInactive(); else this.overlayWindow.show();
         // Only grab focus for explicit user-initiated shows (not shortcut/ghost shows)

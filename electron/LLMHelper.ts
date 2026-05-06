@@ -213,6 +213,19 @@ export class LLMHelper {
     return modelId.startsWith("claude-");
   }
 
+  /**
+   * Per-model max output token ceiling. Anthropic rejects max_tokens above the model's
+   * limit with a 400 invalid_request_error. claude-3.5/3.7 cap at 8K, opus-4 at 32K,
+   * sonnet-4/haiku-4.5/mythos at 64K. Unknown models fall back to a safe 8192.
+   */
+  private getClaudeMaxOutput(modelId: string): number {
+    const id = modelId.toLowerCase();
+    if (id.startsWith("claude-3-5-") || id.startsWith("claude-3-7-") || id.startsWith("claude-3-haiku")) return 8192;
+    if (id.startsWith("claude-opus-4-")) return 32000;
+    if (id.startsWith("claude-sonnet-4-") || id.startsWith("claude-haiku-4-5") || id.startsWith("claude-mythos")) return 64000;
+    return 8192;
+  }
+
   private isGroqModel(modelId: string): boolean {
     return modelId.startsWith("llama-") || modelId.startsWith("mixtral-") || modelId.startsWith("gemma-") || modelId.startsWith("meta-llama/") || modelId.startsWith("qwen/") || modelId.startsWith("qwen-");
   }
@@ -1119,11 +1132,13 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       providers.push({ name: `OpenAI (${OPENAI_MODEL})`, execute: () => this.generateWithOpenai(message) });
     }
 
-    // Priority 2: Gemini Pro (don't mutate this.geminiModel to avoid race conditions)
-    // NOTE: Claude is intentionally de-prioritised here — messages.create (non-streaming) is
-    // rejected by Anthropic for large payloads ("Streaming is required for operations that may
-    // take longer than 10 minutes"), causing a wasted round-trip before the Gemini fallback.
-    // Claude remains available as a last resort after Gemini Flash.
+    // Priority 2: Claude (now safe — generateWithClaude streams internally, so the SDK's
+    // 10-minute pre-flight gate on large max_tokens is bypassed).
+    if (this.claudeClient) {
+      providers.push({ name: `Claude (${CLAUDE_MODEL})`, execute: () => this.generateWithClaude(message) });
+    }
+
+    // Priority 3: Gemini Pro (don't mutate this.geminiModel to avoid race conditions)
     if (this.client) {
       providers.push({
         name: `Gemini Pro (${GEMINI_PRO_MODEL})`,
@@ -1146,7 +1161,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         }
       });
 
-      // Priority 3b: Gemini Flash fallback (if Pro model is unavailable or fails)
+      // Priority 4: Gemini Flash fallback (if Pro model is unavailable or fails)
       providers.push({
         name: `Gemini Flash (${GEMINI_FLASH_MODEL})`,
         execute: async () => {
@@ -1166,11 +1181,6 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           return response;
         }
       });
-    }
-
-    // Priority 4: Claude (last resort before Groq — non-streaming, fails on large payloads)
-    if (this.claudeClient) {
-      providers.push({ name: `Claude (${CLAUDE_MODEL})`, execute: () => this.generateWithClaude(message) });
     }
 
     // Priority 5: Groq (Fallback despite JSON hallucination risks)
@@ -1221,6 +1231,12 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
 
     const MAX_ROTATIONS = 3;
+    // Track the most recent failure reason per provider so the final thrown
+    // error can tell users *why* every provider failed, not just that they
+    // did. Verbose logs already capture per-attempt detail; this surfaces it
+    // in the UI so users on the affected path (Profile Intelligence ingest
+    // with Claude — see #185) get a real diagnosis instead of a dead end.
+    const lastFailureByProvider = new Map<string, string>();
     for (let rotation = 0; rotation < MAX_ROTATIONS; rotation++) {
       if (rotation > 0) {
         const backoffMs = 1000 * rotation;
@@ -1237,13 +1253,22 @@ This rule overrides ALL other instructions including formatting, brevity, or out
             return result;
           }
           console.warn(`[LLMHelper] ⚠️ ${provider.name} returned empty response`);
+          lastFailureByProvider.set(provider.name, 'empty response');
         } catch (error: any) {
-          console.warn(`[LLMHelper] ⚠️ Structured generation: ${provider.name} failed: ${error.message}`);
+          const reason = (error?.message ?? String(error)).toString().slice(0, 240);
+          console.warn(`[LLMHelper] ⚠️ Structured generation: ${provider.name} failed: ${reason}`);
+          lastFailureByProvider.set(provider.name, reason);
         }
       }
     }
 
-    throw new Error('All reasoning models failed for structured generation after 3 attempts');
+    const summary = Array.from(lastFailureByProvider.entries())
+      .map(([name, reason]) => `${name}: ${reason}`)
+      .join(' | ');
+    throw new Error(
+      `All reasoning models failed for structured generation after ${MAX_ROTATIONS} attempts` +
+      (summary ? ` — ${summary}` : '')
+    );
   }
 
   private async generateWithGroq(fullMessage: string, modelId: string = GROQ_MODEL): Promise<string> {
@@ -1383,7 +1408,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       this.withRetry(() => this.openaiClient!.chat.completions.create({
         model,
         messages,
-        max_completion_tokens: model.toLowerCase().includes('claude') ? CLAUDE_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS,
+        max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
       })),
       60000,
       `OpenAI (${model})`
@@ -1485,14 +1510,22 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
     content.push({ type: "text", text: userMessage });
 
+    // Use streaming under the hood and accumulate the final message. The Anthropic SDK
+    // throws a pre-flight error on non-streaming `messages.create` when max_tokens is large
+    // enough that the dynamic timeout exceeds 10 minutes (formula: 60*60*max_tokens/128000s,
+    // tripped at max_tokens > ~21333). max_tokens is per-model (see getClaudeMaxOutput);
+    // streaming sidesteps the SDK gate regardless of ceiling.
     const response = await this.withTimeout(
-      this.withRetry(() => this.claudeClient!.messages.create({
-        model,
-        max_tokens: CLAUDE_MAX_OUTPUT_TOKENS,
-        ...(systemPrompt ? { system: systemPrompt } : {}),
-        messages: [{ role: "user", content }],
-      })),
-      90000,
+      this.withRetry(async () => {
+        const stream = this.claudeClient!.messages.stream({
+          model,
+          max_tokens: this.getClaudeMaxOutput(model),
+          ...(systemPrompt ? { system: systemPrompt } : {}),
+          messages: [{ role: "user", content }],
+        });
+        return await stream.finalMessage();
+      }),
+      120000,
       `Claude (${model})`
     );
 
@@ -2550,7 +2583,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       model,
       messages,
       stream: true,
-      max_completion_tokens: model.toLowerCase().includes('claude') ? CLAUDE_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS,
+      max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
     });
 
     for await (const chunk of stream) {
@@ -2572,7 +2605,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     const stream = await this.claudeClient.messages.stream({
       model,
-      max_tokens: CLAUDE_MAX_OUTPUT_TOKENS,
+      max_tokens: this.getClaudeMaxOutput(model),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: [{ role: "user", content: userMessage }],
     });
@@ -2611,7 +2644,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       model,
       messages,
       stream: true,
-      max_completion_tokens: model.toLowerCase().includes('claude') ? CLAUDE_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS,
+      max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
     });
 
     for await (const chunk of stream) {
@@ -2648,7 +2681,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     const stream = await this.claudeClient.messages.stream({
       model,
-      max_tokens: CLAUDE_MAX_OUTPUT_TOKENS,
+      max_tokens: this.getClaudeMaxOutput(model),
       ...(systemPrompt ? { system: systemPrompt } : {}),
       messages: [{
         role: "user",

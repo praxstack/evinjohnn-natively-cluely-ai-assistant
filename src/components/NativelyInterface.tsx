@@ -96,6 +96,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         const stored = localStorage.getItem('natively_interviewer_transcript');
         return stored !== 'false';
     });
+    const [autoScroll, setAutoScroll] = useState(() => {
+        const stored = localStorage.getItem('natively_auto_scroll');
+        return stored === 'true';
+    });
 
     // Analytics State
     const requestStartTimeRef = useRef<number | null>(null);
@@ -110,6 +114,26 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         return () => window.removeEventListener('storage', handleStorage);
     }, []);
 
+    // Sync auto-scroll setting
+    useEffect(() => {
+        const handleStorage = () => {
+            const stored = localStorage.getItem('natively_auto_scroll');
+            setAutoScroll(stored === 'true');
+        };
+        window.addEventListener('storage', handleStorage);
+        return () => window.removeEventListener('storage', handleStorage);
+    }, []);
+
+    // Auto-scroll to bottom on every messages update when toggle is enabled.
+    // 'auto' (instant) instead of 'smooth' is intentional: streaming tokens fire
+    // this effect tens of times per second; smooth would restart the animation
+    // each time and never reach bottom, producing visible chase/jitter.
+    useEffect(() => {
+        if (!autoScroll) return;
+        if (messages.length === 0) return;
+        messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+    }, [messages, autoScroll]);
+
     const [rollingTranscript, setRollingTranscript] = useState('');  // For interviewer rolling text bar
     const [isInterviewerSpeaking, setIsInterviewerSpeaking] = useState(false);  // Track if actively speaking
     const [voiceInput, setVoiceInput] = useState('');  // Accumulated user voice input
@@ -119,11 +143,22 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
-    const isMotionAnimatingRef = useRef(false);
     const rafDimUpdateRef = useRef<number | null>(null);
     const codeExpandedRef = useRef(false);
-    const animationSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const animationControlsRef = useRef<ReturnType<typeof animate> | null>(null);
+    // Stability gate for code-visibility transitions. Scroll fires at ~60Hz;
+    // without this, fast scrolls cancel and restart the 0.7s tween repeatedly,
+    // producing stutter (and sometimes a snap when start≈target). The pending
+    // visibility must hold its new state for STABILITY_MS before we commit to
+    // a transition.
+    const stableVisibilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const pendingVisibilityRef = useRef<boolean | null>(null);
+    // Sticky-bottom across expand/contract. Captured at the start of each
+    // transition: if the chat was scrolled to (or within 8 px of) the bottom,
+    // the rAF loop pins scrollTop to bottom on every spring frame so the
+    // bottom of the conversation stays visually pinned as scrollMaxH grows.
+    // iMessage does the same when its window resizes.
+    const wasAtBottomRef = useRef<boolean>(true);
     // Captures data from onCaptureAndProcess before the React state flush so
     // handleWhatToSay() can access it even in React 18 concurrent mode (where
     // a plain setTimeout(0) may fire before setAttachedContext flushes).
@@ -189,10 +224,34 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
     const controlSurfaceClass = 'overlay-control-surface overlay-text-interactive';
 
     // ── Code-expansion spring ────────────────────────────────────────────────
-    // shellWidth is animated directly via animate() so spring physics and the
-    // onComplete callback live in the same call — no useSpring wrapper needed.
-    const shellWidth = useMotionValue(600);
-    const scrollMaxH = useTransform(shellWidth, [600, 780], [320, 560]);
+    // Architecture: stable canvas, renderer-only animation.
+    //
+    // The OS window is pinned to STABLE_OVERLAY_WIDTH for the entire chat-
+    // expanded session — its width never changes when code becomes visible or
+    // hidden. The shell width animates 600 ↔ 780 purely in renderer CSS via a
+    // Framer spring. mx-auto centers the shell against a STABLE 780 parent, so
+    // its margin animates symmetrically (90 → 0 on expand, 0 → 90 on contract).
+    //
+    // Why this anchors the TopPill to its screen position:
+    //   • OS window X never moves during code expand/contract (no IPC).
+    //   • OS window content area is always 780 wide.
+    //   • TopPill and shell sit in a flex column centered horizontally inside
+    //     that stable canvas → TopPill's screen X is invariant of the spring.
+    //   • OS window Y is preserved by setBounds → TopPill's screen Y is fixed.
+    //   • Shell height growth is driven by content; ResizeObserver feeds height
+    //     (only) to the OS, which extends downward (Y preserved).
+    //
+    // The 90px transparent gutters on each side when shellWidth == 600 are
+    // invisible (window background is transparent) and click-through.
+    const SHELL_WIDTH_COLLAPSED = 600;
+    const SHELL_WIDTH_EXPANDED = 780;
+    const STABLE_OVERLAY_WIDTH = SHELL_WIDTH_EXPANDED;
+    const shellWidth = useMotionValue(SHELL_WIDTH_COLLAPSED);
+    const scrollMaxH = useTransform(shellWidth, [SHELL_WIDTH_COLLAPSED, SHELL_WIDTH_EXPANDED], [320, 560]);
+
+    // isExpanded mirror for closures inside refs/observers that must not
+    // re-bind on every toggle.
+    const isExpandedRef = useRef(true);
 
     useEffect(() => {
         // Load the persisted default model (not the runtime model)
@@ -284,28 +343,41 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         };
     }, []);
 
-    // Auto-resize Window
-    // rAF-debounced so Framer Motion's 60fps spring never floods the Electron main
-    // process with setBounds calls. During the expand animation the flag is set and
-    // the observer is fully suppressed; the OS window is pre-sized before the spring
-    // starts. During contraction the flag is clear so the observer follows the spring.
+    // Keep the closure-free isExpanded mirror in sync.
+    useEffect(() => { isExpandedRef.current = isExpanded; }, [isExpanded]);
+
+    // Single canonical size-reporter. While the chat overlay is expanded we
+    // pin the OS window to STABLE_OVERLAY_WIDTH (=SHELL_WIDTH_EXPANDED) so the
+    // shell can spring 600↔780 in renderer CSS without ever resizing the OS
+    // window — no IPC race, no clip, no jump. Centered IPC is used so the
+    // first chat-mode entry (when the OS window may grow from a smaller mode
+    // into the stable canvas) keeps the TopPill's center fixed; subsequent
+    // height-only updates have widthDelta=0 and don't shift X.
+    const reportShellSize = useCallback(() => {
+        if (!contentRef.current) return;
+        const rect = contentRef.current.getBoundingClientRect();
+        const width = isExpandedRef.current ? STABLE_OVERLAY_WIDTH : Math.ceil(rect.width);
+        const height = Math.ceil(rect.height);
+        const api = window.electronAPI as any;
+        if (api?.updateContentDimensionsCentered) {
+            api.updateContentDimensionsCentered({ width, height });
+        } else {
+            window.electronAPI?.updateContentDimensions({ width, height });
+        }
+    }, [STABLE_OVERLAY_WIDTH]);
+
+    // ResizeObserver: rAF-debounced so the spring can update height without
+    // flooding IPC. Width is constant in expanded mode, so per-frame updates
+    // only carry height changes — no race with the renderer's CSS spring.
     useLayoutEffect(() => {
         if (!contentRef.current) return;
 
-        const flush = () => {
-            rafDimUpdateRef.current = null;
-            if (!contentRef.current) return;
-            const rect = contentRef.current.getBoundingClientRect();
-            window.electronAPI?.updateContentDimensions({
-                width: Math.ceil(rect.width),
-                height: Math.ceil(rect.height)
-            });
-        };
-
         const observer = new ResizeObserver(() => {
-            if (isMotionAnimatingRef.current) return;
             if (rafDimUpdateRef.current) cancelAnimationFrame(rafDimUpdateRef.current);
-            rafDimUpdateRef.current = requestAnimationFrame(flush);
+            rafDimUpdateRef.current = requestAnimationFrame(() => {
+                rafDimUpdateRef.current = null;
+                reportShellSize();
+            });
         });
 
         observer.observe(contentRef.current);
@@ -316,169 +388,88 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
                 rafDimUpdateRef.current = null;
             }
         };
-    }, []);
+    }, [reportShellSize]);
 
-    // Force resize when attachedContext changes (screenshots added/removed).
-    // If the code-expansion spring is mid-animation, the CSS shell width is an
-    // intermediate value — passing the measured rect.width to setOverlayDimensions
-    // would fight the pre-sized OS window and produce a visible width glitch.
-    // Use the expansion target width instead so only the height is live-updated.
+    // attachedContext (screenshots add/remove) and initial-sizing safety:
+    // both just re-run the canonical reporter — no more "what width should I
+    // use right now?" branching against animation flags.
     useEffect(() => {
-        if (!contentRef.current) return;
-        requestAnimationFrame(() => {
-            if (!contentRef.current) return;
-            const rect = contentRef.current.getBoundingClientRect();
-            const w = isMotionAnimatingRef.current
-                ? (codeExpandedRef.current ? 780 : 600)
-                : Math.ceil(rect.width);
-            window.electronAPI?.updateContentDimensions({ width: w, height: Math.ceil(rect.height) });
-        });
-    }, [attachedContext]);
+        const id = requestAnimationFrame(reportShellSize);
+        return () => cancelAnimationFrame(id);
+    }, [attachedContext, reportShellSize]);
 
-    // Initial sizing safety check — same animation-gate rule as above.
     useEffect(() => {
-        const timer = setTimeout(() => {
-            if (contentRef.current) {
-                const rect = contentRef.current.getBoundingClientRect();
-                const w = isMotionAnimatingRef.current
-                    ? (codeExpandedRef.current ? 780 : 600)
-                    : Math.ceil(rect.width);
-                window.electronAPI?.updateContentDimensions({ width: w, height: Math.ceil(rect.height) });
-            }
-        }, 600);
+        const timer = setTimeout(reportShellSize, 600);
         return () => clearTimeout(timer);
-    }, []);
+    }, [reportShellSize]);
 
     // ── Code-expansion ──────────────────────────────────────────────────────
-    // IPC helper — sends OS window dimensions exactly once per transition.
-    // Called before the spring starts (expand) or after it settles (contract).
-    const syncOSWindow = useCallback((targetWidth: number, targetHeight?: number) => {
-        if (!contentRef.current) return;
-        const h = targetHeight ?? Math.ceil(contentRef.current.getBoundingClientRect().height);
-        window.electronAPI?.updateContentDimensions({ width: targetWidth, height: h });
-    }, []);
+    // The shell's width animates 600↔780 with a renderer-only spring against a
+    // STABLE 780-wide OS canvas. mx-auto on the wrapper distributes the width
+    // delta as symmetric horizontal margin → expansion grows from the center,
+    // TopPill stays anchored, no IPC during the animation. Height growth is
+    // picked up by the ResizeObserver and forwarded to the OS as height-only
+    // updates (width is unchanged so no X shift, no jump).
+    const startTransition = useCallback((targetWidth: number) => {
+        codeExpandedRef.current = targetWidth === SHELL_WIDTH_EXPANDED;
+        if (animationControlsRef.current) animationControlsRef.current.stop();
 
-    // Centered variant — keeps the shell's horizontal center fixed across width
-    // changes. Pairs with mx-auto on contentRef: when OS window grows by Δ, X
-    // shifts by -Δ/2 and mx-auto adds Δ/2 margin, so net shell shift = 0.
-    const syncOSWindowCentered = useCallback((targetWidth: number, targetHeight?: number) => {
-        if (!contentRef.current) return;
-        const h = targetHeight ?? Math.ceil(contentRef.current.getBoundingClientRect().height);
-        const api = window.electronAPI as any;
-        if (api?.updateContentDimensionsCentered) {
-            api.updateContentDimensionsCentered({ width: targetWidth, height: h });
-        } else {
-            // Fallback for stale preload (dev hot-reload before electron rebuild)
-            window.electronAPI?.updateContentDimensions({ width: targetWidth, height: h });
+        // iMessage-style sticky bottom. Capture the user's scroll intent now,
+        // before scrollMaxH starts changing. If they were at (or near) the
+        // bottom, we keep them pinned there throughout the spring so growing
+        // viewport height doesn't reveal stale history below the visible chat.
+        // If they were scrolled up to read history, we leave their position
+        // alone — the extra viewport extends downward into empty space, which
+        // is the correct behavior for a reader.
+        const container = scrollContainerRef.current;
+        if (container) {
+            const distanceFromBottom = container.scrollHeight - (container.scrollTop + container.clientHeight);
+            wasAtBottomRef.current = distanceFromBottom <= 8;
         }
-    }, []);
+
+        // Symmetric ease-in-out-cubic. Smooth ramp on both ends — no perceived
+        // velocity break at the start or finish, which is what makes a width
+        // animation read as "buttery" rather than "snappy". The cubic poly
+        // is gentle enough that the 1px-per-frame motion at the edges is
+        // visually subliminal at 60Hz, eliminating the "settle" jitter you
+        // get with steeper ease-out curves on width-driven reflow.
+        animationControlsRef.current = animate(shellWidth, targetWidth, {
+            type: 'tween' as const,
+            ease: [0.65, 0, 0.35, 1],
+            duration: 0.7,
+            onUpdate: () => {
+                if (!wasAtBottomRef.current) return;
+                const c = scrollContainerRef.current;
+                if (!c) return;
+                // scrollMaxH is derived from shellWidth, so on every tick the
+                // viewport height has just changed. Re-pin to bottom in the
+                // SAME frame — single layout read, single write, no flush.
+                c.scrollTop = c.scrollHeight - c.clientHeight;
+            },
+            onComplete: () => { animationControlsRef.current = null; },
+        });
+    }, [shellWidth, SHELL_WIDTH_EXPANDED]);
 
     // Scan [data-code-msg] elements and check if any intersect the scroll container
     // viewport. Called on every scroll event and after every messages update.
+    // Uses a stability gate: the visibility must hold its new state for
+    // STABILITY_MS before a transition fires. This filters out the rapid
+    // visible↔invisible flicker that occurs when a code block crosses the
+    // viewport edge during a fast scroll, which would otherwise interrupt
+    // the 0.7s tween mid-flight and cause stutter.
+    const STABILITY_MS = 120;
     const checkCodeVisibility = useCallback(() => {
         const container = scrollContainerRef.current;
 
-        // Kick off a spring transition to targetWidth.
-        // Uses animate() directly on the MotionValue so we get:
-        //   • onComplete — fires exactly when the spring settles (no guessed timeout)
-        //   • identity guard — stale onComplete from a cancelled animation is a no-op
-        //   • fallback timer — in case onComplete doesn't fire (unmount race)
-        const startTransition = (targetWidth: 600 | 780) => {
-            codeExpandedRef.current = targetWidth === 780;
-            isMotionAnimatingRef.current = true;
-
-            if (animationControlsRef.current) animationControlsRef.current.stop();
-            if (animationSettleTimerRef.current) {
-                clearTimeout(animationSettleTimerRef.current);
-                animationSettleTimerRef.current = null;
-            }
-
-            // ────────────────────────────────────────────────────────────────
-            // Top-pill-fixed expansion strategy
-            // ────────────────────────────────────────────────────────────────
-            // The shell's outer wrapper (contentRef) uses `mx-auto w-fit`, so
-            // it auto-centers within the OS window's content area. To keep the
-            // top pill VISUALLY ANCHORED across the resize:
-            //
-            //   1. Resize OS window CENTERED (X shifts by -widthDelta/2)
-            //   2. mx-auto compensates by adding +widthDelta/2 margin to shell
-            //   → net horizontal shell movement = 0 ✓
-            //
-            // We pre-size the OS window to the FINAL dimensions ONCE before
-            // the spring starts. Then the CSS spring animates shell width
-            // freely INSIDE the now-fixed OS window. mx-auto margins shrink
-            // as the shell grows — visual effect: shell expands symmetrically
-            // from its center while the OS window never moves again.
-            //
-            // Y is naturally top-anchored: setOverlayDimensions* preserves
-            // currentBounds.y, so height growth happens entirely at the bottom.
-            const curH = contentRef.current
-                ? Math.ceil(contentRef.current.getBoundingClientRect().height)
-                : 0;
-            // Expand: 260px headroom (scrollMaxH grows 320→560 = 240px + 20 buffer)
-            // so the bottom doesn't clip mid-spring.
-            const finalH = targetWidth === 780 ? curH + 260 : curH;
-
-            if (targetWidth === 780) {
-                // EXPAND: pre-size OS window to final width AND tall height in
-                // one centered call. mx-auto compensates the X shift; the
-                // height grows downward into transparent space (invisible).
-                syncOSWindowCentered(780, finalH);
-            }
-            // CONTRACT: do nothing here. OS window stays at 780×tallH while the
-            // CSS spring contracts the shell from 780→600 inside it. mx-auto
-            // grows margins symmetrically as the shell shrinks — sides retract
-            // toward the center. Bottom rises via scrollMaxH transform. After
-            // the spring settles, we snap the OS window to final 600 below.
-
-            // Critical-damped spring (ζ=1.0): fastest possible settle (~200ms)
-            // with zero overshoot. stiffness↑ = snappier; damping tuned to ζ=1.
-            const controls = animate(shellWidth, targetWidth, {
-                type: 'spring' as const,
-                stiffness: 500,
-                damping: 40,
-                mass: 0.8,
-                // No onUpdate: OS window already at correct geometry. Per-frame
-                // IPC would only introduce desync between the renderer's CSS
-                // reflow and the main process's window resize.
-                onComplete: () => {
-                    if (animationControlsRef.current !== controls) return;
-                    animationControlsRef.current = null;
-                    if (animationSettleTimerRef.current) {
-                        clearTimeout(animationSettleTimerRef.current);
-                        animationSettleTimerRef.current = null;
-                    }
-                    isMotionAnimatingRef.current = false;
-                    if (codeExpandedRef.current) {
-                        // Expand settle: width unchanged (780→780, widthDelta=0,
-                        // no X shift). Just tighten the height to actual content.
-                        syncOSWindow(780);
-                    } else {
-                        // Contract settle: width 780→600. Use centered so X
-                        // shifts +90, mx-auto loses its 90px margin in lockstep,
-                        // shell stays exactly where it was = no jump.
-                        syncOSWindowCentered(600);
-                    }
-                },
-            });
-            animationControlsRef.current = controls;
-
-            // Fallback: covers unmount-mid-spring race where onComplete doesn't fire.
-            animationSettleTimerRef.current = setTimeout(() => {
-                animationSettleTimerRef.current = null;
-                isMotionAnimatingRef.current = false;
-                if (codeExpandedRef.current) {
-                    syncOSWindow(780);
-                } else {
-                    syncOSWindowCentered(600);
-                }
-            }, 350);
-        };
-
         // Scroll container unmounted (session reset / messages cleared) — force
-        // contraction so the OS window doesn't stay at 780px with no content.
+        // contraction so the shell returns to its collapsed width.
         if (!container) {
-            if (codeExpandedRef.current) startTransition(600);
+            if (stableVisibilityTimerRef.current) {
+                clearTimeout(stableVisibilityTimerRef.current);
+                stableVisibilityTimerRef.current = null;
+            }
+            pendingVisibilityRef.current = null;
+            if (codeExpandedRef.current) startTransition(SHELL_WIDTH_COLLAPSED);
             return;
         }
 
@@ -492,8 +483,33 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
             }
         }
 
-        if (visible !== codeExpandedRef.current) startTransition(visible ? 780 : 600);
-    }, [shellWidth, syncOSWindow, syncOSWindowCentered]);
+        // Already in the correct state — clear any pending change so a
+        // mid-flight tween isn't interrupted by a stale timer firing.
+        if (visible === codeExpandedRef.current) {
+            pendingVisibilityRef.current = null;
+            if (stableVisibilityTimerRef.current) {
+                clearTimeout(stableVisibilityTimerRef.current);
+                stableVisibilityTimerRef.current = null;
+            }
+            return;
+        }
+
+        // State change detected. If we're already waiting on the SAME pending
+        // change, let the timer continue ticking — don't reset it on every
+        // scroll frame, or fast scroll would never let the timer fire.
+        if (pendingVisibilityRef.current === visible) return;
+
+        pendingVisibilityRef.current = visible;
+        if (stableVisibilityTimerRef.current) clearTimeout(stableVisibilityTimerRef.current);
+        stableVisibilityTimerRef.current = setTimeout(() => {
+            stableVisibilityTimerRef.current = null;
+            const target = pendingVisibilityRef.current;
+            pendingVisibilityRef.current = null;
+            if (target !== null && target !== codeExpandedRef.current) {
+                startTransition(target ? SHELL_WIDTH_EXPANDED : SHELL_WIDTH_COLLAPSED);
+            }
+        }, STABILITY_MS);
+    }, [startTransition, SHELL_WIDTH_COLLAPSED, SHELL_WIDTH_EXPANDED]);
 
     // Re-check after every messages update (catches mid-stream code fences).
     useEffect(() => {
@@ -503,11 +519,29 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
     // Re-attach scroll listener whenever messages change — the scroll container
     // is conditionally rendered so scrollContainerRef.current is null at mount.
+    //
+    // The visibility check does layout reads (querySelectorAll +
+    // getBoundingClientRect on every code element). Running it synchronously
+    // on every scroll event forces a layout flush mid-scroll-frame, which
+    // shows up as text jitter during fast scrolls. rAF-coalescing it ensures
+    // at most one check per frame and lets the read happen at the natural
+    // post-scroll layout point in the frame lifecycle.
     useEffect(() => {
         const container = scrollContainerRef.current;
         if (!container) return;
-        container.addEventListener('scroll', checkCodeVisibility, { passive: true });
-        return () => container.removeEventListener('scroll', checkCodeVisibility);
+        let rafId: number | null = null;
+        const onScroll = () => {
+            if (rafId !== null) return;
+            rafId = requestAnimationFrame(() => {
+                rafId = null;
+                checkCodeVisibility();
+            });
+        };
+        container.addEventListener('scroll', onScroll, { passive: true });
+        return () => {
+            container.removeEventListener('scroll', onScroll);
+            if (rafId !== null) cancelAnimationFrame(rafId);
+        };
     }, [messages, checkCodeVisibility]);
 
     // Cancel all in-flight async work on unmount.
@@ -515,14 +549,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         return () => {
             animationControlsRef.current?.stop();
             animationControlsRef.current = null;
-            if (animationSettleTimerRef.current) {
-                clearTimeout(animationSettleTimerRef.current);
-                animationSettleTimerRef.current = null;
-            }
             if (rafDimUpdateRef.current) {
                 cancelAnimationFrame(rafDimUpdateRef.current);
                 rafDimUpdateRef.current = null;
             }
+            if (stableVisibilityTimerRef.current) {
+                clearTimeout(stableVisibilityTimerRef.current);
+                stableVisibilityTimerRef.current = null;
+            }
+            pendingVisibilityRef.current = null;
         };
     }, []);
     // ────────────────────────────────────────────────────────────────────────
@@ -733,6 +768,34 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
         cleanups.push(window.electronAPI.onIntelligenceSuggestedAnswerToken((data) => {
             // Progressive update for 'what_to_answer' mode
+            // Mirrors the guard in onGeminiStreamToken: if this token is the negotiation
+            // coaching JSON sentinel, accumulate the raw JSON silently so the Done handler
+            // can convert it to the card UI. Without this, the raw JSON leaks into the
+            // chat bubble (issue #213).
+            try {
+                const parsed = JSON.parse(data.token);
+                if (parsed?.__negotiationCoaching) {
+                    setMessages(prev => {
+                        const lastMsg = prev[prev.length - 1];
+                        if (lastMsg && lastMsg.isStreaming && lastMsg.intent === 'what_to_answer') {
+                            const updated = [...prev];
+                            updated[prev.length - 1] = { ...lastMsg, text: data.token };
+                            return updated;
+                        }
+                        return [...prev, {
+                            id: Date.now().toString(),
+                            role: 'system',
+                            text: data.token,
+                            intent: 'what_to_answer',
+                            isStreaming: true
+                        }];
+                    });
+                    return;
+                }
+            } catch {
+                // Not JSON — normal token, fall through.
+            }
+
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
 
@@ -759,22 +822,54 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
         cleanups.push(window.electronAPI.onIntelligenceSuggestedAnswer((data) => {
             setIsProcessing(false);
+
+            // If the final answer is a negotiation coaching JSON sentinel, route it
+            // to the proper card UI instead of dumping raw JSON into the message bubble.
+            let isCoaching = false;
+            let coachingData: any = null;
+            try {
+                const parsed = JSON.parse(data.answer);
+                if (parsed?.__negotiationCoaching) {
+                    isCoaching = true;
+                    coachingData = parsed.__negotiationCoaching;
+                }
+            } catch {
+                // Not JSON — normal answer.
+            }
+
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
 
                 // If we were streaming, finalize it
                 if (lastMsg && lastMsg.isStreaming && lastMsg.intent === 'what_to_answer') {
-                    // Start new array to avoid mutation
                     const updated = [...prev];
-                    updated[prev.length - 1] = {
-                        ...lastMsg,
-                        text: data.answer, // Ensure final consistency
-                        isStreaming: false
-                    };
+                    updated[prev.length - 1] = isCoaching
+                        ? {
+                            ...lastMsg,
+                            isStreaming: false,
+                            isNegotiationCoaching: true,
+                            negotiationCoachingData: coachingData,
+                            text: '',
+                        }
+                        : {
+                            ...lastMsg,
+                            text: data.answer, // Ensure final consistency
+                            isStreaming: false
+                        };
                     return updated;
                 }
 
                 // If we missed the stream (or not streaming), append fresh
+                if (isCoaching) {
+                    return [...prev, {
+                        id: Date.now().toString(),
+                        role: 'system',
+                        text: '',
+                        intent: 'what_to_answer',
+                        isNegotiationCoaching: true,
+                        negotiationCoachingData: coachingData,
+                    }];
+                }
                 return [...prev, {
                     id: Date.now().toString(),
                     role: 'system',
@@ -1687,7 +1782,11 @@ Provide only the answer, nothing else.`;
                                                     {lang || 'CODE'}
                                                 </span>
                                             </div>
-                                            <div className="bg-transparent">
+                                            {/* No-wrap horizontal scroll: code line layout stays
+                                                stable as the canvas grows/shrinks. Without this,
+                                                wrapped lines re-flow at every spring tick, the
+                                                block height jitters, and content below it shifts. */}
+                                            <div className="bg-transparent overflow-x-auto">
                                                 <SyntaxHighlighter
                                                     language={lang}
                                                     style={codeTheme}
@@ -1700,7 +1799,7 @@ Provide only the answer, nothing else.`;
                                                         padding: '16px',
                                                         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace'
                                                     }}
-                                                    wrapLongLines={true}
+                                                    wrapLongLines={false}
                                                     showLineNumbers={true}
                                                     lineNumberStyle={{ minWidth: '2.5em', paddingRight: '1.2em', color: codeLineNumberColor, textAlign: 'right', fontSize: '11px' }}
                                                 >
@@ -1842,7 +1941,11 @@ Provide only the answer, nothing else.`;
                                                 </span>
                                             </div>
 
-                                            <div className="bg-transparent">
+                                            {/* No-wrap horizontal scroll: code line layout stays
+                                                stable as the canvas grows/shrinks. Without this,
+                                                wrapped lines re-flow at every spring tick, the
+                                                block height jitters, and content below it shifts. */}
+                                            <div className="bg-transparent overflow-x-auto">
                                                 <SyntaxHighlighter
                                                     language={lang}
                                                     style={codeTheme}
@@ -1855,7 +1958,7 @@ Provide only the answer, nothing else.`;
                                                         padding: '16px',
                                                         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace'
                                                     }}
-                                                    wrapLongLines={true}
+                                                    wrapLongLines={false}
                                                     showLineNumbers={true}
                                                     lineNumberStyle={{ minWidth: '2.5em', paddingRight: '1.2em', color: codeLineNumberColor, textAlign: 'right', fontSize: '11px' }}
                                                 >
@@ -1941,6 +2044,91 @@ Provide only the answer, nothing else.`;
     };
 
     useEffect(() => {
+        // ── Continuous, frame-rate-independent scroll with momentum ──
+        // Velocity is integrated against real elapsed time so 60Hz, 120Hz, and
+        // dropped-frame paths all produce the same physical speed. While a key
+        // is held we ease velocity up to TERMINAL; on release we decay it
+        // exponentially, which is what makes the stop feel weighted instead of
+        // snapped. Sub-pixel motion is preserved via a fractional accumulator,
+        // and we write `scrollTop` directly to bypass any browser scroll-behavior
+        // smoothing that would fight the loop.
+        const TERMINAL_VELOCITY = 1400;   // px/s at full hold
+        const ACCEL_SECONDS = 0.18;       // time to reach terminal from rest
+        const DECAY_HALF_LIFE = 0.09;     // seconds for velocity to halve after release
+        const DECAY_K = Math.LN2 / DECAY_HALF_LIFE;
+        const MIN_VELOCITY = 6;           // px/s — snap to 0 below this
+        const MAX_FRAME_DT = 0.05;        // clamp to absorb tab-throttle hiccups
+
+        let direction: -1 | 0 | 1 = 0;    // -1 up, 0 idle, 1 down (or both up+down → 0)
+        let upHeld = false;
+        let downHeld = false;
+        let velocity = 0;                 // signed px/s
+        let positionFraction = 0;         // sub-pixel accumulator
+        let lastTs = 0;
+        let rafId: number | null = null;
+
+        const recomputeDirection = () => {
+            direction = upHeld === downHeld ? 0 : upHeld ? -1 : 1;
+        };
+
+        const tick = (ts: number) => {
+            const container = scrollContainerRef.current;
+            if (!container) {
+                rafId = null;
+                lastTs = 0;
+                return;
+            }
+            if (lastTs === 0) lastTs = ts;
+            const dt = Math.min((ts - lastTs) / 1000, MAX_FRAME_DT);
+            lastTs = ts;
+
+            if (direction !== 0) {
+                const target = direction * TERMINAL_VELOCITY;
+                const step = (TERMINAL_VELOCITY / ACCEL_SECONDS) * dt;
+                if (Math.abs(target - velocity) <= step) velocity = target;
+                else velocity += Math.sign(target - velocity) * step;
+            } else {
+                velocity *= Math.exp(-DECAY_K * dt);
+                if (Math.abs(velocity) < MIN_VELOCITY) velocity = 0;
+            }
+
+            // Cache layout reads once per frame, then a single scrollTop write.
+            const maxScroll = container.scrollHeight - container.clientHeight;
+            const current = container.scrollTop;
+            const move = velocity * dt + positionFraction;
+            const intMove = Math.trunc(move);
+            positionFraction = move - intMove;
+
+            if (intMove !== 0) {
+                let next = current + intMove;
+                if (next <= 0) {
+                    next = 0;
+                    if (velocity < 0) { velocity = 0; positionFraction = 0; }
+                } else if (next >= maxScroll) {
+                    next = maxScroll;
+                    if (velocity > 0) { velocity = 0; positionFraction = 0; }
+                }
+                if (next !== current) container.scrollTop = next;
+            }
+
+            if (direction !== 0 || velocity !== 0) {
+                rafId = requestAnimationFrame(tick);
+            } else {
+                rafId = null;
+                lastTs = 0;
+                positionFraction = 0;
+            }
+        };
+
+        const startScrollLoop = () => {
+            if (rafId === null) rafId = requestAnimationFrame(tick);
+        };
+        const releaseScroll = () => {
+            upHeld = false;
+            downHeld = false;
+            recomputeDirection();
+        };
+
         const handleKeyDown = (e: KeyboardEvent) => {
             const { handleWhatToSay, handleFollowUp, handleFollowUpQuestions, handleRecap, handleAnswerNow, handleClarify, handleCodeHint, handleBrainstorm } = handlersRef.current;
 
@@ -1975,18 +2163,46 @@ Provide only the answer, nothing else.`;
                 handleBrainstorm();
             } else if (isShortcutPressed(e, 'scrollUp')) {
                 e.preventDefault();
-                scrollContainerRef.current?.scrollBy({ top: -100, behavior: 'smooth' });
+                upHeld = true;
+                recomputeDirection();
+                startScrollLoop();
             } else if (isShortcutPressed(e, 'scrollDown')) {
                 e.preventDefault();
-                scrollContainerRef.current?.scrollBy({ top: 100, behavior: 'smooth' });
+                downHeld = true;
+                recomputeDirection();
+                startScrollLoop();
             } else if (isShortcutPressed(e, 'moveWindowUp') || isShortcutPressed(e, 'moveWindowDown')) {
                 // Prevent default scrolling when moving window
                 e.preventDefault();
             }
         };
 
+        const handleKeyUp = (e: KeyboardEvent) => {
+            // Users typically lift the modifier (Cmd/Ctrl) first, so releasing
+            // either it or the arrow ends the hold and lets momentum decay.
+            if (e.key === 'ArrowUp') {
+                upHeld = false;
+                recomputeDirection();
+            } else if (e.key === 'ArrowDown') {
+                downHeld = false;
+                recomputeDirection();
+            } else if (e.key === 'Meta' || e.key === 'Control') {
+                releaseScroll();
+            }
+        };
+
+        // Window blur swallows keyup; reset to avoid stuck scrolling.
+        const handleBlur = () => releaseScroll();
+
         window.addEventListener('keydown', handleKeyDown);
-        return () => window.removeEventListener('keydown', handleKeyDown);
+        window.addEventListener('keyup', handleKeyUp);
+        window.addEventListener('blur', handleBlur);
+        return () => {
+            window.removeEventListener('keydown', handleKeyDown);
+            window.removeEventListener('keyup', handleKeyUp);
+            window.removeEventListener('blur', handleBlur);
+            if (rafId !== null) cancelAnimationFrame(rafId);
+        };
     }, [isShortcutPressed]);
 
     // General Global Shortcuts (Rebindable)
@@ -2248,7 +2464,7 @@ Provide only the answer, nothing else.`;
                         />
                         <motion.div
                             className={`relative max-w-full backdrop-blur-2xl border rounded-[24px] overflow-hidden flex flex-col draggable-area overlay-shell-surface ${overlayPanelClass}`}
-                            style={{ ...appearance.shellStyle, width: shellWidth, willChange: 'width', transform: 'translateZ(0)' }}
+                            style={{ ...appearance.shellStyle, width: shellWidth, willChange: 'width' }}
                         >
 
 
@@ -2344,14 +2560,33 @@ Provide only the answer, nothing else.`;
                             {/* Chat History - Only show if there are messages OR active states */}
                             {(messages.length > 0 || isManualRecording || isProcessing) && (
                                 <motion.div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 space-y-3 no-drag" style={{ scrollbarWidth: 'none', maxHeight: scrollMaxH }}>
-                                    {messages.map((msg) => (
+                                    {messages.map((msg) => {
+                                        // Every row spans the full inner width of the scroll
+                                        // container, which itself rides the shell's animated
+                                        // width. Bubble max-widths are percentages so the text
+                                        // and code grow with the canvas — same as iMessage /
+                                        // Mail when their windows resize. Reflow during the
+                                        // 700 ms tween is gentle (≈0.3 px / frame width delta)
+                                        // and reads as the canvas "breathing", not jitter.
+                                        // The other polish (sticky bottom, stable code line
+                                        // layout via wrapLongLines:false, stability gate that
+                                        // suppresses transitions during scroll) keeps the
+                                        // motion calm.
+                                        const isCodeMsg = msg.role === 'system' && (msg.isCode || msg.text.includes('```'));
+                                        const bubbleMaxClass = msg.role === 'user'
+                                            ? 'max-w-[72%] px-[13.6px] py-[10.2px]'
+                                            : isCodeMsg
+                                                ? 'max-w-[85%] px-4 py-3'
+                                                : 'max-w-[85%] px-4 py-3';
+                                        return (
                                         <div
                                             key={msg.id}
-                                            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in-up`}
-                                            {...(msg.role === 'system' && (msg.isCode || msg.text.includes('```')) ? { 'data-code-msg': 'true' } : {})}
+                                            className="w-full"
+                                            {...(isCodeMsg ? { 'data-code-msg': 'true' } : {})}
                                         >
+                                        <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in-up`}>
                                             <div className={`
-                      ${msg.role === 'user' ? 'max-w-[72.25%] px-[13.6px] py-[10.2px]' : 'max-w-[85%] px-4 py-3'} text-[14px] leading-relaxed relative group whitespace-pre-wrap
+                      ${bubbleMaxClass} text-[14px] leading-relaxed relative group whitespace-pre-wrap
                       ${msg.role === 'user'
                                                     ? (isLightTheme
                                                         ? 'bg-blue-500/10 backdrop-blur-md border border-blue-500/20 text-blue-900 rounded-[20px] rounded-tr-[4px] shadow-sm font-medium'
@@ -2392,7 +2627,9 @@ Provide only the answer, nothing else.`;
                                                 {renderMessageText(msg)}
                                             </div>
                                         </div>
-                                    ))}
+                                        </div>
+                                        );
+                                    })}
 
                                     {/* Active Recording State with Live Transcription */}
                                     {isManualRecording && (

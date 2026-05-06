@@ -463,6 +463,11 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         return stored !== 'false';
     });
 
+    const [autoScroll, setAutoScroll] = useState(() => {
+        const stored = localStorage.getItem('natively_auto_scroll');
+        return stored === 'true';
+    });
+
     // Recognition Language
     const [recognitionLanguage, setRecognitionLanguage] = useState('');
     const [selectedSttGroup, setSelectedSttGroup] = useState('');
@@ -753,6 +758,16 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         return () => window.removeEventListener('storage', handleStorage);
     }, []);
 
+    // Sync auto-scroll setting
+    useEffect(() => {
+        const handleStorage = () => {
+            const stored = localStorage.getItem('natively_auto_scroll');
+            setAutoScroll(stored === 'true');
+        };
+        window.addEventListener('storage', handleStorage);
+        return () => window.removeEventListener('storage', handleStorage);
+    }, []);
+
     // Theme Handlers
     const handleSetTheme = async (mode: 'system' | 'light' | 'dark') => {
         setThemeMode(mode);
@@ -768,6 +783,15 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [selectedOutput, setSelectedOutput] = useState('');
     const [micLevel, setMicLevel] = useState(0);
     const [useExperimentalSck, setUseExperimentalSck] = useState(false);
+    // Most-recent device fallback notice. Populated by main process via
+    // 'device-selection-applied' IPC when the saved device couldn't be opened
+    // and the audio pipeline silently fell back to the system default.
+    const [deviceFallbackNotice, setDeviceFallbackNotice] = useState<{
+        kind: 'input' | 'output';
+        requested: string | null;
+        actual: string | null;
+        reason?: string;
+    } | null>(null);
 
     // STT Provider settings
     const [sttProvider, setSttProvider] = useState<'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'>('none');
@@ -779,6 +803,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [sttAzureKey, setSttAzureKey] = useState('');
     const [sttAzureRegion, setSttAzureRegion] = useState('eastus');
     const [sttIbmKey, setSttIbmKey] = useState('');
+    const [sttOpenaiBaseUrl, setSttOpenaiBaseUrl] = useState('');
     const [sttTestStatus, setSttTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
     const [sttTestError, setSttTestError] = useState('');
     const [sttSaving, setSttSaving] = useState(false);
@@ -837,6 +862,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                     if (creds.sttAzureKey) setSttAzureKey(creds.sttAzureKey);
                     if (creds.sttIbmKey) setSttIbmKey(creds.sttIbmKey);
                     if (creds.sttSonioxKey) setSttSonioxKey(creds.sttSonioxKey);
+                    if (typeof creds.openAiSttBaseUrl === 'string') setSttOpenaiBaseUrl(creds.openAiSttBaseUrl);
                 }
             } catch (e) {
                 console.error('Failed to load STT settings:', e);
@@ -1048,6 +1074,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
 
     const [calendarStatus, setCalendarStatus] = useState<{ connected: boolean; email?: string }>({ connected: false });
     const [isCalendarsLoading, setIsCalendarsLoading] = useState(false);
+    const [calendarEvents, setCalendarEvents] = useState<Array<{ id: string; title: string; startTime: string; endTime: string; link?: string }>>([]);
+    const [isCalendarRefreshing, setIsCalendarRefreshing] = useState(false);
 
 
     // Load stored credentials on mount
@@ -1160,6 +1188,49 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             }
         }
     }, [isOpen, selectedInput, selectedOutput]); // Re-run if isOpen changes, or if selected devices are cleared
+
+    // Fetch upcoming calendar events while the Calendar tab is open and connected.
+    // Polls every 60s to mirror the Launcher's cadence.
+    useEffect(() => {
+        if (!isOpen || activeTab !== 'calendar' || !calendarStatus.connected) return;
+        if (!window.electronAPI?.getUpcomingEvents) return;
+
+        let cancelled = false;
+        const fetchEvents = () => {
+            window.electronAPI.getUpcomingEvents()
+                .then(events => { if (!cancelled) setCalendarEvents(events || []); })
+                .catch(err => console.error('[Settings] Failed to fetch upcoming events:', err));
+        };
+        fetchEvents();
+        const interval = setInterval(fetchEvents, 60_000);
+        return () => { cancelled = true; clearInterval(interval); };
+    }, [isOpen, activeTab, calendarStatus.connected]);
+
+    // Listen for device-selection-applied so the user can see when their saved
+    // device couldn't be opened and audio fell back to the system default.
+    // Pre-fix this was silent: settings showed "AirPods" selected but capture
+    // was actually using the built-in mic, leaving users to wonder why their
+    // device choice "doesn't work".
+    useEffect(() => {
+        if (!window.electronAPI?.onDeviceSelectionApplied) return;
+        const unsubscribe = window.electronAPI.onDeviceSelectionApplied((payload) => {
+            if (payload.fellBack) {
+                setDeviceFallbackNotice({
+                    kind: payload.kind,
+                    requested: payload.requested,
+                    actual: payload.actual,
+                    reason: payload.reason,
+                });
+            } else {
+                // Successful apply for this kind — clear any stale notice that
+                // pointed at the same channel.
+                setDeviceFallbackNotice(prev =>
+                    prev && prev.kind === payload.kind ? null : prev
+                );
+            }
+        });
+        return unsubscribe;
+    }, []);
 
     // Use the native mic test path so device IDs stay consistent with the meeting runtime.
     useEffect(() => {
@@ -1486,6 +1557,30 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                         className={`w-11 h-6 rounded-full relative transition-colors ${showTranscript ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
                                                     >
                                                         <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${showTranscript ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                    </div>
+                                                </div>
+
+                                                {/* Auto Scroll */}
+                                                <div className="flex items-center justify-between px-4 py-3">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle flex items-center justify-center text-text-tertiary">
+                                                            <ArrowDown size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <h3 className="text-sm font-bold text-text-primary">Auto Scroll</h3>
+                                                            <p className="text-xs text-text-secondary mt-0.5">Automatically scroll to the latest message as new responses arrive</p>
+                                                        </div>
+                                                    </div>
+                                                    <div
+                                                        onClick={() => {
+                                                            const newState = !autoScroll;
+                                                            setAutoScroll(newState);
+                                                            localStorage.setItem('natively_auto_scroll', String(newState));
+                                                            window.dispatchEvent(new Event('storage'));
+                                                        }}
+                                                        className={`w-11 h-6 rounded-full relative transition-colors cursor-pointer ${autoScroll ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                    >
+                                                        <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${autoScroll ? 'translate-x-5' : 'translate-x-0'}`} />
                                                     </div>
                                                 </div>
 
@@ -2073,6 +2168,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                                 const keyMap: Record<string, string> = {
                                                                     groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
                                                                     elevenlabs: sttElevenLabsKey, azure: sttAzureKey, ibmwatson: sttIbmKey,
+                                                                    soniox: sttSonioxKey,
                                                                 };
                                                                 handleSttKeySubmit(sttProvider as any, keyMap[sttProvider] || '');
                                                             }}
@@ -2140,6 +2236,35 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                                 </button>
                                                             </div>
                                                             <p className="text-[10px] text-text-tertiary">e.g. eastus, westeurope, westus2</p>
+                                                        </div>
+                                                    )}
+
+                                                    {/* OpenAI Custom Base URL — for self-hosted OpenAI-compatible servers (e.g. Speaches).
+                                                        When set, the WebSocket Realtime path is skipped and REST is used against the custom host. */}
+                                                    {sttProvider === 'openai' && (
+                                                        <div className="space-y-1.5">
+                                                            <label className="text-xs font-medium text-text-secondary block">Custom Base URL <span className="text-text-tertiary">(optional)</span></label>
+                                                            <div className="flex gap-2">
+                                                                <input
+                                                                    type="text"
+                                                                    value={sttOpenaiBaseUrl}
+                                                                    onChange={(e) => setSttOpenaiBaseUrl(e.target.value)}
+                                                                    placeholder="https://api.openai.com (default)"
+                                                                    className="flex-1 bg-bg-input border border-border-subtle rounded-lg px-3 py-2 text-sm text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-primary transition-colors"
+                                                                />
+                                                                <button
+                                                                    onClick={async () => {
+                                                                        // @ts-ignore
+                                                                        await window.electronAPI?.setOpenAiSttBaseUrl?.(sttOpenaiBaseUrl.trim());
+                                                                        setSttSaved(true);
+                                                                        setTimeout(() => setSttSaved(false), 2000);
+                                                                    }}
+                                                                    className="px-5 py-2.5 rounded-lg text-xs font-medium bg-bg-input hover:bg-bg-input/80 border border-border-subtle text-text-primary transition-colors"
+                                                                >
+                                                                    Save
+                                                                </button>
+                                                            </div>
+                                                            <p className="text-[10px] text-text-tertiary">Point at any OpenAI-compatible server (e.g. Speaches). Custom servers use REST only — Realtime WebSocket is skipped. Leave blank for default.</p>
                                                         </div>
                                                     )}
 
@@ -2239,6 +2364,40 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                     <div>
                                         <h3 className="text-lg font-bold text-text-primary mb-1">Audio Configuration</h3>
                                         <p className="text-xs text-text-secondary mb-5">Manage input and output devices.</p>
+
+                                        {/* Device-fallback banner: shown when main process couldn't
+                                            open the selected device and silently used the default. */}
+                                        {deviceFallbackNotice && (
+                                            <div className="mb-4 flex items-start gap-2.5 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/20">
+                                                <AlertCircle size={14} className="text-amber-400 shrink-0 mt-0.5" />
+                                                <div className="min-w-0 flex-1">
+                                                    <p className="text-xs text-amber-200/90 leading-snug">
+                                                        Selected {deviceFallbackNotice.kind === 'input' ? 'microphone' : 'output device'}
+                                                        {deviceFallbackNotice.requested ? ` "${deviceFallbackNotice.requested}"` : ''} couldn't be opened
+                                                        — using <span className="font-medium">{deviceFallbackNotice.actual ?? 'no device'}</span> instead.
+                                                    </p>
+                                                    {deviceFallbackNotice.reason && (
+                                                        <p className="text-[11px] text-amber-200/60 mt-1 font-mono break-all">{deviceFallbackNotice.reason}</p>
+                                                    )}
+                                                </div>
+                                                <button
+                                                    onClick={() => {
+                                                        // Clear stale localStorage so the next meeting starts clean.
+                                                        if (deviceFallbackNotice.kind === 'input') {
+                                                            localStorage.removeItem('preferredInputDeviceId');
+                                                            setSelectedInput('default');
+                                                        } else {
+                                                            localStorage.removeItem('preferredOutputDeviceId');
+                                                            setSelectedOutput('default');
+                                                        }
+                                                        setDeviceFallbackNotice(null);
+                                                    }}
+                                                    className="shrink-0 text-[11px] font-medium text-amber-400 hover:text-amber-300 transition-colors px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25"
+                                                >
+                                                    Reset
+                                                </button>
+                                            </div>
+                                        )}
 
                                         <div className="space-y-4">
                                             <CustomSelect
@@ -2370,40 +2529,220 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                         <p className="text-xs text-text-secondary mb-4">Upcoming meetings are synchronized from these calendars</p>
                                     </div>
 
-                                    <div className="bg-bg-card rounded-xl p-6 border border-border-subtle flex flex-col items-start gap-4">
+                                    <div className="bg-bg-card rounded-xl border border-border-subtle overflow-hidden">
                                         {calendarStatus.connected ? (
-                                            <div className="w-full flex items-center justify-between">
-                                                <div className="flex items-center gap-4">
-                                                    <div className="w-10 h-10 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-500">
-                                                        <Calendar size={20} />
+                                            <>
+                                                {/* Connection header */}
+                                                <div className="p-6 flex items-center justify-between">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-500">
+                                                            <Calendar size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <h4 className="text-sm font-medium text-text-primary">Google Calendar</h4>
+                                                            <p className="text-xs text-text-secondary">Connected as {calendarStatus.email || 'User'}</p>
+                                                        </div>
                                                     </div>
-                                                    <div>
-                                                        <h4 className="text-sm font-medium text-text-primary">Google Calendar</h4>
-                                                        <p className="text-xs text-text-secondary">Connected as {calendarStatus.email || 'User'}</p>
-                                                    </div>
+
+                                                    <button
+                                                        onClick={async () => {
+                                                            setIsCalendarsLoading(true);
+                                                            try {
+                                                                await window.electronAPI.calendarDisconnect();
+                                                                const status = await window.electronAPI.getCalendarStatus();
+                                                                setCalendarStatus(status);
+                                                                setCalendarEvents([]);
+                                                            } catch (e) {
+                                                                console.error(e);
+                                                            } finally {
+                                                                setIsCalendarsLoading(false);
+                                                            }
+                                                        }}
+                                                        disabled={isCalendarsLoading}
+                                                        className="px-3 py-1.5 bg-bg-input hover:bg-bg-elevated border border-border-subtle text-text-primary rounded-md text-xs font-medium transition-colors"
+                                                    >
+                                                        {isCalendarsLoading ? 'Disconnecting...' : 'Disconnect'}
+                                                    </button>
                                                 </div>
 
-                                                <button
-                                                    onClick={async () => {
-                                                        setIsCalendarsLoading(true);
-                                                        try {
-                                                            await window.electronAPI.calendarDisconnect();
-                                                            const status = await window.electronAPI.getCalendarStatus();
-                                                            setCalendarStatus(status);
-                                                        } catch (e) {
-                                                            console.error(e);
-                                                        } finally {
-                                                            setIsCalendarsLoading(false);
-                                                        }
-                                                    }}
-                                                    disabled={isCalendarsLoading}
-                                                    className="px-3 py-1.5 bg-bg-input hover:bg-bg-elevated border border-border-subtle text-text-primary rounded-md text-xs font-medium transition-colors"
-                                                >
-                                                    {isCalendarsLoading ? 'Disconnecting...' : 'Disconnect'}
-                                                </button>
-                                            </div>
+                                                {/* Upcoming section — masterpiece treatment, same parent card backdrop */}
+                                                <div className="relative border-t border-white/[0.05]">
+                                                    {/* Ambient mesh — soft cool radial behind the list, pointer-events-none */}
+                                                    <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                                                        <div className="absolute -top-20 -left-10 w-[260px] h-[260px] bg-blue-500/[0.06] blur-[90px]" />
+                                                        <div className="absolute -bottom-24 right-0 w-[220px] h-[220px] bg-violet-500/[0.04] blur-[80px]" />
+                                                    </div>
+
+                                                    {/* Section header */}
+                                                    <div className="relative px-6 pt-5 pb-3 flex items-end justify-between">
+                                                        <div className="space-y-2">
+                                                            <span className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 bg-white/[0.04] ring-1 ring-white/[0.06] text-[9px] font-medium tracking-[0.22em] text-text-secondary uppercase shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                                                                <span className="w-1 h-1 rounded-full bg-emerald-400/80" />
+                                                                Upcoming
+                                                            </span>
+                                                            <p className="text-[11px] text-text-tertiary tracking-[0.01em]">
+                                                                {calendarEvents.length > 0
+                                                                    ? `${calendarEvents.length} ${calendarEvents.length === 1 ? 'meeting' : 'meetings'} · next 7 days`
+                                                                    : 'next 7 days from your primary calendar'}
+                                                            </p>
+                                                        </div>
+                                                        <button
+                                                            onClick={async () => {
+                                                                if (!window.electronAPI?.calendarRefresh) return;
+                                                                setIsCalendarRefreshing(true);
+                                                                try {
+                                                                    await window.electronAPI.calendarRefresh();
+                                                                    const events = await window.electronAPI.getUpcomingEvents();
+                                                                    setCalendarEvents(events || []);
+                                                                } catch (e) {
+                                                                    console.error(e);
+                                                                } finally {
+                                                                    setIsCalendarRefreshing(false);
+                                                                }
+                                                            }}
+                                                            disabled={isCalendarRefreshing}
+                                                            aria-label="Refresh upcoming events"
+                                                            className="group h-8 w-8 rounded-full bg-white/[0.04] hover:bg-white/[0.08] ring-1 ring-white/[0.07] text-text-secondary hover:text-text-primary transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] active:scale-[0.92] flex items-center justify-center shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                                                        >
+                                                            <RefreshCw
+                                                                size={12}
+                                                                className={`transition-transform duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] ${isCalendarRefreshing ? 'animate-spin' : 'group-hover:rotate-[60deg]'}`}
+                                                            />
+                                                        </button>
+                                                    </div>
+
+                                                    {calendarEvents.length === 0 ? (
+                                                        /* Empty state — composed, not a placeholder */
+                                                        <div className="relative px-6 pt-2 pb-7">
+                                                            <div className="rounded-[1.25rem] p-[1px] bg-gradient-to-b from-white/[0.06] to-white/[0.02]">
+                                                                <div className="rounded-[calc(1.25rem-1px)] bg-bg-card/50 backdrop-blur-md ring-1 ring-white/[0.04] px-6 py-9 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                                                                    <div className="mx-auto w-11 h-11 rounded-2xl bg-white/[0.04] ring-1 ring-white/[0.06] flex items-center justify-center mb-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+                                                                        <Calendar size={18} className="text-text-tertiary" strokeWidth={1.5} />
+                                                                    </div>
+                                                                    <p className="text-[13px] text-text-primary tracking-[-0.01em]">Nothing scheduled.</p>
+                                                                    <p className="text-[11px] text-text-tertiary mt-1">Your week is clear for now.</p>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    ) : (
+                                                        <ul className="relative px-3 pb-4 space-y-1.5">
+                                                            {calendarEvents.map(ev => {
+                                                                const start = new Date(ev.startTime);
+                                                                const end = new Date(ev.endTime);
+                                                                const now = new Date();
+                                                                const tomorrow = new Date(now.getTime() + 86400000);
+                                                                const isToday = start.toDateString() === now.toDateString();
+                                                                const isTomorrow = start.toDateString() === tomorrow.toDateString();
+
+                                                                const diffMs = start.getTime() - now.getTime();
+                                                                const diffMin = diffMs / 60000;
+                                                                const durationMin = Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
+                                                                const durationLabel = durationMin >= 60
+                                                                    ? `${Math.floor(durationMin / 60)}h${durationMin % 60 ? ` ${durationMin % 60}m` : ''}`
+                                                                    : `${durationMin}m`;
+
+                                                                // Urgency-tinted accent for the time chip
+                                                                let chipTone: { text: string; ring: string; bg: string };
+                                                                if (diffMin <= 30) chipTone = { text: 'text-red-300', ring: 'ring-red-400/25', bg: 'bg-red-500/[0.08]' };
+                                                                else if (diffMin <= 4 * 60) chipTone = { text: 'text-amber-200', ring: 'ring-amber-300/25', bg: 'bg-amber-400/[0.08]' };
+                                                                else chipTone = { text: 'text-text-secondary', ring: 'ring-white/[0.06]', bg: 'bg-white/[0.04]' };
+
+                                                                // Smart relative label
+                                                                let chipLabel: string;
+                                                                if (diffMin <= 0) chipLabel = 'Now';
+                                                                else if (diffMin < 60) chipLabel = `in ${Math.ceil(diffMin)}m`;
+                                                                else if (diffMin < 4 * 60) {
+                                                                    const h = Math.floor(diffMin / 60);
+                                                                    const m = Math.round(diffMin - h * 60);
+                                                                    chipLabel = m > 0 ? `in ${h}h ${m}m` : `in ${h}h`;
+                                                                } else if (isToday) chipLabel = 'Today';
+                                                                else if (isTomorrow) chipLabel = 'Tomorrow';
+                                                                else chipLabel = start.toLocaleDateString([], { weekday: 'short' });
+
+                                                                const timeRange = `${start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+
+                                                                // Boarding-pass style date stub
+                                                                const dayNum = start.getDate();
+                                                                const monthAbbrev = start.toLocaleDateString([], { month: 'short' }).toUpperCase();
+
+                                                                // Provider detection
+                                                                let provider: string | null = null;
+                                                                if (ev.link) {
+                                                                    const u = ev.link.toLowerCase();
+                                                                    if (u.includes('meet.google.com')) provider = 'Meet';
+                                                                    else if (u.includes('zoom.us')) provider = 'Zoom';
+                                                                    else if (u.includes('teams.microsoft.com')) provider = 'Teams';
+                                                                    else if (u.includes('webex.com')) provider = 'Webex';
+                                                                }
+
+                                                                return (
+                                                                    <li
+                                                                        key={ev.id}
+                                                                        className="group/row relative rounded-[1.1rem] p-[1px] bg-gradient-to-b from-white/[0.06] to-white/[0.015] transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] hover:from-white/[0.1] hover:to-white/[0.03]"
+                                                                    >
+                                                                        <div className="relative rounded-[calc(1.1rem-1px)] bg-bg-card/40 backdrop-blur-md ring-1 ring-white/[0.04] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] flex items-stretch gap-3 pl-3 pr-3 py-3 transition-colors duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] group-hover/row:bg-bg-card/60">
+                                                                            {/* Date stub — boarding-pass style */}
+                                                                            <div className="shrink-0 w-12 flex flex-col items-center justify-center rounded-[0.85rem] bg-white/[0.03] ring-1 ring-white/[0.05] py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                                                                                <span className="text-[9px] font-medium uppercase tracking-[0.16em] text-text-tertiary leading-none">
+                                                                                    {monthAbbrev}
+                                                                                </span>
+                                                                                <span className="text-[20px] font-semibold tracking-[-0.02em] text-text-primary tabular-nums leading-none mt-1">
+                                                                                    {dayNum}
+                                                                                </span>
+                                                                            </div>
+
+                                                                            {/* Body */}
+                                                                            <div className="min-w-0 flex-1 flex flex-col justify-center">
+                                                                                <div className="flex items-center gap-2 mb-1">
+                                                                                    <span className={`shrink-0 inline-flex items-center rounded-full px-1.5 py-[1px] text-[9px] font-medium tracking-[0.06em] ring-1 ${chipTone.bg} ${chipTone.text} ${chipTone.ring} tabular-nums`}>
+                                                                                        {chipLabel}
+                                                                                    </span>
+                                                                                    {provider && (
+                                                                                        <span className="shrink-0 inline-flex items-center rounded-full px-1.5 py-[1px] text-[9px] font-medium tracking-[0.06em] bg-white/[0.04] text-text-secondary ring-1 ring-white/[0.05]">
+                                                                                            {provider}
+                                                                                        </span>
+                                                                                    )}
+                                                                                </div>
+                                                                                <h4 className="text-[13.5px] font-medium text-text-primary tracking-[-0.01em] leading-snug truncate [text-wrap:balance]">
+                                                                                    {ev.title}
+                                                                                </h4>
+                                                                                <p className="text-[11px] text-text-tertiary tabular-nums mt-0.5">
+                                                                                    <span className="text-text-secondary">{timeRange}</span>
+                                                                                    <span className="mx-1.5 opacity-50">·</span>
+                                                                                    <span>{durationLabel}</span>
+                                                                                </p>
+                                                                            </div>
+
+                                                                            {/* Trailing action — magnetic button */}
+                                                                            {ev.link ? (
+                                                                                <a
+                                                                                    href={ev.link}
+                                                                                    target="_blank"
+                                                                                    rel="noopener noreferrer"
+                                                                                    title={ev.link}
+                                                                                    className="self-center shrink-0 group/btn inline-flex items-center gap-1.5 rounded-full pl-3 pr-1.5 py-1.5 bg-white/[0.05] hover:bg-white/[0.1] ring-1 ring-white/[0.07] text-text-primary text-[11px] font-medium transition-all duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] active:scale-[0.97] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                                                                                >
+                                                                                    <span>Join</span>
+                                                                                    <span className="w-5 h-5 rounded-full bg-white/[0.08] ring-1 ring-white/[0.08] flex items-center justify-center transition-transform duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] group-hover/btn:translate-x-[1px] group-hover/btn:-translate-y-[1px]">
+                                                                                        <ExternalLink size={9} strokeWidth={2} />
+                                                                                    </span>
+                                                                                </a>
+                                                                            ) : (
+                                                                                <span
+                                                                                    aria-label="No meeting link"
+                                                                                    className="self-center shrink-0 inline-flex items-center justify-center w-2 h-2 rounded-full bg-white/[0.08] mr-3"
+                                                                                />
+                                                                            )}
+                                                                        </div>
+                                                                    </li>
+                                                                );
+                                                            })}
+                                                        </ul>
+                                                    )}
+                                                </div>
+                                            </>
                                         ) : (
-                                            <div className="w-full py-4">
+                                            <div className="w-full p-6">
                                                 <div className="mb-4">
                                                     <Calendar size={24} className="text-text-tertiary mb-3" />
                                                     <h4 className="text-sm font-bold text-text-primary mb-1">No calendars</h4>
