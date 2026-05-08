@@ -139,6 +139,7 @@ export interface ElectronAPI {
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
   onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => () => void
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean }) => void) => () => void
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => () => void
@@ -195,6 +196,10 @@ export interface ElectronAPI {
   onIntelligenceAssistUpdate: (callback: (data: { insight: string }) => void) => () => void
   onIntelligenceSuggestedAnswerToken: (callback: (data: { token: string; question: string; confidence: number }) => void) => () => void
   onIntelligenceSuggestedAnswer: (callback: (data: { answer: string; question: string; confidence: number }) => void) => () => void
+  // Sprint 7: dedicated negotiation-coaching channel.
+  onIntelligenceNegotiationCoaching: (callback: (data: { payload: any }) => void) => () => void
+  // Sprint 9: time-batched IPC token channel.
+  onIntelligenceTokenBatch: (callback: (data: { kind: 'suggested_answer' | 'refined_answer' | 'recap' | 'clarify' | 'follow_up_questions'; items: any[] }) => void) => () => void
   onIntelligenceRefinedAnswerToken: (callback: (data: { token: string; intent: string }) => void) => () => void
   onIntelligenceRefinedAnswer: (callback: (data: { answer: string; intent: string }) => void) => () => void
   onIntelligenceFollowUpQuestionsUpdate: (callback: (data: { questions: string }) => void) => () => void

@@ -114,6 +114,7 @@ interface ElectronAPI {
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
   onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => () => void
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean }) => void) => () => void
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => () => void
@@ -148,6 +149,14 @@ interface ElectronAPI {
   onIntelligenceManualResult: (callback: (data: { answer: string; question: string }) => void) => () => void
   onIntelligenceModeChanged: (callback: (data: { mode: string }) => void) => () => void
   onIntelligenceError: (callback: (data: { error: string; mode: string }) => void) => () => void
+  // Sprint 7: dedicated negotiation-coaching channel. Replaces the
+  // sentinel-string multiplex through suggested_answer_token / suggested_answer.
+  onIntelligenceNegotiationCoaching: (callback: (data: { payload: any }) => void) => () => void
+  // Sprint 9: time-batched IPC token channel. Carries a batch of streaming
+  // tokens for ANY of the 5 streaming kinds in one IPC send. Replaces
+  // per-token sends to the 5 individual channels (which still exist as
+  // unused defense-in-depth bridges).
+  onIntelligenceTokenBatch: (callback: (data: { kind: 'suggested_answer' | 'refined_answer' | 'recap' | 'clarify' | 'follow_up_questions'; items: any[] }) => void) => () => void
 
   // Model Management
   getDefaultModel: () => Promise<{ model: string }>
@@ -696,6 +705,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on('device-selection-applied', subscription);
     return () => { ipcRenderer.removeListener('device-selection-applied', subscription); };
   },
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean }) => void) => {
+    const subscription = (_: any, payload: any) => callback(payload);
+    ipcRenderer.on('audio-capture-failed', subscription);
+    return () => { ipcRenderer.removeListener('audio-capture-failed', subscription); };
+  },
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => {
@@ -773,6 +787,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("intelligence-suggested-answer", subscription)
     return () => {
       ipcRenderer.removeListener("intelligence-suggested-answer", subscription)
+    }
+  },
+  // Sprint 7: dedicated negotiation-coaching channel.
+  onIntelligenceNegotiationCoaching: (callback: (data: { payload: any }) => void) => {
+    const subscription = (_: any, data: any) => callback(data)
+    ipcRenderer.on("intelligence-negotiation-coaching", subscription)
+    return () => {
+      ipcRenderer.removeListener("intelligence-negotiation-coaching", subscription)
+    }
+  },
+  // Sprint 9: time-batched IPC token channel.
+  onIntelligenceTokenBatch: (callback: (data: { kind: string; items: any[] }) => void) => {
+    const subscription = (_: any, data: any) => callback(data)
+    ipcRenderer.on("intelligence-token-batch", subscription)
+    return () => {
+      ipcRenderer.removeListener("intelligence-token-batch", subscription)
     }
   },
   onIntelligenceRefinedAnswerToken: (callback: (data: { token: string; intent: string }) => void) => {
