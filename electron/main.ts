@@ -382,7 +382,9 @@ export class AppState {
           actionId === 'chat:brainstorm' ||
           actionId === 'chat:dynamicAction4' ||
           actionId === 'chat:scrollUp' ||
-          actionId === 'chat:scrollDown'
+          actionId === 'chat:scrollDown' ||
+          actionId === 'chat:scrollLeft' ||
+          actionId === 'chat:scrollRight'
         ) {
           const actionMap: Record<string, string> = {
             'chat:whatToAnswer': 'whatToAnswer',
@@ -394,6 +396,8 @@ export class AppState {
             'chat:dynamicAction4': 'dynamicAction4',
             'chat:scrollUp': 'scrollUp',
             'chat:scrollDown': 'scrollDown',
+            'chat:scrollLeft': 'scrollLeft',
+            'chat:scrollRight': 'scrollRight',
           };
           const action = actionMap[actionId];
           // Send to all windows without focusing — stealth operation
@@ -462,6 +466,14 @@ export class AppState {
         llmHelper.setGroqFastTextMode(true);
         console.log('[AppState] Fast mode restored from settings');
       }
+      llmHelper.setCodexCliConfig({
+        enabled: !!settingsManager.get('codexCliEnabled'),
+        path: settingsManager.get('codexCliPath') || 'codex',
+        model: settingsManager.get('codexCliModel') || 'gpt-5.4',
+        fastModel: settingsManager.get('codexCliFastModel') || 'gpt-5.3-codex-spark',
+        timeoutMs: settingsManager.get('codexCliTimeoutMs') || 60_000,
+        sandboxMode: settingsManager.get('codexCliSandboxMode') || 'read-only',
+      });
       // Restore custom notes for non-premium path
       try {
         const savedNotes = DatabaseManager.getInstance().getCustomNotes();
@@ -3522,6 +3534,14 @@ async function initializeApp() {
 
   // Explicitly load credentials into helpers
   appState.processingHelper.loadStoredCredentials();
+
+  // Seed the un-deletable General mode once at startup. Idempotent.
+  try {
+    const { ModesManager } = require('./services/ModesManager');
+    ModesManager.getInstance().ensureSeeded();
+  } catch (err) {
+    console.warn('[Init] ModesManager.ensureSeeded threw (non-fatal):', err);
+  }
 
   // Initialize IPC handlers before window creation
   initializeIpcHandlers(appState)

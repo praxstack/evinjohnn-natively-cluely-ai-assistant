@@ -11,6 +11,12 @@ export interface AppSettings {
     verboseLogging?: boolean;
     actionButtonMode?: 'recap' | 'brainstorm';
     groqFastTextMode?: boolean;
+    codexCliEnabled?: boolean;
+    codexCliPath?: string;
+    codexCliModel?: string;
+    codexCliFastModel?: string;
+    codexCliTimeoutMs?: number;
+    codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
     knowledgeMode?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;

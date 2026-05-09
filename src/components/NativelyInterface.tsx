@@ -45,6 +45,7 @@ import { analytics, detectProviderType } from '../lib/analytics/analytics.servic
 import { useShortcuts } from '../hooks/useShortcuts';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { getOverlayAppearance, OVERLAY_OPACITY_DEFAULT } from '../lib/overlayAppearance';
+import { getCodexCliModelDisplayName } from '../utils/modelUtils';
 
 interface Message {
     id: string;
@@ -1076,50 +1077,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
 
         cleanups.push(window.electronAPI.onIntelligenceSuggestedAnswerToken((data) => {
-            // Progressive update for 'what_to_answer' mode
-            // Mirrors the guard in onGeminiStreamToken: if this token is the negotiation
-            // coaching JSON sentinel, accumulate the raw JSON silently so the Done handler
-            // can convert it to the card UI. Without this, the raw JSON leaks into the
-            // chat bubble (issue #213).
-            //
-            // PERF: gate the JSON.parse with a cheap prefix check. The sentinel always
-            // arrives as a single token whose JSON form starts with `{"__negotiationCoaching"`.
-            // Without the gate we'd JSON.parse + throw on every regular text token (~400/answer).
-            const tok = data.token;
-            const looksLikeSentinel = tok.length > 24 && tok.charCodeAt(0) === 123 /* { */ && tok.includes('__negotiationCoaching');
-            try {
-                const parsed = looksLikeSentinel ? JSON.parse(tok) : null;
-                if (parsed?.__negotiationCoaching) {
-                    // Discard any pending batched text — sentinel REPLACES the
-                    // streaming row's text, so flushing buffered chars onto it
-                    // would corrupt the JSON the final-answer handler parses.
-                    tokenBufRef.current.text = '';
-                    if (tokenBufRef.current.raf !== null) {
-                        cancelAnimationFrame(tokenBufRef.current.raf);
-                        tokenBufRef.current.raf = null;
-                    }
-                    setMessages(prev => {
-                        const lastMsg = prev[prev.length - 1];
-                        if (lastMsg && lastMsg.isStreaming && lastMsg.intent === 'what_to_answer') {
-                            const updated = [...prev];
-                            updated[prev.length - 1] = { ...lastMsg, text: data.token };
-                            return updated;
-                        }
-                        return [...prev, {
-                            id: Date.now().toString(),
-                            role: 'system',
-                            text: data.token,
-                            intent: 'what_to_answer',
-                            isStreaming: true
-                        }];
-                    });
-                    return;
-                }
-            } catch {
-                // Not JSON — normal token, fall through.
-            }
-
-            // PERF: rAF-coalesce instead of per-token setMessages.
+            // Coaching now arrives via onIntelligenceNegotiationCoaching only —
+            // sentinel detection on this stream has been removed.
             queueToken('what_to_answer', data.token);
         }));
 
@@ -1130,57 +1089,21 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
             flushToken();
             setIsProcessing(false);
 
-            // If the final answer is a negotiation coaching JSON sentinel, route it
-            // to the proper card UI instead of dumping raw JSON into the message bubble.
-            let isCoaching = false;
-            let coachingData: any = null;
-            try {
-                const parsed = JSON.parse(data.answer);
-                if (parsed?.__negotiationCoaching) {
-                    isCoaching = true;
-                    coachingData = parsed.__negotiationCoaching;
-                }
-            } catch {
-                // Not JSON — normal answer.
-            }
-
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
-
-                // If we were streaming, finalize it
                 if (lastMsg && lastMsg.isStreaming && lastMsg.intent === 'what_to_answer') {
                     const updated = [...prev];
-                    updated[prev.length - 1] = isCoaching
-                        ? {
-                            ...lastMsg,
-                            isStreaming: false,
-                            isNegotiationCoaching: true,
-                            negotiationCoachingData: coachingData,
-                            text: '',
-                        }
-                        : {
-                            ...lastMsg,
-                            text: data.answer, // Ensure final consistency
-                            isStreaming: false
-                        };
+                    updated[prev.length - 1] = {
+                        ...lastMsg,
+                        text: data.answer,
+                        isStreaming: false
+                    };
                     return updated;
-                }
-
-                // If we missed the stream (or not streaming), append fresh
-                if (isCoaching) {
-                    return [...prev, {
-                        id: Date.now().toString(),
-                        role: 'system',
-                        text: '',
-                        intent: 'what_to_answer',
-                        isNegotiationCoaching: true,
-                        negotiationCoachingData: coachingData,
-                    }];
                 }
                 return [...prev, {
                     id: Date.now().toString(),
                     role: 'system',
-                    text: data.answer,  // Plain text, no markdown - ready to speak
+                    text: data.answer,
                     intent: 'what_to_answer'
                 }];
             });
@@ -1621,30 +1544,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
         // Stream Token
         cleanups.push(window.electronAPI.onGeminiStreamToken((token) => {
-            // Guard: if this token is the negotiation coaching JSON sentinel, accumulate it
-            // silently. The JSON is always emitted as a single complete `yield JSON.stringify(...)`
-            // call, so one parse attempt is sufficient. The onGeminiStreamDone handler will
-            // detect the accumulated JSON and render the proper card UI — we just prevent the
-            // raw JSON characters from ever appearing in the chat bubble.
-            try {
-                const parsed = JSON.parse(token);
-                if (parsed?.__negotiationCoaching) {
-                    // Store the raw JSON text (Done handler needs it) but don't show it.
-                    setMessages(prev => {
-                        const lastMsg = prev[prev.length - 1];
-                        if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
-                            const updated = [...prev];
-                            updated[prev.length - 1] = { ...lastMsg, text: token };
-                            return updated;
-                        }
-                        return prev;
-                    });
-                    return; // Skip the normal append below
-                }
-            } catch {
-                // Not JSON — normal text token, fall through to the standard append.
-            }
-
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
                 if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
@@ -1682,21 +1581,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
                 if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
-                    // Detect negotiation coaching response
-                    try {
-                        const parsed = JSON.parse(lastMsg.text);
-                        if (parsed?.__negotiationCoaching) {
-                            const coaching = parsed.__negotiationCoaching;
-                            return [...prev.slice(0, -1), {
-                                ...lastMsg,
-                                isStreaming: false,
-                                isNegotiationCoaching: true,
-                                negotiationCoachingData: coaching,
-                                text: '',
-                            }];
-                        }
-                    } catch { }
-                    // Normal completion
                     return [...prev.slice(0, -1), { ...lastMsg, isStreaming: false }];
                 }
                 return prev;
@@ -1733,27 +1617,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         // JIT RAG Stream listeners (for live meeting RAG responses)
         if (window.electronAPI.onRAGStreamChunk) {
             cleanups.push(window.electronAPI.onRAGStreamChunk((data: { chunk: string }) => {
-                // Same guard as onGeminiStreamToken: suppress raw JSON if this chunk is
-                // the negotiation coaching sentinel. The onRAGStreamComplete handler will
-                // convert it to the proper card UI.
-                try {
-                    const parsed = JSON.parse(data.chunk);
-                    if (parsed?.__negotiationCoaching) {
-                        setMessages(prev => {
-                            const lastMsg = prev[prev.length - 1];
-                            if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
-                                const updated = [...prev];
-                                updated[prev.length - 1] = { ...lastMsg, text: data.chunk };
-                                return updated;
-                            }
-                            return prev;
-                        });
-                        return; // Skip normal append
-                    }
-                } catch {
-                    // Normal text chunk — fall through.
-                }
-
                 setMessages(prev => {
                     const lastMsg = prev[prev.length - 1];
                     if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
@@ -1777,21 +1640,6 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
                 setMessages(prev => {
                     const lastMsg = prev[prev.length - 1];
                     if (lastMsg && lastMsg.isStreaming && lastMsg.role === 'system') {
-                        // Detect negotiation coaching response
-                        try {
-                            const parsed = JSON.parse(lastMsg.text);
-                            if (parsed?.__negotiationCoaching) {
-                                const coaching = parsed.__negotiationCoaching;
-                                return [...prev.slice(0, -1), {
-                                    ...lastMsg,
-                                    isStreaming: false,
-                                    isNegotiationCoaching: true,
-                                    negotiationCoachingData: coaching,
-                                    text: '',
-                                }];
-                            }
-                        } catch { }
-                        // Normal completion
                         return [...prev.slice(0, -1), { ...lastMsg, isStreaming: false }];
                     }
                     if (lastMsg && lastMsg.isStreaming) {
@@ -2619,6 +2467,127 @@ Provide only the answer, nothing else.`;
         return unsubscribe;
     }, []);
 
+    // Inertial-scroll engine. Each globalShortcut fire kicks velocity on one
+    // axis; a single RAF loop integrates position with friction. A lone tap
+    // glides ~250ms then decays; rapid taps sustain motion. Needed because
+    // Carbon HotKey on macOS does not auto-repeat with Cmd held, so naive
+    // per-fire scrollBy(100px) produces stuttery, taps-only motion.
+    const inertialScrollRef = useRef<{
+        kick: (axis: 'vert' | 'horiz', direction: -1 | 1) => void;
+    } | null>(null);
+
+    useEffect(() => {
+        const KICK_VELOCITY = 900;     // px/s added per press
+        const TERMINAL_VELOCITY = 3200; // px/s clamp
+        const FRICTION_HALF_LIFE = 0.16; // seconds for velocity to halve
+        const MIN_VELOCITY = 8;         // px/s — snap to zero below
+        const MAX_FRAME_DT = 0.05;      // clamp for tab-throttle hiccups
+
+        const state = {
+            raf: null as number | null,
+            lastTs: 0,
+            vert: { vel: 0, target: null as HTMLElement | null, frac: 0 },
+            horiz: { vel: 0, target: null as HTMLElement | null, frac: 0 },
+        };
+
+        const resolveHorizontalTarget = (container: HTMLElement): HTMLElement | null => {
+            const containerRect = container.getBoundingClientRect();
+            const containerCenter = (containerRect.top + containerRect.bottom) / 2;
+
+            const preElements = container.querySelectorAll('pre');
+            let best: HTMLElement | null = null;
+            let bestDistance = Infinity;
+
+            preElements.forEach((pre) => {
+                // Walk up from <pre> until we find the actual horizontal scroller.
+                // Markdown renderers often wrap <pre> in a div that holds overflow-x.
+                let scroller: HTMLElement | null = pre as HTMLElement;
+                while (scroller && scroller !== container) {
+                    if (scroller.scrollWidth > scroller.clientWidth + 1) break;
+                    scroller = scroller.parentElement;
+                }
+                if (!scroller || scroller === container) return;
+                if (scroller.scrollWidth <= scroller.clientWidth + 1) return;
+
+                const rect = scroller.getBoundingClientRect();
+                if (rect.bottom < containerRect.top || rect.top > containerRect.bottom) return;
+
+                const distance = Math.abs((rect.top + rect.bottom) / 2 - containerCenter);
+                if (distance < bestDistance) { bestDistance = distance; best = scroller; }
+            });
+
+            return best;
+        };
+
+        const tick = (ts: number) => {
+            if (state.lastTs === 0) state.lastTs = ts;
+            const dt = Math.min((ts - state.lastTs) / 1000, MAX_FRAME_DT);
+            state.lastTs = ts;
+            const decay = Math.pow(0.5, dt / FRICTION_HALF_LIFE);
+
+            const stepAxis = (axis: 'vert' | 'horiz') => {
+                const a = state[axis];
+                if (Math.abs(a.vel) < MIN_VELOCITY || !a.target) {
+                    a.vel = 0; a.frac = 0; a.target = null;
+                    return false;
+                }
+                const move = a.vel * dt + a.frac;
+                const intMove = Math.trunc(move);
+                a.frac = move - intMove;
+                if (intMove !== 0) {
+                    if (axis === 'vert') a.target.scrollTop += intMove;
+                    else a.target.scrollLeft += intMove;
+                }
+                a.vel *= decay;
+                return true;
+            };
+
+            const vertActive = stepAxis('vert');
+            const horizActive = stepAxis('horiz');
+
+            if (vertActive || horizActive) {
+                state.raf = requestAnimationFrame(tick);
+            } else {
+                state.raf = null;
+                state.lastTs = 0;
+            }
+        };
+
+        const kick = (axis: 'vert' | 'horiz', direction: -1 | 1) => {
+            const container = scrollContainerRef.current;
+            if (!container) return;
+
+            let target: HTMLElement | null;
+            if (axis === 'vert') {
+                target = container;
+            } else {
+                target = resolveHorizontalTarget(container);
+                // No visible scrollable code block → no-op rather than scrolling
+                // an off-screen one or shaking the chat container sideways.
+                if (!target) return;
+            }
+
+            const a = state[axis];
+            // Reverse direction: reset rather than fight existing momentum.
+            if (a.target !== target || Math.sign(a.vel) === -direction) {
+                a.vel = 0;
+                a.frac = 0;
+            }
+            a.target = target;
+            const next = a.vel + direction * KICK_VELOCITY;
+            a.vel = Math.max(-TERMINAL_VELOCITY, Math.min(TERMINAL_VELOCITY, next));
+
+            if (state.raf === null) state.raf = requestAnimationFrame(tick);
+        };
+
+        inertialScrollRef.current = { kick };
+
+        return () => {
+            if (state.raf !== null) cancelAnimationFrame(state.raf);
+            inertialScrollRef.current = null;
+        };
+    }, []);
+
     // Stealth Global Shortcuts Handler
     // Listens for shortcuts triggered when the app is in the background
     useEffect(() => {
@@ -2641,8 +2610,10 @@ Provide only the answer, nothing else.`;
             else if (action === 'clarify') handlers.handleClarify();
             else if (action === 'codeHint') handlers.handleCodeHint();
             else if (action === 'brainstorm') handlers.handleBrainstorm();
-            else if (action === 'scrollUp') scrollContainerRef.current?.scrollBy({ top: -100, behavior: 'smooth' });
-            else if (action === 'scrollDown') scrollContainerRef.current?.scrollBy({ top: 100, behavior: 'smooth' });
+            else if (action === 'scrollUp') inertialScrollRef.current?.kick('vert', -1);
+            else if (action === 'scrollDown') inertialScrollRef.current?.kick('vert', 1);
+            else if (action === 'scrollLeft') inertialScrollRef.current?.kick('horiz', -1);
+            else if (action === 'scrollRight') inertialScrollRef.current?.kick('horiz', 1);
             else if (action === 'processScreenshots') generalHandlers.processScreenshots();
             else if (action === 'resetCancel') generalHandlers.resetCancel();
             else if (action === 'takeScreenshot') generalHandlers.takeScreenshot();
@@ -3012,6 +2983,8 @@ Provide only the answer, nothing else.`;
                                             <span className="truncate min-w-0 flex-1">
                                                 {(() => {
                                                     const m = currentModel;
+                                                    const codexCliName = getCodexCliModelDisplayName(m);
+                                                    if (codexCliName) return codexCliName;
                                                     if (m.startsWith('ollama-')) return m.replace('ollama-', '');
                                                     if (m === 'gemini-3.1-flash-lite-preview') return 'Gemini 3.1 Flash';
                                                     if (m === 'gemini-3.1-pro-preview') return 'Gemini 3.1 Pro';

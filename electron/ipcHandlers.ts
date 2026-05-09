@@ -9,9 +9,12 @@ import * as path from "path";
 import * as fs from "fs";
 import { AudioDevices } from "./audio/AudioDevices";
 import { PhoneMirrorService } from "./services/PhoneMirrorService";
+import { CodexCliService } from "./services/CodexCliService";
+import { SettingsManager } from "./services/SettingsManager";
 
 
 import { RECOGNITION_LANGUAGES, AI_RESPONSE_LANGUAGES } from "./config/languages"
+import { TRIAL_SENTINEL_KEY } from "./config/constants"
 
 export function initializeIpcHandlers(appState: AppState): void {
   const safeHandle = (channel: string, listener: (event: any, ...args: any[]) => Promise<any> | any) => {
@@ -1077,13 +1080,13 @@ export function initializeIpcHandlers(appState: AppState): void {
 
         // Auto-configure natively as the model + STT provider during trial
         const prevSttProvider = cm.getSttProvider();
-        cm.setNativelyApiKey('__trial__');   // sentinel — activates natively model routing
+        cm.setNativelyApiKey(TRIAL_SENTINEL_KEY);   // sentinel — activates natively model routing
         const newSttProvider = cm.getSttProvider();
         if (newSttProvider !== prevSttProvider) {
           await appState.reconfigureSttProvider();
         }
         const llmHelper = appState.processingHelper?.getLLMHelper?.();
-        if (llmHelper) llmHelper.setNativelyKey('__trial__');
+        if (llmHelper) llmHelper.setNativelyKey(TRIAL_SENTINEL_KEY);
       }
 
       return { ok: true, ...data };
@@ -2019,6 +2022,52 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle("get-codex-cli-config", () => {
+    try {
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      return llmHelper.getCodexCliConfig();
+    } catch {
+      return CodexCliService.normalizeConfig({});
+    }
+  });
+
+  safeHandle("set-codex-cli-config", (_, config: any) => {
+    try {
+      const normalized = CodexCliService.normalizeConfig(config || {});
+      const sm = SettingsManager.getInstance();
+      sm.set('codexCliEnabled', normalized.enabled);
+      sm.set('codexCliPath', normalized.path);
+      sm.set('codexCliModel', normalized.model);
+      sm.set('codexCliFastModel', normalized.fastModel);
+      sm.set('codexCliTimeoutMs', normalized.timeoutMs);
+      sm.set('codexCliSandboxMode', normalized.sandboxMode);
+      appState.processingHelper.getLLMHelper().setCodexCliConfig(normalized);
+      return { success: true, config: normalized };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("test-codex-cli", async (_, config?: any) => {
+    try {
+      const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
+      const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
+      const result = await CodexCliService.validateExecutable(normalized.path);
+      // If auto-detection found a different working path, persist it so
+      // subsequent chat calls don't re-ENOENT.
+      if (result.success && result.resolvedPath && result.resolvedPath !== normalized.path) {
+        const updated = CodexCliService.normalizeConfig({ ...normalized, path: result.resolvedPath });
+        const sm = SettingsManager.getInstance();
+        sm.set('codexCliPath', updated.path);
+        appState.processingHelper.getLLMHelper().setCodexCliConfig(updated);
+        return { success: true, resolvedPath: result.resolvedPath, config: updated };
+      }
+      return result;
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
   safeHandle("set-model", async (_, modelId: string) => {
     try {
       const llmHelper = appState.processingHelper.getLLMHelper();
@@ -2914,7 +2963,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           const { NativelySearchProvider } = require('../premium/electron/knowledge/NativelySearchProvider');
           // Pass the real trial token when key is the __trial__ sentinel so the
           // server can authenticate via x-trial-token instead of the invalid key.
-          const trialToken = nativelyKey === '__trial__' ? cm.getTrialToken() : undefined;
+          const trialToken = nativelyKey === TRIAL_SENTINEL_KEY ? cm.getTrialToken() : undefined;
           engine.setSearchProvider(new NativelySearchProvider(nativelyKey, trialToken ?? undefined));
           console.log('[IPC] Company research: using Natively API search (no Tavily key configured)');
         }
@@ -3360,4 +3409,3 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 }
-
