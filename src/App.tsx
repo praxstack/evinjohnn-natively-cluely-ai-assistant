@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react" // forcing refresh
-import { QueryClient, QueryClientProvider } from "react-query"
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { ToastProvider, ToastViewport } from "./components/ui/toast"
 import NativelyInterface from "./components/NativelyInterface"
 import SettingsPopup from "./components/SettingsPopup" // Keeping for legacy/specific window support if needed
@@ -397,8 +397,10 @@ const App: React.FC = () => {
         console.log("[App] Using CoreAudio backend (Default).");
       }
 
+      const meetingRetention = await window.electronAPI.getMeetingRetention?.().catch(() => 'forever');
       const result = await window.electronAPI.startMeeting({
-        audio: { inputDeviceId, outputDeviceId }
+        audio: { inputDeviceId, outputDeviceId },
+        doNotPersist: meetingRetention === 'never'
       });
       if (result.success) {
         analytics.trackMeetingStarted();
