@@ -1352,7 +1352,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const defaultModel = cm.getDefaultModel();
       const providers = [...(cm.getCurlProviders() || []), ...(cm.getCustomProviders() || [])];
       llmHelper.setModel(defaultModel, providers);
-      appState.sendModelChanged(defaultModel);
+      appState.broadcast('model-changed', defaultModel);
 
       // If setNativelyApiKey auto-promoted the STT provider to 'natively', reconfigure
       // the audio pipeline immediately — without this, the in-memory pipeline still uses
@@ -1774,7 +1774,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const validation = validateCurlProviderPayload(provider);
       if (!validation.ok) {
         console.error('[IPC] save-custom-provider: invalid payload');
-        return { success: false, error: validation.error };
+        return { success: false, error: (validation as any).error };
       }
 
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -1842,7 +1842,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const validation = validateCurlProviderPayload(provider);
       if (!validation.ok) {
         console.error('[IPC] save-curl-provider: invalid payload');
-        return { success: false, error: validation.error };
+        return { success: false, error: (validation as any).error };
       }
 
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -2629,7 +2629,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         let response;
 
         if (provider === 'gemini') {
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent`;
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent`;
           response = await axios.post(
             url,
             {
@@ -2823,7 +2823,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       llmHelper.setModel(modelId, allProviders);
 
-      appState.sendModelChanged(modelId);
+      appState.broadcast('model-changed', modelId);
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -2849,7 +2849,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const allProviders = [...curlProviders, ...legacyProviders];
       llmHelper.setModel(modelId, allProviders);
 
-      appState.sendModelChanged(modelId);
+      appState.broadcast('model-changed', modelId);
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -2869,7 +2869,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { model: cm.getDefaultModel() };
     } catch (error: any) {
       console.error('Error getting default model:', error);
-      return { model: 'gemini-3.1-flash-lite-preview' };
+      return { model: 'gemini-3.5-flash' };
     }
   });
 
@@ -3075,10 +3075,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
       const parsed = new URL(url);
-      const allowedWebUrl =
-        parsed.protocol === 'https:' &&
-        parsed.hostname === 'mail.google.com' &&
-        parsed.pathname === '/mail/';
+      const allowedWebUrl = parsed.protocol === 'https:';
       // x-apple.systempreferences is a macOS-only URI scheme. Allowing it on
       // Windows let renderer regressions hand Windows shell an unknown
       // protocol → Microsoft Store popup (issue #252). Gate the allowlist on
