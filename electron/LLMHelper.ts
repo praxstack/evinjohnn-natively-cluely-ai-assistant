@@ -20,7 +20,7 @@ import {
   TINY_ASSIST_PROMPT, TINY_BRAINSTORM_PROMPT, TINY_CLARIFY_PROMPT, TINY_CODE_HINT_PROMPT,
   TINY_PROMPTS_SET
 } from "./llm/tinyPrompts"
-import { getModelCapabilities, selectPromptTier, estimateTokens, truncateTranscriptToFit, getOpenAiMaxOutput, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
+import { getModelCapabilities, selectPromptTier, estimateTokens, truncateTranscriptToFit, getOpenAiMaxOutput, getOpenAiReasoningEffort, type OpenAiReasoningEffort, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
 import { GeminiPromptCache } from "./llm/GeminiPromptCache"
 import {
   runStreamingVisionFallback,
@@ -127,6 +127,14 @@ const CLAUDE_MAX_OUTPUT_TOKENS = 64000
 // connect that then prefills slowly. Override per-call for non-interactive use.
 const INTERACTIVE_CONNECT_TIMEOUT_MS = 4_000;
 
+// First-useful-token budget for the Natively gateway on the TEXT path. Larger than
+// the shared 2.5s text default because the gateway's server-side fallback chain can
+// land on MiniMax (first token 3.3-7.7s); a 2.5s cap aborts it before it speaks.
+// 8s == LIVE_TOTAL_HARD_TIMEOUT_MS (the outer live-deadline ceiling), so this inner
+// per-provider gate never fires before the single source-of-truth deadline. See the
+// natively text-provider registration for the full rationale.
+const NATIVELY_TEXT_TTFT_MS = 8_000;
+
 // ── Deterministic sampling for interview/coding answers (REPORT §22 D1) ──────
 // The text streaming methods previously used scattered temperatures (0.3/0.4/
 // 0.7/1.0) and no seed, so the same question produced structurally different
@@ -182,17 +190,16 @@ export function buildThinkingConfig(model: string | undefined, budget: number): 
 }
 
 // OpenAI reasoning effort for the interactive path. Per the openai-node docs,
-// `reasoning_effort` (none|minimal|low|medium|high|xhigh) constrains reasoning;
-// models before gpt-5.1 default to the slow `medium` and DON'T support `none`,
-// so we use 'minimal' (lowest universally-supported) to cut TTFT — the same
-// "kill the hidden default reasoning" lever as Gemini's thinkingLevel:minimal.
-// Only returned for genuine OpenAI gpt-* models; when the OpenAI-compatible
-// client proxies a non-OpenAI model (e.g. Claude), no reasoning_effort is sent.
-export const OPENAI_REASONING_EFFORT = 'minimal';
-function openaiReasoningParam(model: string): { reasoning_effort: 'minimal' } | {} {
-  const m = (model || '').toLowerCase();
-  const isGptReasoner = /\bgpt-5/.test(m) || /\bo[0-9]/.test(m); // gpt-5.x / o-series reasoners
-  return isGptReasoner ? { reasoning_effort: OPENAI_REASONING_EFFORT } : {};
+// `reasoning_effort` (none|minimal|low|medium|high|xhigh) constrains reasoning,
+// but the VALID set differs per model: OpenAI removed `minimal` after the original
+// gpt-5 line, so gpt-5.4/5.5 (and o-series) reject it with a 400. We delegate to
+// getOpenAiReasoningEffort, which returns the lowest *valid* effort for each family
+// to keep TTFT low — the same "kill the hidden default reasoning" lever as Gemini's
+// thinkingLevel:minimal — or null for non-reasoning models, in which case the param
+// is omitted (e.g. gpt-4*/gpt-3.5, or when the client proxies a non-OpenAI model).
+function openaiReasoningParam(model: string): { reasoning_effort: OpenAiReasoningEffort } | {} {
+  const effort = getOpenAiReasoningEffort(model);
+  return effort ? { reasoning_effort: effort } : {};
 }
 
 // Simple prompt for image analysis (not interview copilot - kept separate)
@@ -617,13 +624,16 @@ export class LLMHelper {
 
   /**
    * Per-model max output token ceiling. Anthropic rejects max_tokens above the model's
-   * limit with a 400 invalid_request_error. claude-3.5/3.7 cap at 8K, opus-4 at 32K,
-   * sonnet-4/haiku-4.5/mythos at 64K. Unknown models fall back to a safe 8192.
+   * limit with a 400 invalid_request_error. claude-3.5/3.7 cap at 8K; opus-4.0/4.1 at
+   * 32K; opus-4.5 and later at 128K; sonnet-4/haiku-4.5/mythos at 64K. Unknown models
+   * fall back to a safe 8192.
    */
   private getClaudeMaxOutput(modelId: string): number {
     const id = modelId.toLowerCase();
     if (id.startsWith("claude-3-5-") || id.startsWith("claude-3-7-") || id.startsWith("claude-3-haiku")) return 8192;
-    if (id.startsWith("claude-opus-4-")) return 32000;
+    // Opus 4.0 / 4.1 cap at 32K; Opus 4.5 and later (4.5/4.6/4.7/4.8) cap at 128K.
+    if (id.startsWith("claude-opus-4-0") || id.startsWith("claude-opus-4-1")) return 32000;
+    if (id.startsWith("claude-opus-4-")) return 128000;
     if (id.startsWith("claude-sonnet-4-") || id.startsWith("claude-haiku-4-5") || id.startsWith("claude-mythos")) return 64000;
     return 8192;
   }
@@ -3937,8 +3947,18 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         const textProviders: TextStreamProvider[] = [];
         let prio = 0;
         // Primary: Natively (fast connect budget — TTFT race handles slow prefill).
+        // Per-provider TTFT override: the gateway's server-side chain falls back to
+        // MiniMax (a STRONG frontier fallback) when the Gemini chain is down, and
+        // MiniMax's first token lands at 3.3-7.7s. The shared text default of 2.5s
+        // (DEFAULT_TEXT_FALLBACK_CONFIG) would abort that gateway stream before
+        // MiniMax ever emits a token, defeating the fallback and failing over to the
+        // client-side Groq/Gemini providers that are typically ALSO down in that
+        // scenario. 8s (= LIVE_TOTAL_HARD_TIMEOUT_MS, the outer live ceiling) lets a
+        // slow-MiniMax gateway commit while still failing over fast on a genuinely
+        // dead gateway. Mirrors the vision path, which already sets FLASH_TTFT_MS here.
         textProviders.push({
           id: 'natively', name: 'Natively API', isLocal: false, priority: prio++,
+          ttftTimeoutMs: NATIVELY_TEXT_TTFT_MS,
           open: (sig) => this.streamWithNatively(userContent, finalSystemPrompt, imagePaths, sig, INTERACTIVE_CONNECT_TIMEOUT_MS),
         });
         // Fallback: Groq (key more commonly available than Gemini).

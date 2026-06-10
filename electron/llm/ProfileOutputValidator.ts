@@ -365,8 +365,8 @@ export function stripProfileTokensFromCoding(answer: string, tokens: string[]): 
 export const CANDIDATE_VOICE_ANSWER_TYPES: ReadonlySet<AnswerType> = new Set<AnswerType>([
   'identity_answer', 'profile_fact_answer', 'experience_answer', 'project_answer',
   'project_followup_answer', 'project_about_answer', 'skills_answer',
-  'skill_experience_answer', 'jd_fit_answer', 'behavioral_interview_answer',
-  'negotiation_answer',
+  'skill_experience_answer', 'jd_fit_answer', 'gap_analysis_answer',
+  'behavioral_interview_answer', 'negotiation_answer',
 ]);
 
 // Assistant-meta / false-refusal markers that must never appear in a candidate answer.
@@ -380,6 +380,14 @@ const CANDIDATE_META_MARKERS: RegExp[] = [
   // "as an AI (model/assistant), I …" — the assistant framing, not a bare "as an AI".
   /\bas an AI(?:\s+(?:language\s+)?(?:model|assistant))\b/i,
   /\bas an AI,?\s+I\s+(?:cannot|can'?t|do(?:n'?t| not)|am|was)\b/i,
+  // The model calling the CANDIDATE "an AI assistant" — "as your AI assistant", "a
+  // reliable AI assistant for your team", "I would be a valuable AI assistant". This
+  // is the model leaking its OWN identity into the candidate's voice. EXCLUDES "AI
+  // assistant product/app/tool/feature/platform" (a legitimate product the candidate
+  // built/sells) so a real product description survives (code-review release
+  // 2026-06-07c). Requires a self-referential frame (as/your/be a/me a … AI assistant)
+  // NOT immediately followed by a product noun.
+  /\b(?:as your|as an?|as the|be an?|be the|me an?|i(?:'m| am) an?|i(?:'m| am) the|being (?:your|an?|the)|a (?:reliable|helpful|valuable|capable|dedicated|great|strong)|the (?:right|best|ideal|perfect|ultimate))\s+(?:\w+\s+)?AI\s+assistant\b(?!\s+(?:product|app|application|tool|platform|feature|service|company|startup|space|domain|market|that|which|called|like))/i,
   // "I'm an AI assistant / language model / chatbot" — the assistant identity. A real
   // job title ("AI Engineer/Researcher/Scientist/Lead/…") is NOT matched because the
   // noun after "AI" must be a model/assistant word.

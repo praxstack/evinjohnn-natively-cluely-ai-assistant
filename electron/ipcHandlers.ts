@@ -15,7 +15,7 @@ import { SkillsManager } from './services/SkillsManager';
 
 import { TRIAL_SENTINEL_KEY } from './config/constants';
 import { AI_RESPONSE_LANGUAGES, RECOGNITION_LANGUAGES } from './config/languages';
-import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, CANDIDATE_VOICE_ANSWER_TYPES } from './llm';
+import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, CANDIDATE_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError } from './llm';
 import { buildLiveFallbackAnswer } from './llm/manualProfileIntelligence';
 import { isCodeVerificationEnabled } from './llm/codeVerification/verificationEnabled';
 import { CodingStreamGate } from './llm/codingStreamGate';
@@ -314,12 +314,14 @@ export function initializeIpcHandlers(appState: AppState): void {
     },
   );
 
-  // (Removed) 'animate-overlay-width' — the overlay width animation is now
-  // CSS-only in the renderer (single compositor clock). The OS window is sized
-  // exactly once per transition via 'update-content-dimensions-centered'
-  // (grown up front on expand, shrunk at the end on collapse). The old
-  // per-frame native setInterval chase tore against the renderer's clock and
-  // has been deleted. See electron/utils/overlayWindowFirst.mjs.
+  // (Removed) 'animate-overlay-width' — the overlay window is a FIXED WIDTH
+  // (WindowHelper.OVERLAY_DEFAULT_WIDTH = 780) and is NEVER width-resized. The
+  // expand/contract animation is CSS-only in the renderer (the panel tweens
+  // 600↔780 centered inside the fixed window). 'update-content-dimensions-centered'
+  // now only carries HEIGHT changes (the renderer always sends the fixed width),
+  // which is a top-anchored resize that does not move X — so there is no
+  // sideways jump and no per-frame transparent-window re-raster. See
+  // NativelyInterface.startTransition for the renderer side.
 
   safeHandle('set-window-mode', async (event, mode: 'launcher' | 'overlay', inactive?: boolean) => {
     appState.getWindowHelper().setWindowMode(mode, inactive);
@@ -668,6 +670,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
         const isCodingChat = isCodingAnswerType(answerPlan.answerType);
         chatTrace.mark('answer_type_selected', { answerType: answerPlan.answerType, isCoding: isCodingChat });
+        piTelemetry.emit('pi_answer_plan_created', { answerType: answerPlan.answerType, surface: 'manual', isCoding: isCodingChat, profilePolicy: answerPlan.profileContextPolicy, answerStyle: answerPlan.answerStyle });
 
         // Context-free bare follow-up ("why?", "and?", "continue") typed in MANUAL
         // mode has no prior turn to resolve against (manual chat is single-shot — no
@@ -791,14 +794,27 @@ export function initializeIpcHandlers(appState: AppState): void {
             `[IPC] Auto-injected 100s context for gemini-chat-stream (${context.length} chars)`,
           );
         }
-        // Skill-rating asks ("python, out of 10?") are profile-REQUIRED (keep the
-        // rolling profile context above), but flash-lite sometimes refuses with "as
-        // an AI assistant I don't assign ratings". ADDITIVELY prepend the skill
-        // answer-contract (which forbids the refusal and demands a grounded number)
-        // WITHOUT dropping the profile grounding (release 2026-06-07).
-        if (answerPlan.answerType === 'skill_experience_answer') {
-          const skillContract = formatAnswerPlanForPrompt(answerPlan, false);
-          context = context ? `${skillContract}\n\n${context}` : skillContract;
+        // MANUAL REGRESSION FIX (release 2026-06-08): for ANY profile-required
+        // candidate answer type (jd_fit / skill / behavioral / project / experience /
+        // identity / negotiation), ADDITIVELY prepend the answer-contract — the
+        // answerType + the adaptive STYLE directive + the strict response template —
+        // WITHOUT dropping the rolling profile grounding. Without this the model
+        // received the profile facts as raw context with no instruction and collapsed
+        // EVERY non-fast-path question into the generic self-intro (the exact bug the
+        // user hit: "why should we hire you", "rate your Python", "JD fit", "what gap"
+        // all returned the same intro). The contract makes the model produce the RIGHT
+        // answer type AND honor the requested style (one-line / bullets / detailed).
+        const CANDIDATE_CONTRACT_TYPES = new Set([
+          'identity_answer', 'profile_fact_answer', 'experience_answer', 'project_answer',
+          'project_followup_answer', 'skills_answer', 'skill_experience_answer',
+          'jd_fit_answer', 'gap_analysis_answer', 'behavioral_interview_answer', 'negotiation_answer',
+        ]);
+        const wantsCandidateContract = CANDIDATE_CONTRACT_TYPES.has(answerPlan.answerType)
+          // a styled question ALWAYS gets the contract so the style reaches the model.
+          || (answerPlan.answerStyle && answerPlan.answerStyle !== 'default');
+        if (wantsCandidateContract && !isContractEnforced && !isCodingChat) {
+          const candidateContract = formatAnswerPlanForPrompt(answerPlan, false);
+          context = context ? `${candidateContract}\n\n${context}` : candidateContract;
         }
 
         // Use CHAT_MODE_PROMPT for general chat — bypasses the interview-copilot
@@ -1022,11 +1038,12 @@ export function initializeIpcHandlers(appState: AppState): void {
                   const repairInstruction = buildProfileRepairInstruction({ ok: false, violations: [critical] } as any);
                   const repairPrompt = `${repairInstruction}\n\nCandidate facts (ground every claim in these; second person to the user is fine, but NEVER say you are Natively or an AI, and NEVER claim the profile is missing):\n${facts}\n\nQuestion: ${message}\n\nRewrite the answer now.`;
                   let repaired = '';
-                  // Deadline-guarded (4s) so a stalled repair provider can't re-hang
-                  // the request after a streamed answer already showed (Issue 1).
+                  // Deadline-guarded (7s) so a stalled repair provider can't re-hang
+                  // the request after a streamed answer already showed (Issue 1). 7s
+                  // (was 4s) clears MiniMax's 4-6s first-token when it's the fallback.
                   await raceStreamWithDeadline({
                     stream: llmHelper.streamChat(repairPrompt, undefined, undefined, undefined, true, true) as AsyncGenerator<string>,
-                    firstUsefulDeadlineMs: 4000,
+                    firstUsefulDeadlineMs: 7000,
                     isUsefulYet: () => repaired.length >= 5,
                     shouldAbort: () => repaired.length > 1200,
                     onToken: (tok: string) => { repaired += tok; },
@@ -1102,8 +1119,10 @@ export function initializeIpcHandlers(appState: AppState): void {
               if (sani.repaired && !sani.needsFallback) {
                 fullResponse = sani.text;
                 finalText = sani.text;
+                piTelemetry.emit('pi_candidate_sanitizer_applied', { answerType: answerPlan.answerType, repaired: true, needsFallback: false, markerCount: sani.removedMarkers.length });
                 console.warn('[ProfileIntelligence] sanitized assistant-meta tail from candidate answer', { answerType: answerPlan.answerType, markers: sani.removedMarkers });
               } else if (sani.needsFallback) {
+                piTelemetry.emit('pi_candidate_sanitizer_applied', { answerType: answerPlan.answerType, repaired: true, needsFallback: true, markerCount: sani.removedMarkers.length });
                 // The whole answer was assistant-meta. Build a deterministic
                 // profile-grounded replacement instead of shipping an empty/broken one.
                 const orchS = llmHelper.getKnowledgeOrchestrator?.();
@@ -1158,11 +1177,12 @@ export function initializeIpcHandlers(appState: AppState): void {
                     question: message,
                     correct: async (repairPrompt: string) => {
                       // Background coding-correction (post-answer). Deadline-guarded
-                      // so a stalled provider can't leave a hung background task.
+                      // so a stalled provider can't leave a hung background task. 7s
+                      // (was 6s) clears MiniMax's 4-6s first-token when it's the fallback.
                       let fixed = '';
                       await raceStreamWithDeadline({
                         stream: llmHelper.streamChat(repairPrompt, undefined, undefined, undefined, true, true) as AsyncGenerator<string>,
-                        firstUsefulDeadlineMs: 6000,
+                        firstUsefulDeadlineMs: 7000,
                         isUsefulYet: () => fixed.length >= 5,
                         onToken: (tok: string) => { fixed += tok; },
                       });
@@ -1193,6 +1213,31 @@ export function initializeIpcHandlers(appState: AppState): void {
           }
         } catch (streamError: any) {
           console.error('[IPC] Streaming error:', streamError);
+          // Classify the provider failure (marker-only telemetry) and, when the route
+          // can answer deterministically (a profile-required answer), emit the
+          // deterministic profile fallback instead of a blank error — no empty answer
+          // when a safe fallback exists. The fallback uses buildManualProfileBackendAnswer
+          // (the DETERMINISTIC profile backend, NO LLM), so it cannot contain assistant-
+          // meta and does not need the candidate sanitizer — same as the happy-path
+          // profile fast-path which also emits this builder's output directly. It is
+          // gated to profileContextPolicy==='required', so it can NEVER fire for a
+          // coding/technical answer (those are 'forbidden') — no profile-into-coding leak.
+          try {
+            const klass = classifyProviderError(streamError);
+            piTelemetry.emit('pi_provider_error_classified', { kind: klass.kind, outage: klass.isOutage, retryable: klass.retryable, surface: 'manual' });
+            if (klass.isOutage && answerPlan.profileContextPolicy === 'required' && !fullResponse.trim()) {
+              const orchE = llmHelper.getKnowledgeOrchestrator?.();
+              const fb = buildManualProfileBackendAnswer({ question: message, orchestrator: orchE, source: 'manual_input' });
+              if (fb?.route?.answer && fb.route.answer.trim().length >= 15 && _chatStreamsBySender.get(senderId)?.streamId === myStreamId) {
+                piTelemetry.emit('provider_fallback_used', { surface: 'manual', kind: klass.kind, answerType: answerPlan.answerType });
+                event.sender.send('gemini-stream-token', fb.route.answer);
+                event.sender.send('gemini-stream-done', { finalText: fb.route.answer });
+                try { PhoneMirrorService.getInstance().publishToken(String(myStreamId), fb.route.answer); PhoneMirrorService.getInstance().publishDone(String(myStreamId), fb.route.answer); } catch (_) { /* noop */ }
+                intelligenceManager.addAssistantMessage(fb.route.answer);
+                return null;
+              }
+            }
+          } catch (classifyErr: any) { console.warn('[IPC] provider-error classify/fallback skipped:', classifyErr?.message); }
           if (_chatStreamsBySender.get(senderId)?.streamId === myStreamId) {
             event.sender.send(
               'gemini-stream-error',
@@ -1378,6 +1423,25 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('get-overlay-mouse-passthrough', async () => {
     return appState.getOverlayMousePassthrough();
+  });
+
+  // Hover-gated click-through for the fixed-width overlay's transparent margins.
+  // The renderer hit-tests the pointer against the painted panel rect and reports
+  // whether the pointer is currently over interactive content (true) or over a
+  // transparent margin / outside it (false). This ONLY affects interactive mode —
+  // when the master stealth passthrough is on, the window stays fully
+  // click-through regardless (enforced in syncOverlayInteractionPolicy). Only the
+  // overlay window's own webContents may drive this.
+  safeHandle('set-overlay-interactive-region', async (event, overContent: boolean) => {
+    const overlayWin = appState.getWindowHelper().getOverlayWindow();
+    if (
+      overlayWin &&
+      !overlayWin.isDestroyed() &&
+      overlayWin.webContents.id === event.sender.id
+    ) {
+      appState.getWindowHelper().setOverlayHoverInteractive(!!overContent);
+    }
+    return { success: true };
   });
 
   safeHandle('get-disguise', async () => {

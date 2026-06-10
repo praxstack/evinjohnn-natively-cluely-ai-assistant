@@ -70,13 +70,24 @@ function inferKind(input: SessionFollowupInput): MemoryItemKind | null {
   if (input.expectedKind) return input.expectedKind;
   const q = (input.latestQuestion || '').toLowerCase();
   const prev = input.previousAnswerType;
+  // A SKILL-proficiency probe ("how strong/good/proficient are you in/at that?",
+  // "rate that out of 10") is unambiguously about the skill on the table, even right
+  // after a project turn — so it must win over the project rules below. (Excludes the
+  // generic status follow-up "how is that going?", which is not a proficiency probe —
+  // code-review 2026-06-08.)
+  if (/\bhow (?:strong|good|proficient|skilled|comfortable|experienced) are you (?:in|at|with)\b|\brate (?:that|it|your)\b.*\b(?:out of|skill)|\bhow (?:is|are) (?:that|your) skill\b/.test(q)) return 'skill';
   // "who owns / who is responsible / who is taking / what is the action item" → a
   // meeting decision/owner.
   if (/\bwho (owns|is responsible|is taking|has|will (do|own|handle))\b|\bwho'?s (the )?owner\b|\baction items?\b|\bwho owns (that|it|the)\b/.test(q)) return 'decision';
-  if (PROJECT_REF_RE.test(q) && (prev === 'project_answer' || prev === 'project_followup_answer' || /project|built|that project|hardest part/.test(q))) return 'project';
+  // "why is it your best?" / "why is that your best project?" → the best PROJECT.
+  if (/\b(your|the) best (project|one)\b|\bwhy is (it|that) your best\b|\bis (it|that) your best\b/.test(q)) return 'project';
+  if (PROJECT_REF_RE.test(q) && (prev === 'project_answer' || prev === 'project_followup_answer' || prev === 'project_about_answer' || /project|built|that project|hardest part|tech stack|architecture/.test(q))) return 'project';
   if (COMPANY_REF_RE.test(q)) return 'company';
   if (prev === 'skill_experience_answer' || prev === 'skills_answer') return 'skill';
   if (prev === 'technical_concept_answer' || prev === 'lecture_answer') return 'topic';
+  // "explain that (with an example)" / "give an example of that" → the lecture/tech
+  // TOPIC on the table (covers lecture follow-ups where prev wasn't yet typed).
+  if (/\b(explain|give (me )?an example of|elaborate on|expand on|tell me more about) (that|this|it)\b/.test(q)) return 'topic';
   if (prev === 'general_meeting_answer') return 'decision';
   // "the hardest part of that", "your role in that" → a project drill-in.
   if (/\b(hardest part|your role|the role|tech stack|architecture)\b.*\b(that|it|there)\b|\b(that|it|there)\b/.test(q) && /\bhardest|role|stack|architecture|build|part\b/.test(q)) return 'project';

@@ -36,6 +36,8 @@ export type { ConversationIntent, IntentResult } from "./IntentClassifier";
 export { planNextAssistantAction } from "./PlannerDecision";
 export type { PlannerDecision, PlannerDecisionKind, PlannerInput } from "./PlannerDecision";
 export { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, shouldScaffold, isStealthEvasionQuestion } from "./AnswerPlanner";
+export { detectAnswerStyle, styleSuppressesScaffold } from "./answerStyle";
+export type { AnswerStyle, AnswerStyleResult } from "./answerStyle";
 export type { AnswerPlan, AnswerSource, AnswerType, ContextLayer, OutputPerspective, SpeakerPerspective } from "./AnswerPlanner";
 export { resolveFollowUp, resolveFollowUpOrClarify, isBareFollowUp, buildContextFreeClarification } from "./FollowUpResolver";
 export { classifyProviderError, isClarificationStall } from "./providerErrorClassifier";
@@ -44,6 +46,14 @@ export { SessionMemory, isKindAllowedInMode } from "./SessionMemory";
 export type { MemoryMode, MemoryItemKind, MemoryItem, MemoryQuery, MemoryRecall } from "./SessionMemory";
 export { resolveSessionFollowup } from "./sessionFollowupResolver";
 export type { SessionFollowupInput, SessionFollowupResult } from "./sessionFollowupResolver";
+export { extractTranscriptEntities, isCorrectionTurn, isExplicitCrossModeInvite } from "./transcriptEntityExtractor";
+export type { ExtractedEntity } from "./transcriptEntityExtractor";
+export { isLiveSessionMemoryEnabled, liveSessionMemoryMaxItems, liveSessionMemoryDebug, __resetLiveSessionMemoryCache, resolveLiveSessionMemoryConfig, sessionBucket } from "./liveSessionMemoryConfig";
+export type { LiveSessionMemoryRolloutConfig } from "./liveSessionMemoryConfig";
+export { piTelemetry, scrubTelemetry, ageBucket } from "./piTelemetry";
+export type { PiTelemetryEvent, PiTelemetryRecord } from "./piTelemetry";
+export { resolveLiveFollowup, isContextFreeBareFollowup, toMemoryMode, toSurface, effectiveMemoryMode } from "./liveSessionMemory";
+export type { LiveTurn, LiveResolveInput } from "./liveSessionMemory";
 export {
   raceStreamWithDeadline, firstUsefulDeadlineMs,
   LIVE_FIRST_USEFUL_BUDGET_MS, LIVE_PROVIDER_FIRST_USEFUL_HARD_TIMEOUT_MS,
@@ -122,6 +132,7 @@ export {
     estimateTokens,
     truncateTranscriptToFit,
     parseOllamaSize,
-    getOpenAiMaxOutput
+    getOpenAiMaxOutput,
+    getOpenAiReasoningEffort
 } from "./modelCapabilities";
-export type { ModelCapabilities, ModelTier, PromptTier } from "./modelCapabilities";
+export type { ModelCapabilities, ModelTier, PromptTier, OpenAiReasoningEffort } from "./modelCapabilities";
