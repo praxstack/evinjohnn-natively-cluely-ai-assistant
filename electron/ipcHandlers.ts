@@ -13,7 +13,7 @@ import { PhoneMirrorService } from './services/PhoneMirrorService';
 import { SettingsManager } from './services/SettingsManager';
 import { SkillsManager } from './services/SkillsManager';
 
-import { TRIAL_SENTINEL_KEY } from './config/constants';
+import { TRIAL_SENTINEL_KEY, DOM_CONTEXT_MAX_CHARS } from './config/constants';
 import { AI_RESPONSE_LANGUAGES, RECOGNITION_LANGUAGES } from './config/languages';
 import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, CANDIDATE_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError } from './llm';
 import { buildLiveFallbackAnswer } from './llm/manualProfileIntelligence';
@@ -1923,6 +1923,51 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle('set-litellm-config', async (_, config: { apiKey: string; baseURL: string; maxTokens?: number }) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      cm.setLitellmConfig(config?.apiKey || '', config?.baseURL || '', config?.maxTokens);
+
+      // Update the LLMHelper with the EFFECTIVE stored key — a blank apiKey on
+      // re-save means "keep the stored one" (the field is masked in Settings),
+      // so read back what CredentialsManager actually persisted.
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      llmHelper.setLitellmConfig(cm.getLitellmApiKey() || '', config?.baseURL || '', config?.maxTokens);
+
+      // Cancel in-flight stream before re-init (engine only, not session)
+      appState.getIntelligenceManager().resetEngine();
+      // Re-init IntelligenceManager
+      appState.getIntelligenceManager().initializeLLMs();
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Error saving LiteLLM config:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Discover models from the configured LiteLLM proxy (OpenAI-compatible /v1/models).
+  // Returns [] on any failure (proxy down, auth rejected, timeout) so the model
+  // selector degrades gracefully rather than throwing.
+  safeHandle('get-available-litellm-models', async () => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      const baseURL = (cm.getLitellmBaseURL() || 'http://localhost:4000/v1').replace(/\/+$/, '');
+      const apiKey = cm.getLitellmApiKey();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const resp = await fetch(`${baseURL}/models`, { method: 'GET', headers, signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) return [];
+      const data: any = await resp.json();
+      const models = (data?.data || []).map((m: any) => m?.id).filter(Boolean);
+      return models;
+    } catch {
+      return [];
+    }
+  });
+
   // ── Usage cache (60-second TTL, keyed by API key) ──────────────────────────
   const _usageCache = new Map<string, { data: any; ts: number }>();
   const USAGE_CACHE_TTL_MS = 60_000;
@@ -2528,6 +2573,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: hasKey(creds.openaiApiKey),
         hasClaudeKey: hasKey(creds.claudeApiKey),
         hasDeepseekKey: hasKey(creds.deepseekApiKey),
+        hasLitellmBaseURL: hasKey(creds.litellmBaseURL),
+        // The base URL is config, not a secret — returned in full so Settings can
+        // prefill it (unlike API keys, which are only reported as booleans).
+        litellmBaseURL: creds.litellmBaseURL || null,
+        litellmMaxTokens: creds.litellmMaxTokens || null,
         hasNativelyKey: hasKey(creds.nativelyApiKey),
         googleServiceAccountPath: creds.googleServiceAccountPath || null,
         sttProvider: creds.sttProvider || 'none',
@@ -2568,6 +2618,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: false,
         hasClaudeKey: false,
         hasDeepseekKey: false,
+        hasLitellmBaseURL: false,
+        litellmBaseURL: null,
+        litellmMaxTokens: null,
         hasNativelyKey: false,
         googleServiceAccountPath: null,
         sttProvider: 'none',
@@ -3564,7 +3617,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { success: true };
     } catch (error: any) {
       console.error('Error starting meeting:', error);
-      return { success: false, error: error.message };
+      // Forward the structured error code (e.g. 'mic-permission-denied') so the
+      // renderer can surface a recoverable permissions prompt rather than a
+      // silent failure. Falls back to undefined for plain errors.
+      return { success: false, error: error?.message, code: error?.code };
     }
   });
 
@@ -3758,7 +3814,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       _,
       question?: string,
       imagePaths?: string[],
-      options?: { promptInstruction?: string },
+      options?: { promptInstruction?: string; domContext?: string },
     ) => {
       try {
         let screenContext: any;
@@ -3882,6 +3938,10 @@ export function initializeIpcHandlers(appState: AppState): void {
             promptInstruction:
               typeof options?.promptInstruction === 'string'
                 ? options.promptInstruction
+                : undefined,
+            domContext:
+              typeof options?.domContext === 'string'
+                ? options.domContext.substring(0, DOM_CONTEXT_MAX_CHARS)
                 : undefined,
           },
         );
