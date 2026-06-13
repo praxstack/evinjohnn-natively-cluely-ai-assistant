@@ -873,11 +873,17 @@ export class AppState {
     // Check and prep Ollama embedding model
     this.bootstrapOllamaEmbeddings()
 
+    // Prime the optional Hindsight long-term-memory server health cache (settings/env
+    // config; Noop when unconfigured). Fire-and-forget — never blocks startup.
+    try {
+      const { HindsightManager } = require('./services/HindsightManager');
+      HindsightManager.getInstance().start().catch(() => { /* never blocks startup */ });
+    } catch { /* optional */ }
 
     this.setupIntelligenceEvents()
 
-    // Pre-warm the zero-shot intent classifier in background
-    warmupIntentClassifier();
+    // Intent-classifier warmup is scheduled after the launcher is visible so
+    // transformers/ONNX initialization cannot contend with the first paint.
 
     // Setup Ollama IPC
     this.setupOllamaIpcHandlers()
@@ -1505,7 +1511,22 @@ export class AppState {
         // 'system' for interviewer (system audio), 'mic' for user (microphone).
         // The server uses ${key}:${channel} as the session key so both streams
         // can coexist without triggering concurrent_session_blocked.
-        stt = new NativelyProSTT(nativelyKey, speaker === 'interviewer' ? 'system' : 'mic');
+        //
+        // Phase 7/8: pass appVersion + platform for the regional-relay
+        // session-create body. The class reads the relay feature flags from
+        // SettingsManager itself and derives the control-plane base URL from
+        // its own host, so the construction site stays tiny. The relay path is
+        // flag-gated OFF by default — this is inert until regionalSttRelayEnabled.
+        stt = new NativelyProSTT(
+          nativelyKey,
+          speaker === 'interviewer' ? 'system' : 'mic',
+          {
+            appVersion: app.getVersion(),
+            platform: process.platform === 'darwin' ? 'mac'
+              : process.platform === 'win32' ? 'windows'
+              : 'linux',
+          },
+        );
       }
     } else if (sttProvider === 'deepgram') {
       const apiKey = CredentialsManager.getInstance().getDeepgramApiKey();
@@ -5236,10 +5257,6 @@ export class AppState {
     this._applyDisguise(this.disguiseMode);
   }
 
-  public applyInitialDisguise(): void {
-    this._applyDisguise(this.disguiseMode);
-  }
-
   private _applyDisguise(mode: 'terminal' | 'settings' | 'activity' | 'none'): void {
     let appName = "Natively";
     let iconPath = "";
@@ -5602,6 +5619,17 @@ if (process.env.THINKING_MATRIX === '1') {
 
   appState.createWindow()
 
+  // Defer the zero-shot intent classifier warmup until after the launcher has
+  // had a chance to paint and settle. The classifier still lazy-loads on first
+  // use, so this only moves startup CPU work out of the visible launch path.
+  setTimeout(() => {
+    try {
+      warmupIntentClassifier();
+    } catch (err) {
+      console.warn('[Init] Intent classifier warmup scheduling failed (non-fatal):', err);
+    }
+  }, Number(process.env.NATIVELY_INTENT_WARMUP_DELAY_MS || '2500'));
+
   // DUAL-DOCK-ICON FIX (promotion half): now that the disguised name/icon are
   // applied and the window exists, promote back to 'regular' so a SINGLE dock
   // tile appears together with the window. Gated on darwin && !undetectable so
@@ -5827,6 +5855,12 @@ if (process.env.THINKING_MATRIX === '1') {
   app.on("before-quit", (event) => {
     console.log("App is quitting, cleaning up resources...");
     appState.setQuitting(true);
+
+    // Stop an app-managed Hindsight server (no-op unless the deferred auto-spawn owns one).
+    try {
+      const { HindsightManager } = require('./services/HindsightManager');
+      HindsightManager.getInstance().stop().catch(() => { /* best effort */ });
+    } catch { /* optional */ }
 
     // Stop the default-output watcher so the setInterval doesn't keep calling
     // into the native module while V8 is tearing down. Without this, quitting

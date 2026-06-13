@@ -343,6 +343,12 @@ interface ElectronAPI {
     Array<{ id: string; title: string; date: string; duration: string; summary: string }>
   >;
   getMeetingDetails: (id: string) => Promise<any>;
+  searchGlobalMeetings: (query: string, filters?: any) => Promise<{ enabled: boolean; results: any[] }>;
+  searchInMeeting: (query: string) => Promise<{ enabled: boolean; results: any[] }>;
+  generateLectureNotes: (opts?: { title?: string; course?: string }) => Promise<{ enabled: boolean; notes: any }>;
+  generateDiagram: (text?: string) => Promise<{ enabled: boolean; diagram: any }>;
+  getIntelligenceFlags: () => Promise<Array<{ key: string; enabled: boolean; setting: string; env: string; default: boolean }>>;
+  setIntelligenceFlag: (key: string, value: boolean | null) => Promise<{ success: boolean; enabled?: boolean; error?: string }>;
   updateMeetingTitle: (id: string, title: string) => Promise<boolean>;
   updateMeetingSummary: (
     id: string,
@@ -811,6 +817,10 @@ interface ElectronAPI {
     modeId: string,
   ) => Promise<{ success: boolean; cancelled?: boolean; file?: any; error?: string }>;
   modesDeleteReferenceFile: (id: string) => Promise<{ success: boolean; error?: string }>;
+  modesGetReferenceFileStatus: (
+    modeId: string,
+  ) => Promise<{ success: boolean; statuses?: Array<{ fileId: string; fileName: string; status: string; chunkCount: number }>; error?: string }>;
+  onModeFileIndexStatus: (callback: (data: { modeId: string; fileId?: string }) => void) => () => void;
   modesGetNoteSections: (modeId: string) => Promise<
     Array<{
       id: string;
@@ -1422,6 +1432,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   finalizeMicSTT: () => ipcRenderer.invoke('finalize-mic-stt'),
   getRecentMeetings: () => ipcRenderer.invoke('get-recent-meetings'),
   getMeetingDetails: (id: string) => ipcRenderer.invoke('get-meeting-details', id),
+  searchGlobalMeetings: (query: string, filters?: any) => ipcRenderer.invoke('search:global-meetings', { query, filters }),
+  searchInMeeting: (query: string) => ipcRenderer.invoke('search:in-meeting', { query }),
+  generateLectureNotes: (opts?: { title?: string; course?: string }) => ipcRenderer.invoke('lecture:generate-notes', opts),
+  generateDiagram: (text?: string) => ipcRenderer.invoke('diagram:generate', { text }),
+  getIntelligenceFlags: () => ipcRenderer.invoke('intelligence-flags:get'),
+  setIntelligenceFlag: (key: string, value: boolean | null) => ipcRenderer.invoke('intelligence-flags:set', { key, value }),
   updateMeetingTitle: (id: string, title: string) =>
     ipcRenderer.invoke('update-meeting-title', { id, title }),
   updateMeetingSummary: (id: string, updates: any) =>
@@ -2146,6 +2162,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   modesUploadReferenceFile: (modeId: string) =>
     ipcRenderer.invoke('modes:upload-reference-file', modeId),
   modesDeleteReferenceFile: (id: string) => ipcRenderer.invoke('modes:delete-reference-file', id),
+  modesGetReferenceFileStatus: (modeId: string) =>
+    ipcRenderer.invoke('modes:get-reference-file-status', modeId),
+  onModeFileIndexStatus: (callback: (data: { modeId: string; fileId?: string }) => void) => {
+    const subscription = (_: any, data: { modeId: string; fileId?: string }) => callback(data);
+    ipcRenderer.on('mode-file-index-status', subscription);
+    return () => {
+      ipcRenderer.removeListener('mode-file-index-status', subscription);
+    };
+  },
   modesGetNoteSections: (modeId: string) => ipcRenderer.invoke('modes:get-note-sections', modeId),
   modesAddNoteSection: (modeId: string, title: string, description: string) =>
     ipcRenderer.invoke('modes:add-note-section', modeId, title, description),

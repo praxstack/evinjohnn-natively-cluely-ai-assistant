@@ -162,6 +162,36 @@ parentPort.on('message', async (msg: any) => {
 
       console.log(`[WhisperWorker] Loading ${msg.modelId} | providers=${providers.join(',')} | dtype=${dtypeDesc}`);
 
+      // DIAGNOSTICS (2026-06-13): the model files load fine in isolation (raw ORT +
+      // transformers, both in system node), yet the live worker can fail with
+      // "Protobuf parsing failed". Log the exact runtime view so the failing GUI run
+      // prints precisely WHY — cacheDir, resolved file paths + sizes, ORT backend, and
+      // the ORT version transformers actually bound. Cheap, init-only (not per-token).
+      try {
+        const _fs = require('fs');
+        const _path = require('path');
+        const _orgName = String(msg.modelId).split('/');
+        const _modelDir = _path.join(String(msg.cacheDir), _orgName[0] || '', _orgName[1] || '', 'onnx');
+        const _encName = typeof dtype === 'string' && dtype !== 'fp32' ? `encoder_model_${dtype}.onnx` : 'encoder_model.onnx';
+        const _decName = typeof dtype === 'string' && dtype !== 'fp32' ? `decoder_model_merged_${dtype}.onnx` : 'decoder_model_merged.onnx';
+        const _stat = (p: string) => { try { return _fs.statSync(p).size; } catch { return -1; } };
+        let _ortVer = 'unknown';
+        try { _ortVer = require('onnxruntime-node/package.json').version; } catch { /* bundled? */ }
+        console.log('[WhisperWorker][diag]', JSON.stringify({
+          cacheDir: String(msg.cacheDir),
+          modelDir: _modelDir,
+          modelDirExists: _fs.existsSync(_modelDir),
+          encoderFile: _encName, encoderBytes: _stat(_path.join(_modelDir, _encName)),
+          decoderFile: _decName, decoderBytes: _stat(_path.join(_modelDir, _decName)),
+          providers, dtype: dtypeDesc,
+          ortNodeVersion: _ortVer,
+          ortBackend: (env.backends?.onnx ? Object.keys(env.backends.onnx) : []),
+          execEnv: { execPath: process.execPath, nodeVer: process.version, modules: process.versions.modules, electron: process.versions.electron || 'n/a' },
+        }));
+      } catch (diagErr: any) {
+        console.log('[WhisperWorker][diag] diagnostics failed (non-fatal):', diagErr?.message);
+      }
+
       // HF Transformers fires progress_callback per *file* (encoder, decoder,
       // tokenizer, config…). The raw `data.progress` is per-file 0..100, which
       // makes a model-level bar bounce around (3 → 2 → 100 → 5 → …) as files
@@ -175,8 +205,19 @@ parentPort.on('message', async (msg: any) => {
       // 0 when unknown / lookup failed → the aggregator falls back to observed
       // file totals. The constructor sanitizes any non-finite/negative value.
       const aggregator = new WhisperProgressAggregator(Number(msg.expectedBytes));
+      // External-data format: forwarded only when the catalog declares it (for
+      // checkpoints whose config.json omits it, e.g. Whisper Large v3 Turbo).
+      // When undefined, transformers falls back to the model's own config —
+      // preserving prior behaviour for every self-declaring model. Without this
+      // the sibling `*.onnx_data` weight file is never fetched and ORT aborts:
+      // "filesystem error: in file_size: ... encoder_model.onnx_data".
+      const useExternalDataFormat: boolean | Record<string, boolean> | undefined =
+        msg.useExternalDataFormat;
       pipe = await pipeline('automatic-speech-recognition', msg.modelId, {
         dtype,
+        ...(useExternalDataFormat !== undefined
+          ? { use_external_data_format: useExternalDataFormat }
+          : {}),
         progress_callback: (data: any) => {
           const { pct } = aggregator.update(data);
           if (pct === null) return;
@@ -194,6 +235,19 @@ parentPort.on('message', async (msg: any) => {
 
       parentPort!.postMessage({ type: 'ready' });
     } catch (e: any) {
+      // Full failure dump (2026-06-13 diag): the error message alone ("Protobuf
+      // parsing failed") doesn't say WHICH file or WHY. Log the full error, stack,
+      // and any ORT-specific cause so the failing GUI run is self-diagnosing.
+      try {
+        console.error('[WhisperWorker][diag] MODEL LOAD FAILED:', {
+          modelId: msg.modelId,
+          message: e?.message,
+          name: e?.name,
+          code: e?.code,
+          cause: e?.cause ? String(e.cause).slice(0, 300) : undefined,
+          stackHead: String(e?.stack || '').split('\n').slice(0, 5).join(' | '),
+        });
+      } catch { /* noop */ }
       parentPort!.postMessage({
         type: 'error',
         message: `Failed to load model: ${e.message}`,
