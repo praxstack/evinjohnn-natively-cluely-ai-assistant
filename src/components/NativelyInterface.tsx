@@ -101,12 +101,17 @@ import {
   shouldHoldEagerCodeExpansion,
 } from '../lib/overlayCodeExpansion.mjs';
 import {
+  // OVERLAY_RESIZE_EASE (the bezier) is intentionally NOT imported here: the
+  // live width channel now uses OVERLAY_RESIZE_SPRING for velocity-continuous,
+  // interrupt-safe scroll-driven retargeting. The bezier remains exported from
+  // the easing module for its pure/tested deterministic samplers.
   OVERLAY_RESIZE_DURATION_MS,
-  OVERLAY_RESIZE_EASE,
+  OVERLAY_RESIZE_SPRING,
 } from '../../electron/utils/overlayResizeEasing.mjs';
 import { shouldAcceptIntelligenceIpc } from '../lib/overlayIntelligenceGeneration.mjs';
 import { shouldUseStreamingCodeUi } from '../lib/overlayStreamingCodeUi.mjs';
 import { widthDerivedScrollMax, verticalScrollCap } from '../lib/overlayScrollBudget.mjs';
+import { resolveChatStreamToken, resolveChatStreamDone, resolveLiveAnswerBatch } from '../lib/chatStreamGuard.mjs';
 import { isPointerOverContent } from '../lib/overlayHoverHitTest.mjs';
 import {
   applyFirstStreamingToken,
@@ -230,6 +235,16 @@ interface NativelyInterfaceProps {
   overlayOpacity?: number;
   interfaceTheme?: MeetingInterfaceTheme;
 }
+
+const buildConversationContextFromMessages = (items: Message[]): string =>
+  items
+    .filter((m) => m.role !== 'user' || !m.hasScreenshot)
+    .map(
+      (m) =>
+        `${m.role === 'interviewer' ? 'Interviewer' : m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`,
+    )
+    .slice(-20)
+    .join('\n');
 
 // PERF: HighlightedCode renders a single fenced code block. Hoisted to module
 // scope and wrapped in React.memo so a parent re-render does not re-tokenize
@@ -833,15 +848,28 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // immediately contradict eager expansion and schedule a collapse.
   const eagerCodeExpansionHoldRef = useRef(false);
   const animationControlsRef = useRef<ReturnType<typeof animate> | null>(null);
-  // Wall-clock deadline until which the CSS width tween is running. The OS
+  // Honors the OS "Reduce Motion" accessibility setting (WCAG 2.3.3). When the
+  // user prefers reduced motion we SNAP the shell width instead of springing it
+  // — same final state, zero animated travel. A ref (not state) so the
+  // streaming-hot startTransition reads it without a re-render; refreshed live
+  // by the matchMedia listener below so toggling the OS setting takes effect
+  // without an app restart.
+  const prefersReducedMotionRef = useRef(
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      : false,
+  );
+  // Wall-clock deadline until which the CSS width animation is running. The OS
   // window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 780) and never width-resizes;
   // only the CSS panel animates 600↔780 centered inside it. But that CSS width
   // change reflows content HEIGHT every frame, firing the ResizeObserver ~60×,
-  // and each height-only setBounds re-rasterizes the transparent backdrop-blur
-  // window → flicker. So while now < this deadline we SUPPRESS per-frame height
-  // reporting and defer to a single authoritative height settle at the tween's
-  // onComplete. (Width is never reported as anything but the fixed 780, so there
-  // is no width setBounds to suppress — that is the whole point of the fix.)
+  // and a height setBounds on every one re-rasterizes the transparent backdrop-
+  // blur window → flicker. So while now < this deadline the ResizeObserver's own
+  // height reporting is SUPPRESSED; the width animation instead drives a single
+  // RATE-LIMITED (~30fps) height channel itself + one authoritative settle at
+  // onComplete (see startTransition). (Width is never reported as anything but
+  // the fixed 780, so there is no width setBounds to suppress — that is the
+  // whole point of the fix.)
   //
   // A self-expiring DEADLINE (not a boolean cleared by framer's onComplete) is
   // deliberate: framer's stop() does NOT fire onComplete, so a boolean could
@@ -849,11 +877,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // freeze height reporting. A deadline lapses on its own. Set to 0 to release
   // immediately (session reset).
   const heightReportSuppressedUntilRef = useRef(0);
-  // Stability gate for code-visibility transitions. Scroll fires at ~60Hz;
-  // without this, fast scrolls cancel and restart the width tween repeatedly,
-  // producing stutter (and sometimes a snap when start≈target). The pending
-  // visibility must hold its new state for STABILITY_MS before we commit to
-  // a transition.
+  // Stability gate for code-visibility transitions. Scroll fires at ~60Hz; this
+  // debounces the scanner so a code block flickering across the viewport edge
+  // during a fast scroll does not issue a transition on every frame. The width
+  // animation is now an interrupt-safe SPRING that retargets with velocity
+  // continuity (so a mid-flight re-trigger no longer hitches — that was the old
+  // bezier-restart stutter), but the gate is still worth keeping: it batches
+  // rapid edge-crossings into one committed direction and avoids needless
+  // animate() churn. The pending visibility must hold its new state for
+  // STABILITY_MS before we commit.
   const stableVisibilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingVisibilityRef = useRef<boolean | null>(null);
   // Sticky-bottom across expand/contract. Captured at the start of each
@@ -1166,26 +1198,33 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   );
 
   // ── Code-expansion spring ────────────────────────────────────────────────
-  // Architecture: OS window resizes in lockstep with the renderer spring.
+  // Architecture: the OS window is a FIXED WIDTH (780) for its whole lifetime;
+  // only the CSS panel animates 600↔780, centered inside it. So width motion is
+  // PURELY renderer-side — there is no per-frame native width setBounds and the
+  // window X origin never moves (TopPill stays pixel-stable, no blur re-raster).
   //
-  // The shell width animates 600 ↔ 780 via a Framer tween and the OS window
-  // width follows on the same clock: a motion-value subscriber pushes width
-  // to the main process per frame (rAF-coalesced, ≤1px deduped). The IPC
-  // (setOverlayDimensionsCentered) does an atomic center-preserving
-  // setBounds so the TopPill stays anchored as the frame shrinks/grows.
-  //
-  // Height is still driven by the ResizeObserver; width is the motion value.
-  // The two channels never disagree because reportShellSize also reads
-  // shellWidth.get() instead of trusting an expansion flag.
+  // `shellWidth` is a MotionValue driven by OVERLAY_RESIZE_SPRING and bound
+  // directly to the panel's CSS `width`. Content reflows to the real panel width
+  // on every frame (correct at every in-between width — no clip/scale/transform).
+  // Only HEIGHT flows to the OS, via the ResizeObserver / reportShellSize (and a
+  // rate-limited channel during the tween); reportShellSize reads shellWidth.get()
+  // so the height it reports always matches the panel's current width.
   const SHELL_WIDTH_COLLAPSED = 600;
-  const SHELL_WIDTH_EXPANDED = 780;
-  // The OS overlay window is a FIXED WIDTH for its entire visible lifetime, equal
-  // to the EXPANDED shell width. The window is created/shown at this width and
-  // never width-resized; the CSS panel animates 600↔780 centered inside it
-  // (mx-auto). This MUST match WindowHelper.OVERLAY_DEFAULT_WIDTH. Keeping the
-  // window width fixed means its X origin never moves, so the TopPill is
-  // pixel-stable and there is zero per-frame transparent-window re-raster.
-  const OVERLAY_WINDOW_WIDTH = SHELL_WIDTH_EXPANDED;
+  // The EXPANDED panel is intentionally NARROWER than the OS window (732 < 780).
+  // The window is fixed at 780 (OVERLAY_WINDOW_WIDTH below); decoupling the panel
+  // from it leaves a permanent ~24px gutter on each side even when expanded, which
+  // is the room the floating resize toggle needs to keep its corner gap in the
+  // expanded state (when the panel filled the window edge-to-edge there was no
+  // gutter, so the button was forced inward over the panel — the reported bug).
+  const SHELL_WIDTH_EXPANDED = 732;
+  // The OS overlay window is a FIXED WIDTH for its entire visible lifetime. The
+  // window is created/shown at this width and never width-resized; the CSS panel
+  // animates 600↔732 centered inside it (mx-auto). This MUST match
+  // WindowHelper.OVERLAY_DEFAULT_WIDTH. Keeping the window width fixed means its
+  // X origin never moves, so the TopPill is pixel-stable and there is zero
+  // per-frame transparent-window re-raster. It is INTENTIONALLY wider than
+  // SHELL_WIDTH_EXPANDED so a side gutter always exists for the resize toggle.
+  const OVERLAY_WINDOW_WIDTH = 780;
   const shellWidth = useMotionValue(SHELL_WIDTH_COLLAPSED);
   // Vertical budget cap for the chat scroll area. Default Infinity = "not yet
   // measured / unbounded", so the width-derived aesthetic max applies until we
@@ -1195,15 +1234,75 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // ≤ the budget the OS window will be granted, so the footer (model selector /
   // settings / send) can never be cropped below the clamped window edge.
   const verticalCap = useMotionValue(Infinity);
+  // scrollMaxH is the chat viewport's MAX-HEIGHT, derived from the LIVE
+  // `shellWidth` motion value (the panel's actual animating width) mins'd against
+  // the measured vertical budget cap. Binding it to the live width means the
+  // scroll area's tall/short budget grows/shrinks IN STEP with the panel as the
+  // spring runs (widthDerivedScrollMax: 320px collapsed → 560px expanded), so the
+  // visible chat region tracks the panel size frame-for-frame. This is a motion
+  // value bound to a style, so it updates without a React re-render.
   const scrollMaxH = useTransform([shellWidth, verticalCap], ([w, cap]: number[]) =>
-    Math.min(widthDerivedScrollMax(w), cap),
+    // Pass the real collapsed/expanded panel widths so the 320→560 scroll-height
+    // ramp reaches its max at the actual expanded width (732), not the default 780.
+    Math.min(
+      widthDerivedScrollMax(w, {
+        collapsedWidth: SHELL_WIDTH_COLLAPSED,
+        expandedWidth: SHELL_WIDTH_EXPANDED,
+      }),
+      cap,
+    ),
   );
-  // Tracks the panel's top-right corner as the CSS width tween runs. The OS
-  // window is a fixed OVERLAY_WINDOW_WIDTH; the panel is centered inside it, so
-  // the panel's right edge sits (OVERLAY_WINDOW_WIDTH - shellWidth) / 2 px from
-  // the window right. The button floats 8 px outside that edge so it's always
-  // visually adjacent to the corner regardless of collapsed/expanded state.
-  const buttonRight = useTransform(shellWidth, (w) => (OVERLAY_WINDOW_WIDTH - w) / 2 + 8);
+  // The floating resize toggle rides the panel's top-right CORNER along that
+  // corner's 45° bisector, with a small gap from the body when there's room. Its
+  // center is offset from the corner point by the SAME distance `d` on BOTH axes,
+  // which is what keeps it exactly on the 45° diagonal in every state (an earlier
+  // version clamped only the horizontal when expanded → unequal offsets → off the
+  // diagonal, the reported bug).
+  //
+  // Corner point in viewport coords:
+  //   • x: the panel is centered in the fixed-width OVERLAY_WINDOW_WIDTH window,
+  //     so its right edge sits M = (OVERLAY_WINDOW_WIDTH - shellWidth) / 2 px from
+  //     the window right (M = 90 collapsed → 0 expanded). Off the LIVE shellWidth,
+  //     so the button follows the corner every spring frame.
+  //   • y: the panel's measured top edge (panelTop, via measureButtonTop()).
+  //
+  // `d` = signed diagonal offset of the button CENTER from the corner, measured
+  // outward (toward the window's top-right corner = up-and-right):
+  //   • Desired: +GAP, so the button sits GAP px outside the corner in the gutter
+  //     — the space between body and button the user asked for.
+  //   • Constraint: the button must stay on-screen. The outward room to the right
+  //     is M (the gutter width); going further clips past the window edge. So we
+  //     cap d at (M - BTN/2 - EDGE_MARGIN). When expanded M→0 this cap is
+  //     NEGATIVE, so d flips negative and the button tucks INWARD along the SAME
+  //     diagonal (equal on both axes) — still on the 45° line, just inside the
+  //     corner instead of outside it.
+  // center-x from window right = M - d  → right = (M - d) - BTN/2
+  // center-y from window top   = panelTop - d → top = (panelTop - d) - BTN/2
+  const RESIZE_BTN_SIZE = 28; // matches ResizeToggle's w-[28px]
+  const RESIZE_BTN_DIAGONAL_GAP = 8; // outward gap from the corner when there's room
+  const RESIZE_BTN_EDGE_MARGIN = 2; // keep this much of the button on-screen when expanded
+  // Diagonal offset `d`, shared by both axes so the button is always on the 45°
+  // bisector. Capped by the available gutter so it never clips off the window.
+  const resizeBtnDiagonalOffset = useTransform(shellWidth, (w) => {
+    const m = (OVERLAY_WINDOW_WIDTH - w) / 2;
+    return Math.min(RESIZE_BTN_DIAGONAL_GAP, m - RESIZE_BTN_SIZE / 2 - RESIZE_BTN_EDGE_MARGIN);
+  });
+  const buttonRight = useTransform([shellWidth, resizeBtnDiagonalOffset], ([w, d]: number[]) =>
+    (OVERLAY_WINDOW_WIDTH - w) / 2 - d - RESIZE_BTN_SIZE / 2,
+  );
+  // Vertical anchor. `panelTopMV` holds the panel card's measured top edge
+  // (viewport-relative), set by measureButtonTop(). The button is position:fixed,
+  // but the panel card is NOT at the window top — it sits below the TopPill + 8px
+  // gap (plus any status pills / banners) — so this offset is dynamic and measured
+  // from shellRef. The panel's TOP does not move during a width animation (only
+  // its width does), so refreshing on layout change — not per frame — is enough.
+  // Initial guess covers TopPill(~36) + gap(8). buttonTop applies the SAME
+  // diagonal offset `d` as buttonRight (subtracted, since up = toward the window
+  // top) so the button center stays on the corner's 45° bisector in every state.
+  const panelTopMV = useMotionValue(44);
+  const buttonTop = useTransform([panelTopMV, resizeBtnDiagonalOffset], ([top, d]: number[]) =>
+    top - d - RESIZE_BTN_SIZE / 2,
+  );
 
   // isExpanded mirror for closures inside refs/observers that must not
   // re-bind on every toggle.
@@ -1423,8 +1522,22 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     isExpandedRef.current = isExpanded;
   }, [isExpanded]);
 
-  // Single canonical size-reporter. Width is the live motion value
-  // (so OS frame matches the spring mid-tween); height is from the
+  // Live-track the OS "Reduce Motion" preference so toggling it applies without
+  // an app restart. startTransition reads prefersReducedMotionRef synchronously.
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const onChange = (e: MediaQueryListEvent) => {
+      prefersReducedMotionRef.current = e.matches;
+    };
+    prefersReducedMotionRef.current = mql.matches;
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
+
+  // Single canonical size-reporter. Width is ALWAYS the fixed OVERLAY_WINDOW_WIDTH
+  // (the OS window never width-resizes — the CSS panel animates inside it), so
+  // this is effectively a height-only reporter; height is from the
   // ResizeObserver-measured content rect. Centered IPC keeps the
   // TopPill's horizontal center invariant across resizes.
   const reportShellSize = useCallback(() => {
@@ -1501,11 +1614,29 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     verticalCap.set(nextCap);
   }, [attachedContext.length, verticalCap]);
 
+  // Measure the panel card's top edge (viewport-relative) into panelTopMV so the
+  // floating resize toggle can ride the panel's TOP-RIGHT CORNER, not the window
+  // top. The panel sits below the TopPill + 8px gap (and any status pills /
+  // warning banners that push it further down), so this offset is dynamic. We read
+  // shellRef (the rounded panel card itself), not contentRef (the whole stack
+  // including the TopPill). We store the RAW top edge here; buttonTop applies the
+  // diagonal offset + BTN/2 centering. getBoundingClientRect().top is
+  // viewport-relative, which is what position:fixed `top` wants. The panel's TOP
+  // does not move during a width animation (only its width does), so measuring on
+  // layout change — not per frame — is correct and cheap.
+  const measureButtonTop = useCallback(() => {
+    const shellEl = shellRef.current;
+    if (!shellEl) return;
+    const top = shellEl.getBoundingClientRect().top;
+    if (top > 0) panelTopMV.set(Math.round(top));
+  }, [panelTopMV]);
+
   // NOTE: the old per-frame "chase" subscriber that pushed the live shell width
   // to setBounds every frame is GONE. The OS window is a fixed width (780) for
-  // its whole lifetime, so there is nothing to chase — the CSS panel animates
-  // 600↔780 entirely on the compositor with no native width resize at all. Only
-  // HEIGHT flows to the OS, via reportShellSize / the ResizeObserver below.
+  // its whole lifetime, so there is nothing to chase — the panel animates
+  // 600↔780 purely renderer-side (CSS `width` bound to the shellWidth spring),
+  // with no native width resize at all. Only HEIGHT flows to the OS, via
+  // reportShellSize / the ResizeObserver.
 
   // ResizeObserver: rAF-debounced so the spring can update height without
   useLayoutEffect(() => {
@@ -1521,6 +1652,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // the observer fires again and this self-converges in ≤2 frames; chrome
         // height is scroll-invariant, so there is no feedback loop.
         measureVerticalCap();
+        // Re-anchor the floating resize toggle: anything that changes content
+        // height above the panel (status pills, warning banners, an attached
+        // screenshot strip) shifts the panel's top edge, so the button's `top`
+        // must follow. Cheap rect read, not per width-frame.
+        measureButtonTop();
         // FLICKER GUARD: during the CSS width tween the panel width changes every
         // frame, which reflows content height every frame and fires this observer
         // ~60×; each reportShellSize() would do a native height setBounds, and
@@ -1543,7 +1679,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         rafDimUpdateRef.current = null;
       }
     };
-  }, [reportShellSize, measureVerticalCap]);
+  }, [reportShellSize, measureVerticalCap, measureButtonTop]);
 
   // ── Hover-gated click-through for the fixed-width window's transparent margins
   // The OS window is a fixed 780px wide but the painted panel is only 600px when
@@ -1608,25 +1744,32 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       measureVerticalCap();
+      measureButtonTop();
       reportShellSize();
     });
     return () => cancelAnimationFrame(id);
-  }, [attachedContext, reportShellSize, measureVerticalCap]);
+  }, [attachedContext, reportShellSize, measureVerticalCap, measureButtonTop]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       measureVerticalCap();
+      measureButtonTop();
       reportShellSize();
     }, 600);
     return () => clearTimeout(timer);
-  }, [reportShellSize, measureVerticalCap]);
+  }, [reportShellSize, measureVerticalCap, measureButtonTop]);
 
-  // ── Code-expansion (CSS-ONLY, fixed-width window) ────────────────────────
-  // THE FIX (third attempt, root cause confirmed): the OS window is a FIXED
-  // WIDTH (OVERLAY_WINDOW_WIDTH = 780) for its entire visible lifetime. The
-  // expand/contract is animated PURELY in CSS — only the `shellWidth` motion
-  // value tweens 600↔780, and the panel is centered (mx-auto) inside the fixed
-  // window. There is NO width setBounds during the interaction at all.
+  // ── Code-expansion (renderer-only width spring, fixed-width window) ──────────
+  // THE FIX: the OS window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 780) for its
+  // entire visible lifetime, and the panel is centered (mx-auto) inside it. There
+  // is NO width setBounds during the interaction at all. The expand/contract
+  // travel is a renderer-only CSS `width` animation: the `shellWidth` spring is
+  // bound to the panel's `width` style, so the content reflows (text re-wrap +
+  // code re-layout) to the real panel width on every frame and is correct at
+  // every in-between width — no clipping, no phantom layout width, no transform
+  // distortion. Per-frame reflow cost is held down by `contain: layout style` on
+  // the shell (scopes the reflow) + memoized syntax highlighting (a width change
+  // re-wraps without re-tokenizing).
   //
   // Why: the previous two attempts shifted the window's X origin during the
   // animation (to keep the panel centered as the window width changed). But
@@ -1638,11 +1781,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   //   • TopPill (centered in the fixed window) is pixel-stable — zero jump.
   //   • No per-frame width setBounds → no transparent-blur re-raster — zero flicker.
   //
-  // Only HEIGHT still flows to the OS (content/streaming growth), via a single
+  // Only HEIGHT still flows to the OS (content/streaming growth), via a
   // height-only, top-anchored setBounds — which does not move X. During the CSS
-  // width tween the height reflows every frame, so per-frame height reports are
-  // SUPPRESSED (heightReportSuppressedUntilRef) and a single authoritative
-  // height settle fires at onComplete.
+  // width animation the height reflows every frame, so the ResizeObserver's own
+  // reporting is SUPPRESSED (heightReportSuppressedUntilRef) and the animation
+  // instead drives height itself, rate-limited to ~30fps (see startTransition),
+  // with a final authoritative settle at onComplete.
   const resizeOverlayWindowCentered = useCallback(
     (height: number) => {
       if (height <= 0) return;
@@ -1658,16 +1802,25 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     [OVERLAY_WINDOW_WIDTH],
   );
 
+  // Re-pin the chat to the bottom for the current frame (iMessage-style sticky
+  // bottom). Hoisted out of the animation callback so both the spring's
+  // per-frame onUpdate and the reduced-motion snap path share one definition.
+  // A single layout read + single write, no forced flush.
+  const pinScrollBottomIfNeeded = useCallback(() => {
+    if (!wasAtBottomRef.current) return;
+    const c = scrollContainerRef.current;
+    if (c) c.scrollTop = c.scrollHeight - c.clientHeight;
+  }, []);
+
   const startTransition = useCallback(
     (targetWidth: number) => {
       codeExpandedRef.current = targetWidth === SHELL_WIDTH_EXPANDED;
-      if (animationControlsRef.current) animationControlsRef.current.stop();
 
       const fromWidth = Math.round(shellWidth.get());
 
       // iMessage-style sticky bottom. Capture the user's scroll intent now,
       // before scrollMaxH starts changing. If they were at (or near) the
-      // bottom, we keep them pinned there throughout the tween so growing
+      // bottom, we keep them pinned there throughout the animation so growing
       // viewport height doesn't reveal stale history below the visible chat.
       const container = scrollContainerRef.current;
       if (container) {
@@ -1678,65 +1831,107 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
       // No meaningful width change: nothing to animate, no native resize.
       if (Math.abs(targetWidth - fromWidth) <= 1) {
+        if (animationControlsRef.current) animationControlsRef.current.stop();
+        animationControlsRef.current = null;
+        // Snap the live width to the target so the box rests at the exact width.
         shellWidth.set(targetWidth);
         return;
       }
 
-      // Suppress per-frame HEIGHT reporting for the whole tween: the CSS width
-      // change reflows content height ~60×/s, and one height setBounds per frame
-      // re-rasters the transparent-blur window → flicker. Settle once at
-      // onComplete instead. (There is NO width setBounds to suppress — the window
-      // width is fixed.) Margin covers onComplete jitter. Self-expiring deadline
-      // so an interrupted/retargeted tween can never wedge reporting off.
-      heightReportSuppressedUntilRef.current = Date.now() + OVERLAY_RESIZE_DURATION_MS + 120;
+      // ACCESSIBILITY (WCAG 2.3.3): honor "Reduce Motion" — snap to the target
+      // width with no animated travel, then settle height once. No suppression
+      // window needed because there is no multi-frame tween to protect against.
+      if (prefersReducedMotionRef.current) {
+        if (animationControlsRef.current) animationControlsRef.current.stop();
+        animationControlsRef.current = null;
+        heightReportSuppressedUntilRef.current = 0;
+        // Snap the width to the target with no animated travel; content reflows
+        // once to the final width.
+        shellWidth.set(targetWidth);
+        pinScrollBottomIfNeeded();
+        const h = contentRef.current?.offsetHeight ?? 0;
+        if (h > 0) resizeOverlayWindowCentered(h);
+        return;
+      }
 
-      // Throttled height reporter for the tween duration. The CSS width change
-      // reflows content height every frame as the panel grows/shrinks, but we
-      // cannot setBounds at 60fps (backdrop-blur re-raster causes flicker). We
-      // sample height at ~15fps (every 67ms) — smooth enough that the OS window
-      // bottom visibly tracks the content growth instead of snapping at the end,
-      // but coarse enough to avoid per-frame native raster.
-      let lastHeightReport = 0;
-      const HEIGHT_THROTTLE_MS = 67;
+      // Suppress the ResizeObserver's own per-frame HEIGHT reporting for the
+      // whole animation: the live `width` animation reflows content height every
+      // frame, so the ResizeObserver fires ~60× and each height setBounds would
+      // re-raster the transparent backdrop-blur window → flicker. (There is NO
+      // width setBounds to suppress — the window width is fixed.) Instead the
+      // animation drives a single, RATE-LIMITED height channel below. The
+      // deadline EXTENDS on every (re)trigger so a mid-flight scroll retarget
+      // keeps the observer suppressed across the blended motion; a generous tail
+      // covers the spring's settle past visualDuration. Self-expiring so an
+      // interrupted spring can never wedge reporting off.
+      heightReportSuppressedUntilRef.current =
+        Date.now() + OVERLAY_RESIZE_DURATION_MS + 260;
 
-      // CSS-only width tween on the compositor clock. Monotonic ease-out (no
-      // overshoot). The panel grows/shrinks symmetrically off the fixed center.
+      // Height channel for the animation. The chat scroll viewport's max-height
+      // is derived from the LIVE width (widthDerivedScrollMax: 320px collapsed →
+      // 560px expanded), so it ramps up with the spring on EXPAND. If we only
+      // settled height at onComplete the OS window would stay short for the whole
+      // expand and CLIP the bottom of the growing content until it jumped at the
+      // end. So we track height during the animation, but:
+      //   • driven from the spring's onUpdate (same frame it reads offsetHeight
+      //     from, so the window edge and the panel are computed from one
+      //     consistent layout, never a frame apart);
+      //   • rate-limited to ~30fps (33ms) so a height step from streaming growth
+      //     mid-tween stays below perception;
+      //   • integer-deduped, so a stable height issues no redundant setBounds
+      //     (no needless blur re-raster).
+      // 30fps stays well under 60fps, so it does not reintroduce the per-frame
+      // native setBounds that the suppression machinery exists to prevent.
+      let lastHeightReportAt = 0;
+      let lastReportedHeight = -1;
+      const HEIGHT_REPORT_INTERVAL_MS = 33; // ~30fps
+
+      // WIDTH SPRING on the renderer clock (600↔780 inside the fixed window). Why
+      // a spring instead of the old duration+bezier tween:
+      //
+      //   The scroll scanner re-fires startTransition whenever a code block
+      //   crosses the viewport edge during a scroll. A duration+bezier RESTARTS
+      //   from progress 0 (zero velocity) at the current width on each re-fire,
+      //   so a scroll through mixed code/text stacked velocity discontinuities
+      //   = the perceived stutter. We deliberately DO NOT call .stop() before
+      //   re-issuing: framer-motion reads the motion value's CURRENT velocity
+      //   and retargets the spring in-flight, blending consecutive expand /
+      //   contract scans into one continuous motion. stop() would zero that
+      //   velocity and reintroduce the hitch, so it is reserved for the
+      //   no-op / reduced-motion / unmount paths only.
+      //
+      //   bounce:0 (critically damped, see OVERLAY_RESIZE_SPRING) means an
+      //   uninterrupted run has NO overshoot and reads identically to the old
+      //   drawer tween. Any micro-overshoot during an interrupted retarget is
+      //   renderer-only (it nudges the CSS width, never a native width setBounds —
+      //   the window width is fixed), so it is safe.
       animationControlsRef.current = animate(shellWidth, targetWidth, {
-        duration: OVERLAY_RESIZE_DURATION_MS / 1000,
-        ease: OVERLAY_RESIZE_EASE,
+        ...OVERLAY_RESIZE_SPRING,
         onUpdate: () => {
-          if (wasAtBottomRef.current) {
-            const c = scrollContainerRef.current;
-            if (c) {
-              // scrollMaxH is derived from shellWidth, so on every tick the
-              // viewport height has just changed. Re-pin to bottom in the
-              // SAME frame — single layout read, single write, no flush.
-              c.scrollTop = c.scrollHeight - c.clientHeight;
-            }
-          }
-          // Throttled height sample: lets the OS window bottom track content
-          // growth during the tween instead of snapping at onComplete. Far
-          // below 60fps so backdrop-blur re-raster stays below perception.
+          pinScrollBottomIfNeeded();
           const now = Date.now();
-          if (now - lastHeightReport >= HEIGHT_THROTTLE_MS) {
-            lastHeightReport = now;
-            const h = contentRef.current?.offsetHeight ?? 0;
-            if (h > 0) resizeOverlayWindowCentered(h);
-          }
+          if (now - lastHeightReportAt < HEIGHT_REPORT_INTERVAL_MS) return;
+          const h = contentRef.current?.offsetHeight ?? 0;
+          if (h <= 0 || h === lastReportedHeight) return;
+          lastHeightReportAt = now;
+          lastReportedHeight = h;
+          resizeOverlayWindowCentered(h);
         },
         onComplete: () => {
           animationControlsRef.current = null;
           // Hand reporting back to normal FIRST so the settle below actually
           // fires (the ResizeObserver early-returns while suppression is live).
           heightReportSuppressedUntilRef.current = 0;
-          // Authoritative HEIGHT settle: ensures the final frame is exact even
-          // if the last throttled sample landed slightly before the tween end.
+          // Authoritative HEIGHT settle: one setBounds for the final, exact
+          // content height after the width (and therefore the width-derived
+          // scroll max) has fully settled — guarantees the final frame is exact
+          // even if the last rate-limited sample landed a few px short.
           const settledHeight = contentRef.current?.offsetHeight ?? 0;
           resizeOverlayWindowCentered(settledHeight);
         },
       });
     },
-    [shellWidth, SHELL_WIDTH_EXPANDED, resizeOverlayWindowCentered],
+    [shellWidth, SHELL_WIDTH_EXPANDED, resizeOverlayWindowCentered, pinScrollBottomIfNeeded],
   );
 
   // Manual resize toggle. Reads the LIVE shell width (not codeExpandedRef) so it
@@ -1770,8 +1965,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // Uses a stability gate: the visibility must hold its new state for
   // STABILITY_MS before a transition fires. This filters out the rapid
   // visible↔invisible flicker that occurs when a code block crosses the
-  // viewport edge during a fast scroll, which would otherwise interrupt
-  // the 0.7s tween mid-flight and cause stutter.
+  // viewport edge during a fast scroll, batching it into a single committed
+  // direction. (The width spring retargets smoothly if a transition does fire
+  // mid-flight, so the gate is no longer the only thing standing between fast
+  // scroll and stutter — but it still avoids redundant animate() churn.)
   const STABILITY_MS = 120;
   const checkCodeVisibility = useCallback(() => {
     // While the user has manually pinned a width, auto-resize is fully
@@ -1929,15 +2126,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
   // Build conversation context from messages
   useEffect(() => {
-    const context = messages
-      .filter((m) => m.role !== 'user' || !m.hasScreenshot)
-      .map(
-        (m) =>
-          `${m.role === 'interviewer' ? 'Interviewer' : m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`,
-      )
-      .slice(-20)
-      .join('\n');
-    setConversationContext(context);
+    setConversationContext(buildConversationContextFromMessages(messages));
   }, [messages]);
 
   // Listen for settings window visibility changes
@@ -2038,10 +2227,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       pendingVisibilityRef.current = null;
       // Release any height-report suppression from an in-flight tween.
       heightReportSuppressedUntilRef.current = 0;
-      // Imperative .set() (not animate) — no transient frame. Width is CSS-only
-      // and the OS window stays fixed at OVERLAY_WINDOW_WIDTH, so snapping the
-      // shell back to collapsed is a pure compositor change with no native
-      // resize and no sideways motion.
+      // Imperative .set() (not animate) — no transient frame. The OS window
+      // stays fixed at OVERLAY_WINDOW_WIDTH, so snapping the shell width back to
+      // collapsed is a renderer-only width reset (content reflows once for the
+      // fresh meeting) with no native resize and no sideways motion.
       shellWidth.set(SHELL_WIDTH_COLLAPSED);
       setInputValue('');
       setAttachedContext([]);
@@ -2141,6 +2330,19 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const streamingRafRef    = useRef<number | null>(null);
   const streamingRenderModeRef = useRef<'imperative' | 'react-code'>('imperative');
   const streamingCodeRafRef = useRef<number | null>(null);
+  // Active chat stream id (audit finding #3). The main process emits chat tokens
+  // on one channel from both the desktop and phone-mirror paths; this lets us drop
+  // tokens/done from a superseded stream. null = no id adopted yet (back-compat).
+  const chatStreamIdRef = useRef<number | null>(null);
+  // Active LIVE-ANSWER generation id (audit finding #3, full). The live what-to-
+  // answer path streams on `intelligence-token-batch` (kind='suggested_answer')
+  // keyed only on intent, so two back-to-back live answers share the same intent
+  // and a superseded answer's already-queued batch could merge into the new
+  // answer's bubble. Each item now carries a generationId; resolveLiveAnswerBatch
+  // (same "newest wins" policy as chatStreamGuard) drops items from an older
+  // generation. null = no id adopted yet (id-less items are always accepted →
+  // backward compatible with the code-hint / brainstorm streams that omit it).
+  const liveAnswerGenIdRef = useRef<number | null>(null);
 
   // Helper: render accumulated markdown to the streaming DOM node via RAF.
   // Called after every token write. Schedules at most one RAF per frame.
@@ -2787,7 +2989,19 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         if (!items || items.length === 0) return;
         if (kind === 'suggested_answer') {
           pinAnswerPanel();
-          for (const it of items) queueToken('what_to_answer', (it as any).token);
+          for (const it of items) {
+            // #3 (full): drop tokens belonging to a superseded live answer so a
+            // stale batch (already queued in main when a newer answer started)
+            // can't merge into the new same-intent ('what_to_answer') bubble.
+            // id-less items (code-hint/brainstorm/older builds) are always kept.
+            const decision = resolveLiveAnswerBatch(
+              liveAnswerGenIdRef.current,
+              (it as any).generationId,
+            );
+            liveAnswerGenIdRef.current = decision.activeId;
+            if (!decision.accept) continue;
+            queueToken('what_to_answer', (it as any).token);
+          }
         } else if (kind === 'refined_answer') {
           for (const it of items) queueToken((it as any).intent, (it as any).token);
         } else if (kind === 'recap') {
@@ -3303,9 +3517,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     const cleanups: (() => void)[] = [];
 
-    // Stream Token — rAF-coalesced via queueToken (same path as intelligence streams)
+    // Stream Token — rAF-coalesced via queueToken (same path as intelligence streams).
+    // streamId guard (audit finding #3): drop tokens from a superseded chat stream so
+    // a phone-mirror or stale desktop stream can't bleed into the active bubble. Tokens
+    // without a streamId (back-compat) are always accepted.
     cleanups.push(
-      window.electronAPI.onGeminiStreamToken((token) => {
+      window.electronAPI.onGeminiStreamToken((token, meta) => {
+        const decision = resolveChatStreamToken(chatStreamIdRef.current, meta?.streamId);
+        chatStreamIdRef.current = decision.activeId;
+        if (!decision.accept) return;
         queueToken('chat', token);
       }),
     );
@@ -3313,6 +3533,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // Stream Done
     cleanups.push(
       window.electronAPI.onGeminiStreamDone((data) => {
+        // Ignore a done from a superseded stream (audit finding #3) so it can't
+        // tear down a newer stream's row. A done without a streamId is honored
+        // (back-compat). On an honored done we clear the adopted id.
+        const doneDecision = resolveChatStreamDone(chatStreamIdRef.current, data?.streamId);
+        chatStreamIdRef.current = doneDecision.activeId;
+        if (!doneDecision.honor) return;
         const pendingText = streamingTextRef.current;
         const pendingMsgId = streamingMsgIdRef.current;
         // finalText is set ONLY when the backend's coding validate→repair changed
@@ -3376,6 +3602,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         flushToken();
         setIsProcessing(false);
         requestStartTimeRef.current = null; // Clear timer on error
+        // Symmetry with the done handler: release the adopted chat stream id so the
+        // next stream starts clean (audit finding #3). Safe today because ids are
+        // monotonic, but keeps token/done/error ref management consistent.
+        chatStreamIdRef.current = null;
         setMessages((prev) => {
           // Append error to the current message or add new one?
           // Let's add a new error block if the previous one confusing,
@@ -5115,6 +5345,7 @@ Provide only the answer, nothing else.`;
         appearance={appearance}
         interfaceTheme={isGlassTheme ? 'liquid-glass' : isModernTheme ? 'modern' : undefined}
         rightOffset={buttonRight}
+        topOffset={buttonTop}
       />
     )}
     <div
@@ -5158,18 +5389,26 @@ Provide only the answer, nothing else.`;
               className={`relative max-w-full backdrop-blur-2xl border rounded-[24px] overflow-hidden flex flex-col draggable-area overlay-shell-surface ${overlayPanelClass}`}
               style={{
                 ...appearance.shellStyle,
-                width: shellWidth,
-                // Removed will-change: 'width' — Framer Motion animates shellWidth
-                // using transform (translateX), not CSS width, so this hint created
-                // a ghost compositor layer with stale dimensions from the first
-                // meeting's layout, blocking correct compositing on remount.
+                // The panel width is bound to the LIVE `shellWidth` motion value,
+                // animated 600↔780 by OVERLAY_RESIZE_SPRING. The content reflows
+                // (text re-wrap + code re-layout) to the real panel width on every
+                // frame, so it is always correct at every in-between width — there
+                // is no clipping, no phantom layout width, no transform distortion.
+                // The OS window stays a fixed OVERLAY_WINDOW_WIDTH (780) and the
+                // panel is centered (mx-auto) inside it, so this width change never
+                // touches a native setBounds and the X origin never moves.
                 //
-                // contain: layout/style scopes the per-frame reflow that the
-                // width animation triggers to this subtree, so growing the shell
-                // doesn't dirty layout/style up the ancestor chain each frame.
-                // NOT `size` (that would stop the box sizing to its content and
-                // break offsetHeight reporting); NOT `paint` (would clip the
-                // backdrop-blur).
+                // The cost of reflowing per frame is held down by keeping each
+                // reflow cheap: `contain: layout style` scopes it to this subtree
+                // (below), and syntax highlighting is memoized on the code STRING +
+                // language so a width change re-wraps text without re-tokenizing.
+                width: shellWidth,
+                // contain: layout/style isolates this box's layout/style from the
+                // ancestor chain so the per-frame width reflow (and any content
+                // growth) does not dirty layout up to the document — the reflow is
+                // SCOPED to this subtree. NOT `size` (would stop the box sizing to
+                // its content and break offsetHeight reporting); NOT `paint` (would
+                // clip the backdrop-blur, which must keep working).
                 contain: 'layout style',
               }}
             >

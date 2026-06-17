@@ -894,14 +894,12 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                     setHasStoredSonioxKey(creds.hasSonioxKey || false);
 
                     setHasNativelyKey(creds.hasNativelyKey || false);
-                    // Populate key fields so switching providers doesn't make saved keys appear gone
-                    if (creds.sttGroqKey) setSttGroqKey(creds.sttGroqKey);
-                    if (creds.sttOpenaiKey) setSttOpenaiKey(creds.sttOpenaiKey);
-                    if (creds.sttDeepgramKey) setSttDeepgramKey(creds.sttDeepgramKey);
-                    if (creds.sttElevenLabsKey) setSttElevenLabsKey(creds.sttElevenLabsKey);
-                    if (creds.sttAzureKey) setSttAzureKey(creds.sttAzureKey);
-                    if (creds.sttIbmKey) setSttIbmKey(creds.sttIbmKey);
-                    if (creds.sttSonioxKey) setSttSonioxKey(creds.sttSonioxKey);
+                    // Do NOT pre-populate STT key fields from stored credentials.
+                    // The backend returns masked values ("sk-...XXXX") for security; pre-populating
+                    // them into the input state causes the masked string to be submitted on re-test,
+                    // which every provider (Deepgram, Groq, Soniox, etc.) rejects as invalid.
+                    // The hasStoredXxxKey booleans already show the "Saved" badge and set the
+                    // placeholder to "••••••••••••" — that is sufficient UX feedback.
                     if (typeof creds.openAiSttBaseUrl === 'string') setSttOpenaiBaseUrl(creds.openAiSttBaseUrl);
                 }
             } catch (e) {
@@ -952,6 +950,13 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
 
     const handleSttKeySubmit = async (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', key: string) => {
         if (!key.trim()) return;
+        // Reject masked values returned by getStoredCredentials ("sk-...XXXX").
+        // These are never valid API keys and every provider rejects them.
+        if (/^sk-\.\.\.[A-Za-z0-9]{4}$/.test(key.trim())) {
+            setSttTestStatus('error');
+            setSttTestError('Please enter your actual API key — the displayed value is masked for security.');
+            return;
+        }
 
         // Auto-test before saving
         setSttSaving(true);
@@ -1332,7 +1337,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                         >
                         {/* Sidebar */}
                         <div className="w-64 bg-bg-sidebar flex flex-col border-r border-border-subtle">
-                            <div className="p-6">
+                            <div className="p-6 pb-2 overflow-y-auto flex-1 min-h-0">
                                 <h2 className="font-semibold text-gray-400 text-xs uppercase tracking-wider mb-2">Settings</h2>
                                 <nav className="space-y-1">
                                     <button
@@ -1416,7 +1421,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                 </nav>
                             </div>
 
-                            <div className="mt-auto p-6 border-t border-border-subtle">
+                            <div className="mt-auto py-4 px-6 border-t border-border-subtle">
                                 <button
                                     onClick={() => window.electronAPI.quitApp()}
                                     className="w-full text-left px-3 py-2 rounded-lg text-sm font-medium text-red-400 hover:bg-red-500/10 transition-colors flex items-center gap-3"
