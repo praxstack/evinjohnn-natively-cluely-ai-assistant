@@ -772,11 +772,24 @@ export function initializeIpcHandlers(appState: AppState): void {
             const skill = SkillsManager.getInstance().getSkill(candidateId);
             if (skill) {
               skillPromptBlock = SkillsManager.getInstance().buildPromptBlock(skill);
-              message = skillPrefixMatch[2].trim() || message;
+              const strippedQuery = skillPrefixMatch[2].trim();
+              message = strippedQuery || `Please help me with the ${skill.name} skill.`;
               console.log(`[IPC] Skill activated: ${skill.id}`);
+            } else {
+              const allSkills = SkillsManager.getInstance().listSkills();
+              const available = allSkills.length
+                ? allSkills.map(s => `/${s.id}`).join(', ')
+                : 'none registered';
+              event.sender.send(
+                'gemini-stream-error',
+                `Skill "/${candidateId}" not found. Available: ${available}`,
+              );
+              return;
             }
           } catch (skillErr: any) {
-            console.warn('[IPC] Skill lookup failed (non-fatal):', skillErr?.message || skillErr);
+            console.warn('[IPC] Skill lookup failed:', skillErr?.message || skillErr);
+            event.sender.send('gemini-stream-error', `Skill lookup failed: ${skillErr?.message || 'unknown error'}`);
+            return;
           }
         }
 
@@ -4087,6 +4100,13 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('local-whisper-start-download', async (event, modelId: string) => {
+    if (process.platform === 'darwin') {
+      const os = require('os') as typeof import('os');
+      const darwinMajor = parseInt(os.release().split('.')[0], 10);
+      if (Number.isNaN(darwinMajor) || darwinMajor < 22) {
+        return { success: false, error: 'Local Whisper models require macOS 13 Ventura or later.' };
+      }
+    }
     if (activeWhisperDownloads.has(modelId)) {
       return { success: false, error: 'already-downloading' };
     }
@@ -4127,6 +4147,13 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('local-whisper-preload', async (_, modelId: string) => {
+    if (process.platform === 'darwin') {
+      const os = require('os') as typeof import('os');
+      const darwinMajor = parseInt(os.release().split('.')[0], 10);
+      if (Number.isNaN(darwinMajor) || darwinMajor < 22) {
+        return { success: false, error: 'Local Whisper models require macOS 13 Ventura or later.' };
+      }
+    }
     try {
       const { modelPreloader } = require('./audio/whisper/modelPreloader');
       const { isModelCached } = require('./audio/whisper/modelManager');
@@ -6619,7 +6646,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         if (ext === '.pdf') {
           const { PDFParse } = require('pdf-parse');
-          const buffer = fs.readFileSync(filePath);
+          const buffer = await fs.promises.readFile(filePath);
           const parser = new PDFParse({ data: buffer });
           const data: any = await withTimeout<any>(parser.getText(), PARSE_TIMEOUT_MS, 'PDF parse');
           content = data.text;
@@ -6635,7 +6662,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           // Plain-text family. Read raw bytes first so we can detect text
           // encoding from a leading byte-order-mark before deciding whether
           // a null byte is binary noise or a legitimate UTF-16 zero-pad.
-          const probe = fs.readFileSync(filePath, { encoding: null });
+          const probe = await fs.promises.readFile(filePath, { encoding: null });
           if (probe.length === 0) {
             return { success: false, error: `"${fileName}" is empty.` };
           }
