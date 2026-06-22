@@ -2415,7 +2415,11 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const sm = SettingsManager.getInstance();
       const { HindsightManager } = require('./services/HindsightManager') as typeof import('./services/HindsightManager');
-      const available = HindsightManager.getInstance().isAvailable();
+      // Fresh probe (not the cached isAvailable): the settings panel polls this while open, and
+      // the local server takes ~15-20s to load embedding models before /health answers. A cached
+      // value would leave the chip stuck on "Can't connect" even after the server comes up.
+      const hm = HindsightManager.getInstance();
+      const available = (sm.get('hindsightBaseUrl') ? await hm.healthCheck() : false) || hm.isAvailable();
       return {
         baseUrl: String(sm.get('hindsightBaseUrl') || ''),
         hasApiKey: Boolean(sm.get('hindsightApiKey')),
@@ -3654,14 +3658,35 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // Shared guard for STT key saves. Keys persist via the OS keyring or, when that is
+  // unavailable, an app-managed encrypted fallback. The setter returns whether the
+  // write ACTUALLY reached disk — we branch on that real result, NOT on a capability
+  // probe like isPersistenceAvailable() (which is almost always true and cannot see a
+  // disk-full / EACCES / read-only write failure). Branching on the real write result
+  // is what closes the "false Saved → key gone on restart" bug class for good. Only
+  // flagged when a non-empty key was provided (clearing has nothing to persist).
+  const sttPersistError =
+    'Could not save your API key to disk — it will work this session but will not survive a restart. Check that the app has permission to write its data folder.';
+  const sttKeyPersistenceWarning = (apiKey: string, persisted: boolean): { success: false; error: string } | null => {
+    if (apiKey && apiKey.trim().length > 0 && !persisted) {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      // Correlate the actual save failure with the environment (platform /
+      // linux storage backend / packaged) so we can tell the expected
+      // no-keyring case from a signing regression. Metadata only, never the key.
+      CredentialsManager.getInstance().emitStorageStatusDiagnostic('stt_save_failed');
+      return { success: false, error: sttPersistError };
+    }
+    return null;
+  };
+
   safeHandle('set-groq-stt-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setGroqSttApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setGroqSttApiKey(apiKey);
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving Groq STT API key:', error);
       return { success: false, error: error.message };
@@ -3671,11 +3696,11 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-openai-stt-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setOpenAiSttApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setOpenAiSttApiKey(apiKey);
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving OpenAI STT API key:', error);
       return { success: false, error: error.message };
@@ -3702,12 +3727,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-deepgram-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setDeepgramApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setDeepgramApiKey(apiKey);
       await appState.reconfigureSttProvider();
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving Deepgram API key:', error);
       return { success: false, error: error.message };
@@ -3732,12 +3757,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-elevenlabs-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setElevenLabsApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setElevenLabsApiKey(apiKey);
       await appState.reconfigureSttProvider();
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving ElevenLabs API key:', error);
       return { success: false, error: error.message };
@@ -3747,12 +3772,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-azure-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setAzureApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setAzureApiKey(apiKey);
       await appState.reconfigureSttProvider();
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving Azure API key:', error);
       return { success: false, error: error.message };
@@ -3777,12 +3802,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-ibmwatson-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setIbmWatsonApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setIbmWatsonApiKey(apiKey);
       await appState.reconfigureSttProvider();
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving IBM Watson API key:', error);
       return { success: false, error: error.message };
@@ -3792,7 +3817,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-soniox-api-key', async (_, apiKey: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      CredentialsManager.getInstance().setSonioxApiKey(apiKey);
+      const persisted = CredentialsManager.getInstance().setSonioxApiKey(apiKey);
       // Reconfigure the active pipeline so a key saved after provider selection
       // is picked up immediately (without this, the pipeline stays on the GoogleSTT
       // fallback that was chosen when reconfigure ran before the key was entered).
@@ -3800,7 +3825,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) win.webContents.send('credentials-changed');
       });
-      return { success: true };
+      return sttKeyPersistenceWarning(apiKey, persisted) ?? { success: true };
     } catch (error: any) {
       console.error('Error saving Soniox API key:', error);
       return { success: false, error: error.message };
@@ -3917,7 +3942,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               ws.send(
                 JSON.stringify({
                   api_key: apiKey,
-                  model: 'stt-rt-v4',
+                  model: 'stt-rt-v5',
                   audio_format: 'pcm_s16le',
                   sample_rate: 16000,
                   num_channels: 1,
