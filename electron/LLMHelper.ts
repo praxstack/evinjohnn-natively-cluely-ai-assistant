@@ -880,8 +880,16 @@ export class LLMHelper {
   private async generateWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal): Promise<string> {
     if (!this.codexCliConfig.enabled) throw new Error('Codex CLI transport is disabled.');
     const model = this.getSelectedCodexCliModel(fastMode);
+    // System prompt is sent separately as `body.instructions` (the
+    // Responses-API field the Codex backend uses for system content),
+    // NOT concatenated into the user prompt. Concatenation diverges
+    // from how the codex CLI processes the same prompts — different
+    // role classification, different prompt caching, different
+    // instruction-following behavior. Matches open-sse CodexExecutor.
+    // transformRequest (codex.md:395-487).
     return CodexCliService.run(this.codexCliConfig.path, {
-      prompt: this.buildCodexCliPrompt(userContent, systemPrompt),
+      prompt: userContent,
+      instructions: systemPrompt,
       model,
       timeoutMs: this.codexCliConfig.timeoutMs,
       imagePaths,
@@ -895,8 +903,11 @@ export class LLMHelper {
   private async *streamWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (!this.codexCliConfig.enabled) throw new Error('Codex CLI transport is disabled.');
     const model = this.getSelectedCodexCliModel(fastMode);
+    // See note in generateWithCodexCli — system prompt is sent
+    // separately as `body.instructions`, not concatenated.
     yield* CodexCliService.stream(this.codexCliConfig.path, {
-      prompt: this.buildCodexCliPrompt(userContent, systemPrompt),
+      prompt: userContent,
+      instructions: systemPrompt,
       model,
       timeoutMs: this.codexCliConfig.timeoutMs,
       imagePaths,
@@ -1961,11 +1972,15 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
       // GROQ FAST TEXT OVERRIDE (Text-Only) — gated on picked model so Gemini/Claude/OpenAI
       // selections aren't silently routed to Groq. See streamChat() for matching gate.
+      // !this.isCodexCliModel(this.currentModelId) prevents fast-mode from
+      // overriding an EXPLICITLY-PICKED codex-cli:<model> (which would otherwise
+      // call getSelectedCodexCliModel(true) → fastModel → 0 tokens → fallback).
+      // Fixes issue #315.
       const fastModeAppliesNS = this.groqFastTextMode && !isMultimodal && (
         this.codexCliConfig.enabled ||
         this.isGroqModel(this.currentModelId) ||
         this.currentModelId === 'natively'
-      );
+      ) && !this.isCodexCliModel(this.currentModelId);
       if (fastModeAppliesNS && this.codexCliConfig.enabled) {
         console.log(`[LLMHelper] ⚡️ Fast Text Mode Active. Routing to Codex CLI...`);
         try {
@@ -3962,7 +3977,30 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         // every other answer type.
         // PI v3 (W2): customContext is PINNED below (always-on), so retrieval is
         // scoped to reference files only — the same text never ships twice.
-        const modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(message, context, 1800, modeAnswerType(routeOptions), true);
+        //
+        // Phase 1 (smart-retrieval): the manual chat path has LOOSER latency
+        // than a live transcript turn, so when `ragLocalRerank` is on it opts
+        // into the async hybrid retriever WITH the cross-encoder rerank
+        // escalation (allowRerank=true). Default (flag off) → the existing sync
+        // lexical retriever, byte-for-byte unchanged. The hybrid call is guarded
+        // so any failure falls back to the sync path the manual flow always used.
+        let modeContextBlock = '';
+        let usedRerankPath = false;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { isRagLocalRerankEnabled } = require('./intelligence/intelligenceFlags');
+          if (isRagLocalRerankEnabled() && typeof modesMgr.buildRetrievedActiveModeContextBlockHybrid === 'function') {
+            modeContextBlock = await modesMgr.buildRetrievedActiveModeContextBlockHybrid(
+              message, context, 1800, modeAnswerType(routeOptions), true, undefined, /* allowRerank */ true,
+            );
+            usedRerankPath = true;
+          }
+        } catch (_rerankErr: any) {
+          console.warn('[LLMHelper] manual hybrid+rerank path failed, using sync lexical:', _rerankErr?.message);
+        }
+        if (!usedRerankPath) {
+          modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(message, context, 1800, modeAnswerType(routeOptions), true);
+        }
         // The mode's user-authored "Real-time prompt", deterministic — applies on
         // every answer instead of only when retrieval happened to score it.
         // Sensitivity-scoped by answer type inside the accessor.
@@ -4074,7 +4112,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       this.codexCliConfig.enabled ||
       this.isGroqModel(this.currentModelId) ||
       this.currentModelId === 'natively'
-    );
+    ) && !this.isCodexCliModel(this.currentModelId);
     if (fastModeApplies) {
       if (this.codexCliConfig.enabled) {
         console.log(`[LLMHelper] ⚡️ Fast Text Mode Active (Streaming). Routing to Codex CLI...`);
@@ -5566,6 +5604,20 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
   public isUsingOllama(): boolean {
     return this.useOllama;
+  }
+
+  /**
+   * Codex CLI is a LOCAL subprocess transport (child_process.spawn → stdin) that
+   * cold-loads the model before emitting the first `agent_message.delta` event —
+   * the same latency profile as Ollama. The live-deadline contract treats Ollama
+   * as local (30s first-useful) but had no codex equivalent, so a cold codex
+   * call was raced against the 7s cloud cap and aborted to the canned fallback
+   * ("Let me come back to that in just a moment."). Mirrors isUsingOllama().
+   */
+  public isUsingCodexCli(): boolean {
+    return Boolean(this.codexCliConfig?.enabled) && (
+      this.isCodexCliModel(this.currentModelId) || this.groqFastTextMode === true
+    );
   }
 
   public async getOllamaModels(): Promise<string[]> {

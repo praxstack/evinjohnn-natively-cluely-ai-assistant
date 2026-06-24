@@ -190,6 +190,7 @@ interface ElectronAPI {
   ) => Promise<{ success: boolean; error?: string }>;
   localWhisperGetModels: () => Promise<{ models: any[]; activeModelId: string }>;
   localWhisperSetModel: (modelId: string) => Promise<{ success: boolean }>;
+  localWhisperResetToDefault: () => Promise<{ success: boolean; error?: string; modelId?: string }>;
   localWhisperGetChannelConfig: () => Promise<{
     enabled: boolean;
     micModelId: string;
@@ -437,6 +438,9 @@ interface ElectronAPI {
     model: string;
     fastModel: string;
     timeoutMs: number;
+    sandboxMode?: string;
+    serviceTier?: string;
+    modelReasoningEffort?: string;
   }>;
   setCodexCliConfig: (config: {
     enabled: boolean;
@@ -444,6 +448,9 @@ interface ElectronAPI {
     model: string;
     fastModel: string;
     timeoutMs: number;
+    sandboxMode?: string;
+    serviceTier?: string;
+    modelReasoningEffort?: string;
   }) => Promise<{
     success: boolean;
     error?: string;
@@ -453,6 +460,9 @@ interface ElectronAPI {
       model: string;
       fastModel: string;
       timeoutMs: number;
+      sandboxMode?: string;
+      serviceTier?: string;
+      modelReasoningEffort?: string;
     };
   }>;
   testCodexCli: (config?: {
@@ -461,6 +471,9 @@ interface ElectronAPI {
     model?: string;
     fastModel?: string;
     timeoutMs?: number;
+    sandboxMode?: string;
+    serviceTier?: string;
+    modelReasoningEffort?: string;
   }) => Promise<{
     success: boolean;
     error?: string;
@@ -471,8 +484,22 @@ interface ElectronAPI {
       model: string;
       fastModel: string;
       timeoutMs: number;
+      sandboxMode?: string;
+      serviceTier?: string;
+      modelReasoningEffort?: string;
     };
   }>;
+  codexCliAuthStatus: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
+  codexCliLogout: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
+  codexCliLogin: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
+  codexCliDoctor: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
+  // ChatGPT OAuth IPCs — replace the old `codex login` CLI subprocess flow.
+  // startLogin kicks off the PKCE flow + opens the system browser; the
+  // renderer listens for codex:login:complete / :failed events to update UI.
+  codexLoginStatus: () => Promise<{ success: boolean; signedIn: boolean; email?: string; expiresAt?: number; error?: string }>;
+  codexStartLogin: () => Promise<{ success: boolean; email?: string; expiresAt?: number; error?: string }>;
+  codexSignOut: () => Promise<{ success: boolean; error?: string }>;
+  codexRefreshTokens: () => Promise<{ success: boolean; email?: string; expiresAt?: number; error?: string }>;
 
   // Demo
   seedDemo: () => Promise<{ success: boolean }>;
@@ -1216,6 +1243,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   ) => ipcRenderer.invoke('test-stt-connection', provider, apiKey, region),
   localWhisperGetModels: () => ipcRenderer.invoke('local-whisper-get-models'),
   localWhisperSetModel: (modelId: string) => ipcRenderer.invoke('local-whisper-set-model', modelId),
+  // In-app recovery: resets the active local-Whisper model + per-channel
+  // overrides back to the safe fallback. See electron/ipcHandlers.ts handler.
+  localWhisperResetToDefault: () => ipcRenderer.invoke('local-whisper-reset-to-default'),
   localWhisperGetChannelConfig: () => ipcRenderer.invoke('local-whisper-get-channel-config'),
   localWhisperSetChannelConfig: (cfg: {
     enabled?: boolean;
@@ -1227,6 +1257,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('local-whisper-delete-model', modelId),
   localWhisperStartDownload: (modelId: string) =>
     ipcRenderer.invoke('local-whisper-start-download', modelId),
+  localWhisperCancelDownload: (modelId: string) =>
+    ipcRenderer.invoke('local-whisper-cancel-download', modelId),
+  localWhisperGetDownloadState: (modelId?: string) =>
+    ipcRenderer.invoke('local-whisper-get-download-state', modelId),
   onLocalWhisperDownloadProgress: (cb: (data: { modelId: string; progress: number }) => void) => {
     const listener = (_: any, data: any) => cb(data);
     ipcRenderer.on('local-whisper-download-progress', listener);
@@ -1722,6 +1756,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     model: string;
     fastModel: string;
     timeoutMs: number;
+    sandboxMode?: string;
+    serviceTier?: string;
+    modelReasoningEffort?: string;
   }) => ipcRenderer.invoke('set-codex-cli-config', config),
   testCodexCli: (config?: {
     enabled?: boolean;
@@ -1729,7 +1766,41 @@ contextBridge.exposeInMainWorld('electronAPI', {
     model?: string;
     fastModel?: string;
     timeoutMs?: number;
+    sandboxMode?: string;
+    serviceTier?: string;
+    modelReasoningEffort?: string;
   }) => ipcRenderer.invoke('test-codex-cli', config),
+  codexCliAuthStatus: (config?: any) => ipcRenderer.invoke('codex-cli:auth-status', config),
+  codexCliLogout: (config?: any) => ipcRenderer.invoke('codex-cli:logout', config),
+  codexCliLogin: (config?: any) => ipcRenderer.invoke('codex-cli:login', config),
+  codexCliDoctor: (config?: any) => ipcRenderer.invoke('codex-cli:doctor', config),
+  // ChatGPT OAuth (PKCE) — replaces the old `codex login` CLI subprocess.
+  // The renderer listens for `codex:login:complete` / `:failed` /
+  // `:signed-out` / `:tokens:refreshed` events for live UI updates.
+  codexLoginStatus: () => ipcRenderer.invoke('codex:login-status'),
+  codexStartLogin: () => ipcRenderer.invoke('codex:start-login'),
+  codexSignOut: () => ipcRenderer.invoke('codex:sign-out'),
+  codexRefreshTokens: () => ipcRenderer.invoke('codex:refresh-tokens'),
+  onCodexLoginComplete: (callback: (info: { email?: string }) => void) => {
+    const subscription = (_: any, info: any) => callback(info || {});
+    ipcRenderer.on('codex:login:complete', subscription);
+    return () => { ipcRenderer.removeListener('codex:login:complete', subscription); };
+  },
+  onCodexLoginFailed: (callback: (info: { message: string }) => void) => {
+    const subscription = (_: any, info: any) => callback(info || { message: 'Unknown error' });
+    ipcRenderer.on('codex:login:failed', subscription);
+    return () => { ipcRenderer.removeListener('codex:login:failed', subscription); };
+  },
+  onCodexSignedOut: (callback: () => void) => {
+    const subscription = () => callback();
+    ipcRenderer.on('codex:signed-out', subscription);
+    return () => { ipcRenderer.removeListener('codex:signed-out', subscription); };
+  },
+  onCodexTokensRefreshed: (callback: (info: { expiresAt: number }) => void) => {
+    const subscription = (_: any, info: any) => callback(info || {});
+    ipcRenderer.on('codex:tokens:refreshed', subscription);
+    return () => { ipcRenderer.removeListener('codex:tokens:refreshed', subscription); };
+  },
 
   // Demo
   seedDemo: () => ipcRenderer.invoke('seed-demo'),

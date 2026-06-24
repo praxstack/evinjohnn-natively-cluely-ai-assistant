@@ -641,14 +641,81 @@ export class AppState {
       try {
         const { CredentialsManager } = require('./services/CredentialsManager');
         if (CredentialsManager.getInstance().getSttProvider() === 'local-whisper') {
-          const { isModelCached } = require('./audio/whisper/modelManager');
+          const { isModelCached, MODEL_CATALOG_IDS } = require('./audio/whisper/modelManager');
           const { modelPreloader } = require('./audio/whisper/modelPreloader');
           const { resolveInferenceConfig } = require('./audio/whisper/inferenceConfig');
-          const modelId = settingsManager.get('localWhisperModel') ?? 'Xenova/whisper-tiny.en';
+          // Startup validation gate: if the persisted modelId isn't in the
+          // catalog (corrupted settings, model retired, fork diverged), reset
+          // to the safest fallback BEFORE preload — otherwise the worker
+          // crashes on init with a confusing "model not found" and the user
+          // is locked out of audio until they manually clear settings.
+          //
+          // Validate BOTH the global setting AND the per-channel overrides
+          // (when per-channel mode is enabled). Per-channel validation runs
+          // here because the per-channel id is read at meeting-start time
+          // (main.ts:1721-1726), not at this preload block — leaving it
+          // un-validated here means a corrupt per-channel id would still
+          // crash the meeting even though the global gate passes.
+          const FALLBACK = 'Xenova/whisper-tiny.en';
+          const rawModelId = settingsManager.get('localWhisperModel') ?? FALLBACK;
+          const modelId = MODEL_CATALOG_IDS.has(rawModelId) ? rawModelId : FALLBACK;
+          if (modelId !== rawModelId) {
+            console.warn(`[AppState] Persisted localWhisperModel "${rawModelId}" not in catalog — resetting to ${modelId}`);
+            settingsManager.set('localWhisperModel', modelId);
+          }
+          if (settingsManager.get('localWhisperPerChannelEnabled')) {
+            for (const key of ['localWhisperModelMic', 'localWhisperModelSystem'] as const) {
+              const raw = settingsManager.get(key);
+              if (raw && !MODEL_CATALOG_IDS.has(raw)) {
+                console.warn(`[AppState] Persisted ${key} "${raw}" not in catalog — resetting to ${FALLBACK}`);
+                settingsManager.set(key, FALLBACK);
+              }
+            }
+          }
           const { dtype } = resolveInferenceConfig();
-          if (isModelCached(modelId, dtype)) {
-            console.log(`[AppState] Preloading local Whisper model: ${modelId}`);
-            modelPreloader.preload(modelId);
+
+          // Collect every model ID the user has selected (global + per-channel)
+          // so we can auto-repair each one that's missing or corrupt.
+          const modelIds = new Set<string>([modelId]);
+          if (settingsManager.get('localWhisperPerChannelEnabled')) {
+            const mic = settingsManager.get('localWhisperModelMic');
+            const sys = settingsManager.get('localWhisperModelSystem');
+            if (mic && MODEL_CATALOG_IDS.has(mic)) modelIds.add(mic);
+            if (sys && MODEL_CATALOG_IDS.has(sys)) modelIds.add(sys);
+          }
+
+          // Which model to warm: mic-channel > global (mic is the user's own
+          // voice — most latency-critical). The preloader is single-slot so we
+          // pick the highest-priority cached candidate.
+          const micOverride = settingsManager.get('localWhisperPerChannelEnabled')
+            ? (settingsManager.get('localWhisperModelMic') ?? '')
+            : '';
+          const preloadPriority = [
+            micOverride && MODEL_CATALOG_IDS.has(micOverride) ? micOverride : '',
+            modelId,
+          ].filter(Boolean);
+          const primaryPreloadId = preloadPriority.find(id => isModelCached(id, dtype)) ?? '';
+
+          const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+          for (const id of modelIds) {
+            if (isModelCached(id, dtype)) {
+              if (id === primaryPreloadId) {
+                console.log(`[AppState] Preloading local Whisper model: ${id}`);
+                modelPreloader.preload(id);
+              }
+            } else {
+              // Files are missing or corrupt — auto-download in the background
+              // so the user doesn't have to open Settings and click Download.
+              console.log(`[AppState] Local Whisper model "${id}" not cached — starting background download`);
+              try {
+                const result = LocalModelDownloadService.getInstance().start('whisper', id);
+                if (!result.success && !result.alreadyDownloading) {
+                  console.warn(`[AppState] Auto-download for "${id}" rejected:`, result.error);
+                }
+              } catch (dlErr: any) {
+                console.warn(`[AppState] Auto-download for "${id}" failed to start:`, dlErr?.message);
+              }
+            }
           }
         }
       } catch (e) {
@@ -5738,6 +5805,20 @@ async function initializeApp() {
   // Initialize IPC handlers before window creation
   initializeIpcHandlers(appState)
 
+  // Generic, provider-agnostic local-model download service. Owns the
+  // in-flight state for Whisper (today) and any future local model family
+  // (vision, embeddings, …). Instantiated BEFORE createWindow so the
+  // Settings overlay can call `getDownloadState` on first mount without
+  // waiting for IPC registration. The service rehydrates from disk
+  // synchronously in its constructor.
+  try {
+    const { LocalModelDownloadService, createWhisperDownloadProvider } = require('./services/LocalModelDownloadService');
+    const downloadService = LocalModelDownloadService.getInstance();
+    downloadService.registerProvider(createWhisperDownloadProvider());
+  } catch (e: any) {
+    console.warn('[main] LocalModelDownloadService init failed (non-fatal):', e?.message);
+  }
+
   // Apply the full disguise payload (names, dock icon, AUMID) early
   appState.applyInitialDisguise();
 
@@ -6083,6 +6164,18 @@ if (process.env.THINKING_MATRIX === '1') {
     } catch (e) {
       console.error('[main] Failed to stop DefaultOutputWatcher during shutdown:', e);
     }
+
+    // Local-model download service: synchronously flush the in-flight state
+    // map to disk and terminate every live worker. Without this, a quit
+    // mid-download (e.g. user force-quits while a 1.5GB Whisper Medium is
+    // downloading) leaves the service's state file in a stale
+    // 'downloading' state forever, AND any workers keep running until the
+    // process is actually reaped. The next launch rehydrates to
+    // 'interrupted' (or 'complete' if the bytes actually landed).
+    try {
+      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+      LocalModelDownloadService.getInstance().pauseForShutdown();
+    } catch { /* optional */ }
 
     // ROUND 2 FIX (#9): synchronously stop the CGEventTap worker thread
     // BEFORE V8 starts tearing down. The tap callback holds an

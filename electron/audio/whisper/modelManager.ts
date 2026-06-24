@@ -51,6 +51,15 @@ const MODEL_CATALOG: WhisperModelInfo[] = [
 ];
 
 /**
+ * Set of every modelId declared in MODEL_CATALOG above. Exported for startup
+ * validation gates: a persisted `localWhisperModel` / `localWhisperModelMic` /
+ * `localWhisperModelSystem` setting must be one of these, otherwise the
+ * worker crashes on init and the user is locked out of audio. Callers should
+ * fall back to `Xenova/whisper-tiny.en` (always present) on miss.
+ */
+export const MODEL_CATALOG_IDS: Set<string> = new Set(MODEL_CATALOG.map(m => m.id));
+
+/**
  * Returns the directory where Whisper models are stored.
  * Uses electron app.getPath('userData') so models persist across updates.
  */

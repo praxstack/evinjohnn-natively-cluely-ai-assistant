@@ -5,6 +5,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, systemPreferences } from 'e
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { pathToFileURL, fileURLToPath } from 'url';
 import { AudioDevices } from './audio/AudioDevices';
 import { DatabaseManager } from './db/DatabaseManager'; // Import Database Manager
 import { AppState } from './main';
@@ -33,6 +34,73 @@ import { SearchOrchestrator, type SearchCandidate } from './intelligence/SearchO
 import { CHAT_MODE_PROMPT } from './llm/prompts';
 import { isAssistantIdentityQuestion, profileFactsReady } from './llm/manualProfileIntelligence';
 import { buildManualProfileBackendAnswer } from './llm/profileAnswerBackend';
+
+// Module-scope: pdfjs-dist's legacy build defaults GlobalWorkerOptions.workerSrc
+// to `new URL("./pdf.worker.mjs", import.meta.url)`. Inside esbuild's bundle
+// for the electron main process, `import.meta.url` points at the bundled
+// main.js, so the runtime tries to load
+// `dist-electron/electron/pdf.worker.mjs` — a file that does not exist and
+// is not copied by scripts/build-electron.js. PDFParse then falls through to
+// the fake-worker bootstrap, which fails with
+// "Setting up fake worker failed: Cannot find module '.../pdf.worker.mjs'"
+// and the IPC surfaces that as the misleading "PDF may be corrupt /
+// password-protected" message. Pin workerSrc to the real pdfjs-dist worker
+// before the first PDFParse construction so the bundled PDFWorker resolves
+// the worker file regardless of where the bundle lives on disk. Guarded so
+// the require.resolve + file:// conversion runs at most once per process.
+//
+// REQUIRES `pdfjs-dist` (and `pdf-parse`/`mammoth`) to be listed in the
+// esbuild externals array in scripts/build-electron.js. If those packages
+// are bundled, the canvas/DOMMatrix polyfill chain in pdfjs-dist's module
+// init throws "DOMMatrix is not defined" at line 15620
+// (`const SCALE_MATRIX = new DOMMatrix();`) because esbuild's CJS bundle
+// sets `import_meta = {}`, breaking the
+// `createRequire(import.meta.url)` call that loads @napi-rs/canvas. The
+// ModeUploadHardening.test.mjs suite asserts both halves of the fix.
+//
+// The pin itself uses dynamic import() (not require()) because pdfjs-dist
+// is an ESM-only package (.mjs). Node 20 throws
+// "require() of ES Module ... not supported" when you require() an .mjs
+// file, so the function must be async and awaited at its call site.
+let pdfjsWorkerSrcPinned = false;
+async function pinPdfjsWorkerSrcOnce(): Promise<void> {
+  if (pdfjsWorkerSrcPinned) return;
+  try {
+    // pdfjs-dist is external (not bundled) so its .mjs entry point must be
+    // loaded via dynamic import() — Node 20 forbids synchronous require() of
+    // ESM modules and throws "require() of ES Module ... not supported".
+    const pdfjsLib: any = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    // The pdfjs-dist legacy build sets `GlobalWorkerOptions.workerSrc` to
+    // `"./pdf.worker.mjs"` (relative string) at class-init time. In the
+    // bundled electron main, pdfjs-dist's class init runs once, then
+    // PDFParse is built from inside `new PDFWorker(...)` — which resolves
+    // the relative string against `import.meta.url` of the bundle
+    // (dist-electron/electron/main.js) and produces a file:// URL that
+    // does not point at a real file. We check both the unset case and the
+    // "resolved to a missing file" case and pin in both situations. A
+    // previously-set working URL (e.g. from a parent app) is left alone.
+    const current = pdfjsLib?.GlobalWorkerOptions?.workerSrc;
+    let currentIsBroken = !current || current === './pdf.worker.mjs';
+    if (current && !currentIsBroken) {
+      try {
+        const candidatePath = current.startsWith('file://') ? fileURLToPath(current) : current;
+        if (!fs.existsSync(candidatePath)) currentIsBroken = true;
+      } catch {
+        currentIsBroken = true;
+      }
+    }
+    if (currentIsBroken) {
+      const workerPath = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
+      pdfjsLib.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
+    }
+    pdfjsWorkerSrcPinned = true;
+  } catch (pinErr) {
+    // Non-fatal — if the pin fails the original fake-worker error path is
+    // still taken (and logged); the upload handler's catch block converts
+    // it to the user-facing message.
+    console.warn('[IPC] pdfjs-dist workerSrc pin failed (PDF parse may fail):', (pinErr as Error)?.message);
+  }
+}
 
 export function initializeIpcHandlers(appState: AppState): void {
   const safeHandle = (
@@ -1395,11 +1463,13 @@ export function initializeIpcHandlers(appState: AppState): void {
           // stall guard (not a wall-clock cap, so long coding answers stream in
           // full). This is the no-134s / no-30s-hang guarantee (Issue 1, P0).
           //
-          // LOCAL PROVIDER: a local Ollama model cold-loads its weights (8-12s for
-          // a 7-9B model) before the first token, so it gets the far longer local
-          // first-useful budget — otherwise every cold local generation aborted to
-          // zero tokens and the user saw the canned fallback line below.
-          const usingLocalLlm = llmHelper.isUsingOllama();
+          // LOCAL PROVIDER (Ollama OR Codex CLI): a local model cold-loads its
+          // weights (8-12s for a 7-9B model) before the first token, so it gets
+          // the far longer local first-useful budget — otherwise every cold
+          // local generation aborted to zero tokens and the user saw the canned
+          // fallback line below. Codex CLI shares the cold-load profile
+          // (subprocess spawn → codex CLI loads the model → first delta).
+          const usingLocalLlm = llmHelper.isUsingOllama() || llmHelper.isUsingCodexCli();
           let manualFirstUseful = false;
           let manualSuperseded = false;
           await raceStreamWithDeadline({
@@ -4100,8 +4170,6 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Local Whisper STT Handlers
   // ==========================================
 
-  const activeWhisperDownloads = new Set<string>();
-
   safeHandle('local-whisper-get-models', async () => {
     try {
       const { getAvailableModels } = require('./audio/whisper/modelManager');
@@ -4118,6 +4186,40 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       SettingsManager.getInstance().set('localWhisperModel', modelId);
       return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  // In-app recovery path for "app crashed after I selected model X and now
+  // won't open" scenarios. Resets the active model to the safe fallback
+  // (Xenova/whisper-tiny.en, always present in MODEL_CATALOG_IDS) and clears
+  // any per-channel overrides + the preloader cooldown for the bad id.
+  safeHandle('local-whisper-reset-to-default', async () => {
+    try {
+      const DEFAULT_MODEL = 'Xenova/whisper-tiny.en';
+      const sm = SettingsManager.getInstance();
+      // Capture the bad ids BEFORE overwriting so we can clear their
+      // preloader cooldowns — otherwise the user re-selects the broken
+      // model in Settings and gets silently blocked by the 5-min TTL.
+      const badGlobal = sm.get('localWhisperModel');
+      const badMic = sm.get('localWhisperModelMic');
+      const badSystem = sm.get('localWhisperModelSystem');
+      sm.set('localWhisperModel', DEFAULT_MODEL);
+      if (badMic) sm.set('localWhisperModelMic', DEFAULT_MODEL);
+      if (badSystem) sm.set('localWhisperModelSystem', DEFAULT_MODEL);
+      // Drop the recent-failure cooldown for every id we just replaced.
+      // Without this, the user can re-select the bad model and the
+      // preloader will silently skip the preload for 5 minutes.
+      try {
+        const { modelPreloader } = require('./audio/whisper/modelPreloader');
+        for (const badId of [badGlobal, badMic, badSystem]) {
+          if (badId && badId !== DEFAULT_MODEL) {
+            modelPreloader.clearRecentFailure(badId);
+          }
+        }
+      } catch { /* advisory */ }
+      return { success: true, modelId: DEFAULT_MODEL };
     } catch (e: any) {
       return { success: false, error: e.message };
     }
@@ -4162,50 +4264,47 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  safeHandle('local-whisper-start-download', async (event, modelId: string) => {
-    if (process.platform === 'darwin') {
-      const os = require('os') as typeof import('os');
-      const darwinMajor = parseInt(os.release().split('.')[0], 10);
-      if (Number.isNaN(darwinMajor) || darwinMajor < 22) {
-        return { success: false, error: 'Local Whisper models require macOS 13 Ventura or later.' };
-      }
-    }
-    if (activeWhisperDownloads.has(modelId)) {
-      return { success: false, error: 'already-downloading' };
-    }
-    activeWhisperDownloads.add(modelId);
+  // The actual download lifecycle is owned by LocalModelDownloadService
+  // (a process-wide singleton instantiated in main.ts). The IPC layer is
+  // a thin pass-through so the renderer can:
+  //   1. Start a download (idempotent — already-downloading returns success).
+  //   2. Cancel an in-flight download.
+  //   3. Query the live state (status + progress) for rehydration on remount.
+  // All event broadcasting (progress/complete/error) is performed BY THE
+  // SERVICE to all live webContents, so the previous bug where closing the
+  // Settings overlay severed the event channel is no longer possible.
+  safeHandle('local-whisper-start-download', async (_event, modelId: string) => {
     try {
-      const { Worker } = require('worker_threads');
-      const nodePath = require('path');
-      const { buildWorkerInitMessage } = require('./audio/whisper/inferenceConfig');
-      const workerPath = nodePath.join(__dirname, 'audio', 'whisper', 'whisperWorker.js');
-      const w = new Worker(workerPath);
-      const sender = event.sender;
-      w.on('message', (msg: any) => {
-        if (sender.isDestroyed()) return;
-        if (msg.type === 'progress') {
-          sender.send('local-whisper-download-progress', { modelId, progress: msg.progress });
-        } else if (msg.type === 'ready') {
-          activeWhisperDownloads.delete(modelId);
-          sender.send('local-whisper-download-complete', { modelId });
-          w.terminate();
-        } else if (msg.type === 'error') {
-          activeWhisperDownloads.delete(modelId);
-          sender.send('local-whisper-download-error', { modelId, error: msg.message });
-          w.terminate();
-        }
-      });
-      w.on('error', (err: Error) => {
-        activeWhisperDownloads.delete(modelId);
-        if (!sender.isDestroyed()) {
-          sender.send('local-whisper-download-error', { modelId, error: err.message });
-        }
-      });
-      w.postMessage(buildWorkerInitMessage(modelId));
-      return { success: true };
+      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+      const r = LocalModelDownloadService.getInstance().start('whisper', modelId);
+      // Preserve the original return shape: the panel treats 'already-downloading'
+      // as a non-error success.
+      if (r.alreadyDownloading) return { success: false, error: 'already-downloading' };
+      return r;
     } catch (e: any) {
-      activeWhisperDownloads.delete(modelId);
-      return { success: false, error: e.message };
+      return { success: false, error: e?.message ?? String(e) };
+    }
+  });
+
+  safeHandle('local-whisper-cancel-download', async (_event, modelId: string) => {
+    try {
+      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+      return LocalModelDownloadService.getInstance().cancel('whisper', modelId);
+    } catch (e: any) {
+      return { success: false, error: e?.message ?? String(e) };
+    }
+  });
+
+  // Read-only snapshot of every in-flight Whisper download. Called on
+  // mount by LocalWhisperModelPanel so a re-mounted panel sees an
+  // in-progress download even though the user closed the overlay
+  // mid-download.
+  safeHandle('local-whisper-get-download-state', async (_event, modelId?: string) => {
+    try {
+      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
+      return LocalModelDownloadService.getInstance().getState('whisper', modelId);
+    } catch {
+      return modelId ? null : [];
     }
   });
 
@@ -4430,24 +4529,151 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('test-codex-cli', async (_, config?: any) => {
     try {
+      // The new implementation is HTTP-direct — there is no CLI binary to
+      // validate. The test is now "do we have a valid OAuth token + a
+      // reachable model?". A lightweight probe is a status read; the
+      // Settings UI also has a "Try it" button that issues a real chat
+      // call. This handler returns success=true with the current
+      // normalized config so the Settings UI's "Test" button keeps
+      // working without an error state.
       const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
       const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
-      const result = await CodexCliService.validateExecutable(normalized.path);
-      // If auto-detection found a different working path, persist it so
-      // subsequent chat calls don't re-ENOENT.
-      if (result.success && result.resolvedPath && result.resolvedPath !== normalized.path) {
-        const updated = CodexCliService.normalizeConfig({
-          ...normalized,
-          path: result.resolvedPath,
-        });
-        const sm = SettingsManager.getInstance();
-        sm.set('codexCliPath', updated.path);
-        appState.processingHelper.getLLMHelper().setCodexCliConfig(updated);
-        return { success: true, resolvedPath: result.resolvedPath, config: updated };
-      }
-      return result;
+      const { CodexOAuthService } = require('./services/CodexOAuthService');
+      const status = CodexOAuthService.getInstance().getStatus();
+      return {
+        success: true,
+        resolvedPath: normalized.path, // legacy field; ignored
+        config: normalized,
+        signedIn: status.signedIn,
+        email: status.email,
+      };
     } catch (error: any) {
       return { success: false, error: error.message };
+    }
+  });
+
+  const runCodexAuthAction = async (action: 'status' | 'logout' | 'login' | 'doctor', config?: any) => {
+    // Legacy wrapper. The OAuth-direct implementation does not use
+    // CLI subprocesses for auth, so the old action map is reimplemented
+    // against CodexOAuthService. The renderer-facing shape is unchanged
+    // so the Settings UI keeps working without changes.
+    try {
+      const { CodexOAuthService } = require('./services/CodexOAuthService');
+      const oauth = CodexOAuthService.getInstance();
+      const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
+      const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
+      if (action === 'status') {
+        const status = oauth.getStatus();
+        return {
+          success: status.signedIn,
+          action,
+          output: status.signedIn ? `Logged in with ChatGPT account (${status.email || 'unknown'})` : 'Not signed in',
+          config: normalized,
+        };
+      }
+      if (action === 'logout') {
+        oauth.signOut();
+        return { success: true, action, output: 'Logged out', config: normalized };
+      }
+      if (action === 'login') {
+        // For backwards-compat: the new flow uses codex:start-login IPC
+        // + a callback IPC, but if a legacy caller invokes
+        // codex-cli:login we still kick off the new flow so the
+        // Settings UI works.
+        try {
+          const result = await oauth.startLogin();
+          return {
+            success: true,
+            action,
+            output: `Logged in with ChatGPT account (${result.email || 'unknown'})`,
+            config: normalized,
+          };
+        } catch (e: any) {
+          return { success: false, action, error: e?.message || 'Codex login failed', config: normalized };
+        }
+      }
+      if (action === 'doctor') {
+        const status = oauth.getStatus();
+        return {
+          success: true,
+          action,
+          output: status.signedIn
+            ? `Codex doctor OK — signed in as ${status.email || 'unknown'}`
+            : 'Codex doctor OK — not signed in (run `codex:start-login`)',
+          config: normalized,
+        };
+      }
+      return { success: false, action, error: `Unknown auth action: ${action}`, config: normalized };
+    } catch (error: any) {
+      return { success: false, action, error: error.message || `Codex CLI ${action} failed.` };
+    }
+  };
+
+  safeHandle('codex-cli:auth-status', async (_, config?: any) => runCodexAuthAction('status', config));
+  safeHandle('codex-cli:logout', async (_, config?: any) => runCodexAuthAction('logout', config));
+  safeHandle('codex-cli:login', async (_, config?: any) => runCodexAuthAction('login', config));
+  safeHandle('codex-cli:doctor', async (_, config?: any) => runCodexAuthAction('doctor', config));
+
+  // ── ChatGPT OAuth (new — replaces `codex login` CLI subprocess) ──────────
+  // The renderer calls codex:start-login, which kicks off the PKCE flow,
+  // opens the system browser, and waits for the loopback callback. When
+  // the user completes (or denies) the auth in the browser, the
+  // CodexOAuthService emits 'login:complete' or 'login:failed', which we
+  // rebroadcast on the IPC bus as 'codex:login:complete' / ':failed' so
+  // the renderer can update its UI without polling.
+  const { CodexOAuthService: CodexOAuthServiceClass } = require('./services/CodexOAuthService');
+  const codexOAuth = CodexOAuthServiceClass.getInstance();
+  const broadcastCodexLoginEvent = (event: 'login:complete' | 'login:failed' | 'tokens:refreshed' | 'signed-out', payload: any) => {
+    try {
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (win.isDestroyed()) return;
+        win.webContents.send(`codex:${event}`, payload);
+      });
+    } catch { /* broadcast best-effort */ }
+  };
+  codexOAuth.on('login:complete', (info: any) => broadcastCodexLoginEvent('login:complete', info));
+  codexOAuth.on('login:failed', (err: Error) => broadcastCodexLoginEvent('login:failed', { message: err?.message || String(err) }));
+  codexOAuth.on('tokens:refreshed', (info: any) => broadcastCodexLoginEvent('tokens:refreshed', info));
+  codexOAuth.on('signed-out', () => broadcastCodexLoginEvent('signed-out', undefined));
+
+  safeHandle('codex:login-status', () => {
+    try {
+      return { success: true, ...codexOAuth.getStatus() };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle('codex:start-login', async () => {
+    try {
+      const result = await codexOAuth.startLogin();
+      return { success: true, email: result.email, expiresAt: result.tokens.expiresAt };
+    } catch (error: any) {
+      return { success: false, error: error?.message || String(error) };
+    }
+  });
+
+  safeHandle('codex:sign-out', () => {
+    try {
+      codexOAuth.signOut();
+      return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Force-refresh — used by the Settings UI's "Refresh now" button so the
+  // user can confirm the stored refresh token still works without waiting
+  // for a 401 from a chat call.
+  safeHandle('codex:refresh-tokens', async () => {
+    try {
+      const tokens = await codexOAuth.refreshTokens();
+      if (!tokens) {
+        return { success: false, error: 'Codex session expired. Please sign in again from Settings → AI Providers.' };
+      }
+      return { success: true, expiresAt: tokens.expiresAt, email: tokens.email };
+    } catch (error: any) {
+      return { success: false, error: error?.message || String(error) };
     }
   });
 
@@ -5154,6 +5380,11 @@ export function initializeIpcHandlers(appState: AppState): void {
             // returning null ("What to answer stops responding after a few messages"
             // P0). The cooldown still throttles the automatic speculative path.
             skipCooldown: true,
+            // The user explicitly pressed the button — they want a fresh answer,
+            // not a cached speculative draft from a previous question (Jaccard
+            // gate can otherwise bleed a previous question's answer into the
+            // current manual press). See runWhatShouldISay.forceFresh branch.
+            forceFresh: true,
             screenContext,
             promptInstruction:
               typeof options?.promptInstruction === 'string'
@@ -6691,19 +6922,47 @@ export function initializeIpcHandlers(appState: AppState): void {
         '.log',
         '.pdf',
         '.docx',
-        '.doc',
+        // NOTE: legacy Word `.doc` (binary CFB, NOT the modern .docx ZIP)
+        // is intentionally NOT in the allow-list. mammoth@1.x only handles
+        // .docx and would throw `unzip` errors on real .doc files, which
+        // the user would see as the misleading "corrupt / password-protected"
+        // message. Removing from the allow-list means the dedicated catch
+        // below produces a friendly "convert to .docx" error instead.
       ]);
-      // 10 MiB per file. Anything larger is almost always a database dump,
-      // a media file, or a misclicked archive; the modes layer would just
-      // truncate it to ~40 KB anyway via MAX_TOTAL_CHARS.
-      const MAX_FILE_BYTES = 10 * 1024 * 1024;
+      // 50 MiB per file. PDF/DOCX files are dominated by images, fonts, and
+      // compression metadata — a 50 MB PDF typically yields only 300 KB–2 MB
+      // of extracted text. The extracted text is indexed into mode_reference_chunks
+      // and only the top-6 chunks are retrieved per query (never sent whole),
+      // so there is no prompt-size risk from large files. The old 10 MB limit
+      // was calibrated for the legacy full-text-dump path (MAX_TOTAL_CHARS=40KB)
+      // which is no longer used on the live answer path.
+      const MAX_FILE_BYTES = 50 * 1024 * 1024;
 
       const result: any = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
           {
+            // MUST stay in sync with ALLOWED_EXTENSIONS above. Users see
+            // the first matching filter as the selected type in the picker;
+            // any extension listed here but missing from ALLOWED_EXTENSIONS
+            // would be silently rejected by the server-side allow-list, and
+            // any extension in ALLOWED_EXTENSIONS but missing from this
+            // filter would force users to switch to "All Files" to pick it.
             name: 'Text & Documents',
-            extensions: ['txt', 'md', 'json', 'csv', 'xml', 'html', 'pdf', 'docx', 'doc'],
+            extensions: [
+              'txt',
+              'md',
+              'markdown',
+              'json',
+              'csv',
+              'tsv',
+              'xml',
+              'html',
+              'htm',
+              'log',
+              'pdf',
+              'docx',
+            ],
           },
           { name: 'All Files', extensions: ['*'] },
         ],
@@ -6716,10 +6975,21 @@ export function initializeIpcHandlers(appState: AppState): void {
       const ext = path.extname(filePath).toLowerCase();
 
       if (!ALLOWED_EXTENSIONS.has(ext)) {
+        // Special-case the legacy .doc extension: it's a real, common file
+        // type that users WILL try to upload, so a generic "unsupported"
+        // message is unhelpful. Give them the exact conversion instruction
+        // instead. mammoth can't read CFB; users need to "Save As .docx"
+        // in Word, Pages, or Google Docs.
+        if (ext === '.doc') {
+          return {
+            success: false,
+            error: `"${fileName}" is a legacy Word .doc file. Reference files only support the modern .docx format. Open the file in Word, Pages, or Google Docs and choose "Save As .docx" (or "File → Download → Word .docx"), then upload the new file.`,
+          };
+        }
         // Friendly, actionable message — UI surfaces this to the user.
         return {
           success: false,
-          error: `Unsupported file type "${ext || 'none'}". Supported formats: TXT, MD, JSON, CSV, XML, HTML, LOG, PDF, DOCX, DOC. For resumes and job descriptions, use Profile Intelligence under Settings instead.`,
+          error: `Unsupported file type "${ext || 'none'}". Supported formats: TXT, MD, MARKDOWN, JSON, CSV, TSV, XML, HTML, HTM, LOG, PDF, DOCX. For resumes and job descriptions, use Profile Intelligence under Settings instead.`,
         };
       }
 
@@ -6746,14 +7016,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         const mb = (stats.size / (1024 * 1024)).toFixed(1);
         return {
           success: false,
-          error: `File is ${mb} MB; the maximum is 10 MB. Trim the file or split it into smaller reference documents.`,
+          error: `File is ${mb} MB; the maximum is 50 MB. Trim the file or split it into smaller reference documents.`,
         };
       }
 
       // Wrap the parser branches in a per-call timeout. pdf-parse and mammoth
-      // have both hung historically on malformed input or zip-bomb DOCX —
-      // 15 s is generous for a 10 MiB document.
-      const PARSE_TIMEOUT_MS = 15_000;
+      // have both hung historically on malformed input or zip-bomb DOCX.
+      // 30 s covers a 50 MiB image-heavy PDF on a slow machine.
+      const PARSE_TIMEOUT_MS = 30_000;
       function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
         return Promise.race([
           p,
@@ -6766,12 +7036,26 @@ export function initializeIpcHandlers(appState: AppState): void {
       let content = '';
       try {
         if (ext === '.pdf') {
+          // pdf-parse@2.x is a thin wrapper over pdfjs-dist's legacy build.
+          // See `pinPdfjsWorkerSrcOnce` above for why this MUST run before
+          // `new PDFParse(...)` and not at module top level. Skipping this
+          // call leaves the broken default workerSrc in place and the parse
+          // fails with "Setting up fake worker failed" on every PDF.
+          await pinPdfjsWorkerSrcOnce();
           const { PDFParse } = require('pdf-parse');
           const buffer = await fs.promises.readFile(filePath);
           const parser = new PDFParse({ data: buffer });
           const data: any = await withTimeout<any>(parser.getText(), PARSE_TIMEOUT_MS, 'PDF parse');
           content = data.text;
-        } else if (ext === '.docx' || ext === '.doc') {
+        } else if (ext === '.docx') {
+          // mammoth@1.x only handles .docx (modern Office Open XML, a ZIP
+          // container). Legacy .doc (binary CFB) is rejected upstream in
+          // ALLOWED_EXTENSIONS — it never reaches this branch. The dispatch
+          // intentionally does NOT also match '.doc' (even though the
+          // upstream allow-list gate means it would be dead-code) — keeping
+          // the matcher narrow is a guard against future regressions that
+          // re-add .doc to the parser chain without updating the catch-block
+          // error messages.
           const mammoth = require('mammoth');
           const result2: any = await withTimeout<any>(
             mammoth.extractRawText({ path: filePath }),
