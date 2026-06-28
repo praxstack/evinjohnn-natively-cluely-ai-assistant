@@ -199,6 +199,18 @@ export function isIntelligenceFlagEnabled(key: IntelligenceFlagKey): boolean {
   return FLAGS[key].default;
 }
 
+/**
+ * True when the flag's value is FORCED by an environment override (NATIVELY_* var set to
+ * a recognized on/off value). When true, the env is the authoritative source — callers
+ * must NOT persist a contradicting SettingsManager value (e.g. HindsightManager's
+ * auto-flip would otherwise write `hindsightMemoryEnabled=true` to settings while
+ * `NATIVELY_HINDSIGHT_MEMORY=0` is set, silently re-enabling the flag the moment the
+ * user unsets the env). Never throws.
+ */
+export function isIntelligenceFlagEnvForced(key: IntelligenceFlagKey): boolean {
+  return readEnvOverride(key) !== null;
+}
+
 /** True when the observe-only IntelligenceTrace should collect (Phase 12/13). */
 export const isIntelligenceTraceEnabled = (): boolean => isIntelligenceFlagEnabled('trace');
 
@@ -284,6 +296,11 @@ export function intelligenceFlagMeta(key: IntelligenceFlagKey): { setting: strin
  * Persist a flag's value via its SettingsManager key (the same key the flag reads).
  * Used by the dev/experimental settings UI (Phase 14). Pass `null` to clear the
  * override (revert to env/default). Defensive — never throws.
+ *
+ * ALSO writes a paired `*Explicit` sibling key (e.g. `hindsightMemoryEnabledExplicit`)
+ * so callers can distinguish "default OFF, user hasn't touched it" (auto-flip is OK)
+ * from "user explicitly set OFF" (auto-flip would silently reverse user intent). Only
+ * `hindsightMemory` reads this sibling today; the others ignore it.
  */
 export function setIntelligenceFlag(key: IntelligenceFlagKey, value: boolean | null): boolean {
   try {
@@ -296,8 +313,21 @@ export function setIntelligenceFlag(key: IntelligenceFlagKey, value: boolean | n
     const spec = FLAGS[key];
     if (!spec || typeof spec.setting !== 'string') return false;
     const { SettingsManager } = require('../services/SettingsManager');
-    if (value === null) SettingsManager.getInstance().set(spec.setting, undefined);
-    else SettingsManager.getInstance().set(spec.setting, value);
+    const sm = SettingsManager.getInstance();
+    if (value === null) {
+      sm.set(spec.setting, undefined);
+      // Clearing the override also clears the explicit marker — the value reverts to
+      // the registry default, which is itself a non-explicit state.
+      sm.set(`${spec.setting}Explicit`, undefined);
+    } else {
+      sm.set(spec.setting, value);
+      // Mark "explicit" only when value DIFFERS from registry default. This is the key
+      // invariant: if the value equals the default, the user hasn't expressed intent
+      // beyond the registry default and the auto-flip should still be free to flip.
+      // Only `hindsightMemory` actually reads this sibling — others ignore it.
+      const isExplicit = value !== spec.default;
+      sm.set(`${spec.setting}Explicit`, isExplicit ? true : undefined);
+    }
     return true;
   } catch {
     return false;

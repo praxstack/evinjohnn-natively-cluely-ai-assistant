@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
+import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
 import { ModeContextRetriever, type ModeRetrievalOptions } from './ModeContextRetriever';
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
@@ -54,6 +55,12 @@ export interface ModeReferenceFile {
     fileName: string;
     content: string;
     createdAt: string;
+    /** Real page count reported by the PDF parser (pdf-parse@2.x `data.total`).
+     *  Only set for `.pdf` uploads; undefined for txt/md/docx. */
+    pageCount?: number;
+    /** Number of pages from which text was actually extracted (a subset of
+     *  `pageCount` when some pages are image-only / blank). Only set for PDFs. */
+    extractedPageCount?: number;
 }
 
 export interface ModeNoteSection {
@@ -226,6 +233,11 @@ function rowToFile(row: any): ModeReferenceFile {
         fileName: row.file_name,
         content: row.content ?? '',
         createdAt: row.created_at,
+        // Round-trip PDF page counts (DB stores snake_case columns; the
+        // 2026-06-27 v18→v19 migration adds these columns and the
+        // IPC handler fills them in for .pdf uploads only).
+        pageCount: typeof row.page_count === 'number' ? row.page_count : undefined,
+        extractedPageCount: typeof row.extracted_page_count === 'number' ? row.extracted_page_count : undefined,
     };
 }
 
@@ -437,7 +449,13 @@ export class ModesManager {
         return DatabaseManager.getInstance().getReferenceFiles(modeId).map(rowToFile);
     }
 
-    public addReferenceFile(params: { modeId: string; fileName: string; content: string }): ModeReferenceFile {
+    public addReferenceFile(params: {
+        modeId: string;
+        fileName: string;
+        content: string;
+        pageCount?: number;
+        extractedPageCount?: number;
+    }): ModeReferenceFile {
         const id = `ref_${crypto.randomUUID()}`;
         DatabaseManager.getInstance().addReferenceFile({
             id,
@@ -452,6 +470,8 @@ export class ModesManager {
             fileName: params.fileName,
             content: params.content,
             createdAt: new Date().toISOString(),
+            pageCount: params.pageCount,
+            extractedPageCount: params.extractedPageCount,
         };
     }
 
@@ -470,6 +490,58 @@ export class ModesManager {
     /** Index one reference file (idempotent — re-embeds only on content/space change). */
     public async indexReferenceFile(file: ModeReferenceFile): Promise<void> {
         await this.modeContextRetriever.indexReferenceFile(file);
+    }
+
+    /** Wire the RAGManager EmbeddingPipeline into the mode hybrid retriever. */
+    public setSharedEmbeddingPipeline(pipeline: EmbeddingPipeline): void {
+        this.modeContextRetriever.setSharedEmbeddingPipeline(pipeline);
+    }
+
+    /** Re-index files that fell back before the embedding provider became ready,
+     *  OR whose stored vectors are in a now-stale embedding space (fallback
+     *  promotion flips the active space; getFileIndexStatus reports those 'ready'
+     *  files as 'pending', which retryLexicalOnlyFiles re-indexes — MEDIUM #3).
+     *
+     *  MEDIUM #2: only descend into a mode when at least one of its files is in a
+     *  retry-eligible state, so a user with many fully-indexed modes doesn't pay
+     *  an O(modes × files) re-scan + per-file indexFile entry on every kick. */
+    public async retryAllLexicalOnlyFiles(): Promise<void> {
+        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
+        for (const mode of this.getModes()) {
+            const files = this.getReferenceFiles(mode.id);
+            if (files.length === 0) continue;
+            // Cheap status read (no embedding work) gates the expensive retry.
+            const hasEligible = files.some(f => {
+                try {
+                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                } catch {
+                    return true; // status lookup failed → let the retry decide
+                }
+            });
+            if (!hasEligible) continue;
+            await this.modeContextRetriever.retryLexicalOnlyFiles(files).catch(() => { /* logged inside */ });
+        }
+    }
+
+    /** Modes that have at least one retry-eligible reference file. Used by the
+     *  main process to broadcast 'done' only for modes that were actually
+     *  re-indexed (LOW #8), instead of spamming every mode on every kick. */
+    public getModesWithRetryEligibleFiles(): string[] {
+        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
+        const out: string[] = [];
+        for (const mode of this.getModes()) {
+            const files = this.getReferenceFiles(mode.id);
+            if (files.length === 0) continue;
+            const hasEligible = files.some(f => {
+                try {
+                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                } catch {
+                    return true;
+                }
+            });
+            if (hasEligible) out.push(mode.id);
+        }
+        return out;
     }
 
     /** Kick indexing for every not-yet-ready file of a mode (mode activation prewarm). */
@@ -503,6 +575,12 @@ export class ModesManager {
             fileName: file.fileName,
             ...this.modeContextRetriever.getReferenceFileIndexStatus(file.id),
         }));
+    }
+
+    /** Single-file index status lookup — used by IPC handlers to decide whether to
+     *  schedule a retry when a freshly-uploaded file lands in 'failed'/'lexical_only'. */
+    public getReferenceFileIndexStatus(fileId: string): { status: string; chunkCount: number } {
+        return this.modeContextRetriever.getReferenceFileIndexStatus(fileId);
     }
 
     // ── Note Sections ─────────────────────────────────────────────
@@ -759,12 +837,42 @@ export class ModesManager {
         if (!mode) return '';
         const files = this.getReferenceFiles(mode.id);
 
-        // Forced document grounding relies on the lexical retriever's compact
-        // document-identity block. The hybrid retriever does not build that block,
-        // so route explicitly to the sync path instead of accepting an option the
-        // hybrid implementation would silently ignore.
+        // Forced document grounding (audit 2026-06-27): run HYBRID retrieval
+        // first (semantic + lexical with cross-encoder rerank), and if the
+        // hybrid path returns nothing usable (no embedder, no chunks, used
+        // fallback), merge the lexical document-identity block on top. This
+        // gives document-grounded custom modes the precision of semantic
+        // retrieval while preserving the compact identity block for broad
+        // questions like "what is this about?" — the previous code
+        // unconditionally routed to the sync path here, missing the entire
+        // semantic ranking benefit.
         if (retrievalOptions?.forceDocumentGrounding) {
-            return this.buildRetrievedActiveModeContextBlock(query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions);
+            try {
+                const hybridResult = await this.modeContextRetriever.retrieveHybrid(
+                    mode, files, {
+                        query,
+                        transcript,
+                        tokenBudget,
+                        answerType,
+                        excludeCustomContext,
+                        allowRerank,
+                        forceDocumentGrounding: true,
+                    },
+                );
+                if (hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext) {
+                    return hybridResult.formattedContext;
+                }
+                // Hybrid unavailable — fall back to lexical + identity block.
+                return this.buildRetrievedActiveModeContextBlock(
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                );
+            } catch (err) {
+                // Don't let a hybrid outage block a document-grounded answer.
+                console.warn('[ModesManager] hybrid forceDocumentGrounding failed, falling back to lexical:', err?.message);
+                return this.buildRetrievedActiveModeContextBlock(
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                );
+            }
         }
 
         // Telemetry: rag_query / rag_hit / rag_miss / rag_lexical_fallback.

@@ -1403,7 +1403,7 @@ const templateFor = (answerType: AnswerType): string => {
   }
 };
 
-const requiredLayersFor = (answerType: AnswerType): ContextLayer[] => {
+const requiredLayersFor = (answerType: AnswerType, documentGroundedCustomModeActive = false): ContextLayer[] => {
   switch (answerType) {
     case 'identity_answer':
       return ['stable_identity', 'resume'];
@@ -1438,6 +1438,17 @@ const requiredLayersFor = (answerType: AnswerType): ContextLayer[] => {
     case 'lecture_answer':
       return ['live_transcript', 'screen_context', 'reference_files', 'active_mode'];
     case 'follow_up_answer':
+      // Document-grounded custom mode (audit 2026-06-27): drop
+      // `prior_assistant_responses` from the follow-up layer. A wrong prior
+      // assistant answer about the uploaded material would otherwise become
+      // truth on the next follow-up via `live_transcript`. The transcript
+      // layer is preserved so pronoun resolution ("that", "it") still works,
+      // but factual claims must come from the document, not from a
+      // previously-emitted answer. Non-document-grounded follow-ups keep
+      // the original layer set so chat-style continuity is preserved.
+      if (documentGroundedCustomModeActive) {
+        return ['live_transcript', 'active_mode'];
+      }
       return ['live_transcript', 'prior_assistant_responses', 'active_mode'];
     case 'project_about_answer':
       // Grounded in the loaded project metadata (résumé projects) + custom context
@@ -2180,7 +2191,7 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     voicePerspective,
     profileContextPolicy,
     resolvedEntity,
-    requiredContextLayers: requiredLayersFor(answerType),
+    requiredContextLayers: requiredLayersFor(answerType, documentGroundedCustomModeActive),
     forbiddenContextLayers: forbiddenLayersFor(answerType),
     responseTemplate: templateFor(answerType),
     maxFirstUsefulTokenMs: latencyMs,
@@ -2285,7 +2296,7 @@ export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationS
         ? 'Speak in the FIRST PERSON as the product\'s seller/representative ("our product", "we"). Never identify as an AI assistant.'
         : 'Answer in a neutral, explanatory voice. Do not roleplay as the candidate.';
   const policyLine = plan.documentGroundedCustomModeActive
-    ? 'Ground every concrete claim in the uploaded/reference files for this custom mode. Reference files outrank profile, resume, JD, persona, prior assistant answers, and generic knowledge. If the answer is not supported by the uploaded material, say: "This is not directly mentioned in my seminar material, but based on the topic, the likely explanation is..."'
+    ? 'Ground every concrete claim in the uploaded/reference files for this custom mode. If the answer is not supported by the uploaded material, say plainly that the requested information is not in the uploaded material. Do not reconstruct it from general knowledge, prior assistant answers, profile, resume, JD, or persona context.'
     : plan.profileContextPolicy === 'required'
       ? 'Ground every concrete claim in the provided profile facts. Never invent names, numbers, metrics, companies, or technologies that are not in those facts.'
       : plan.profileContextPolicy === 'forbidden'
