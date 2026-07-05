@@ -205,7 +205,17 @@ export function encodeModeContextPayload(value: unknown): string {
 const OKF_BACKGROUND_INDEX_THRESHOLD_CHARS = 300_000;
 
 const DOCUMENT_SOURCE_RE = /\b(uploaded|attached|provided|reference|source material|course material|seminar material|lecture material|presentation|slides?|deck|papers?|pdfs?|files?|documents?|docs?|notes?|attached material|uploaded content|provided material)\b/i;
-const DOCUMENT_CONSTRAINT_RE = /\b(source[-\s]?of[-\s]?truth|from the files?|from the documents?|from the uploaded|answer(?:s|ing)?\s+from\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?)|based on (?:uploaded|provided|attached|the\s+(?:uploaded|attached|provided|reference)|my\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation))|use only|only use|rely only|use\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation)|(?:stick to|restrict to|limit to|draw from)\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation|material)|do not use knowledge outside|(?:don['’]?t|do not)\s+(?:use|rely on|draw on)\s+(?:anything\s+)?(?:outside|beyond|other than)|ground(?:ed)? (?:your )?answers? in|ground(?:ed)? in)\b/i;
+// Broadened 2026-07-05 (code-review audit) after confirming false negatives on
+// realistic, clearly-grounded user phrasings: "Please only answer based on the
+// PDF I uploaded" (based-on...I-uploaded word order), "Stick strictly to the
+// material in the file" ("stick to" not immediately adjacent to "the X"),
+// "Only reference what is in the notes, do not add anything not written there"
+// (no exact-phrase match), "always check the file first before answering" (a
+// very common plain-English grounding instruction with no prior alternative
+// at all). Each addition below is anchored to an explicit source noun so it
+// still requires unambiguous document-grounding intent, not just any
+// restrictive-sounding sentence.
+const DOCUMENT_CONSTRAINT_RE = /\b(source[-\s]?of[-\s]?truth|from the files?|from the documents?|from the uploaded|answer(?:s|ing)?\s+from\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?)|based on (?:uploaded|provided|attached|the\s+(?:uploaded|attached|provided|reference)|my\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation))|based on the [a-z]+ i(?:'ve| have)?\s+(?:uploaded|attached|provided|shared|given)|use only|only use|only reference|only rely|rely only|use\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation)|(?:stick to|restrict to|limit to|draw from)(?:\s+\w+){0,2}\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation|material)|(?:material|content|info(?:rmation)?)\s+in\s+the\s+(?:file|document|pdf|notes?|slides?|presentation)|do not use knowledge outside|(?:don['’]?t|do not)\s+(?:use|rely on|draw on|add)\s+(?:anything\s+)?(?:outside|beyond|other than|not\s+(?:written|mentioned|present|found)\s+(?:there|in))|ground(?:ed)? (?:your )?answers? in|ground(?:ed)? in|(?:check|read|refer to|consult|verify|look at)\s+the\s+(?:file|document|pdf|notes?|slides?|presentation|material)\s+(?:first|before))\b/i;
 
 export interface ActiveModeDocumentGroundingInfo {
     isCustom: boolean;
@@ -918,8 +928,38 @@ export class ModesManager {
         const custom = isCustomMode(mode);
         const hasReferenceFiles = files.some(file => file.content.trim());
         const hasCustomPrompt = mode.customContext.trim().length > 0;
-        const documentGrounded = custom && hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
-        const documentGroundedCustomModeActive = custom && hasCustomPrompt && documentGrounded && hasReferenceFiles;
+        // A mode is "document-grounded" if it has reference files AND a custom
+        // prompt that declares source-of-truth on the uploaded material. We
+        // intentionally do NOT gate this on `custom` (= templateType === 'general'
+        // && name !== 'General') because users legitimately create deeply
+        // document-grounded prompts for built-in templates (e.g. a Seminar
+        // mode that explicitly says "answer only from the uploaded seminar file"
+        // — see live repro: a team-meet mode with 2k chars of doc-grounded
+        // customContext + 1 PDF, but documentGrounded=false because custom=false
+        // → retrieval never fires → model says "please upload your document").
+        const documentGrounded = hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
+        // CRITICAL (code-review audit 2026-07-05, following the fix above):
+        // `documentGroundedCustomModeActive` — NOT `documentGrounded` — is the
+        // flag every production retrieval/prompt-shaping call site actually
+        // reads (WhatToAnswerLLM.ts forceDocumentGrounding, both LLMHelper.ts
+        // active-mode-injection sites, IntelligenceEngine.ts's context
+        // suppression + profile bypass, ipcHandlers.ts's Hindsight/OKF
+        // isolation gates and phone-chat). `documentGrounded` alone is
+        // essentially write-only (only 2 diagnostic console.log fields read
+        // it) — broadening ONLY `documentGrounded` (as an earlier, incomplete
+        // fix did) left every real behavior still gated on the unbroadened
+        // `custom` requirement below, so the original "please upload your
+        // document" bug persisted for built-in-template modes even after
+        // that fix landed. The name retains "CustomMode" for historical/API
+        // -compat reasons (~65 call sites reference this exact field name)
+        // but it no longer requires `isCustomMode` — any mode (built-in
+        // template or user-created) with reference files + a document-
+        // grounded prompt now activates the full doc-grounded behavior.
+        // `hasCustomPrompt` and `hasReferenceFiles` are both already implied
+        // by `documentGrounded` (empty customContext can't match either
+        // regex; documentGrounded requires hasReferenceFiles) — kept as
+        // explicit conjuncts only for readability/defense-in-depth.
+        const documentGroundedCustomModeActive = hasCustomPrompt && documentGrounded && hasReferenceFiles;
         return {
             isCustom: custom,
             hasReferenceFiles,
