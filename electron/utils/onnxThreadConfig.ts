@@ -45,11 +45,15 @@
 // here before posting `init` to their worker.
 
 import os from 'os';
+import { execFileSync } from 'child_process';
+import fs from 'fs';
 
 export interface OnnxThreadBounds {
     intraOpNumThreads: number;
     interOpNumThreads: number;
     executionMode: 'sequential' | 'parallel';
+    enableCpuMemArena?: boolean;
+    enableMemPattern?: boolean;
 }
 
 function readIntEnv(name: string, fallback: number): number {
@@ -57,6 +61,15 @@ function readIntEnv(name: string, fallback: number): number {
     if (!raw) return fallback;
     const n = Number.parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function readBoolEnv(name: string, fallback: boolean): boolean {
+    const raw = process.env[name];
+    if (!raw) return fallback;
+    const normalized = raw.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
 }
 
 /**
@@ -69,6 +82,12 @@ export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
         intraOpNumThreads: readIntEnv('NATIVELY_ONNX_INTRA_OP_THREADS', 1),
         interOpNumThreads: readIntEnv('NATIVELY_ONNX_INTER_OP_THREADS', 1),
         executionMode: 'sequential',
+        // Disable ORT's persistent BFCArena/memory-pattern reuse by default.
+        // The crash forensics above point at BFCArena::Extend; standard system
+        // allocations are safer inside Electron. Env vars keep this reversible
+        // for perf experiments without shipping a new build.
+        enableCpuMemArena: readBoolEnv('NATIVELY_ONNX_ENABLE_CPU_MEM_ARENA', false),
+        enableMemPattern: readBoolEnv('NATIVELY_ONNX_ENABLE_MEM_PATTERN', false),
     };
 }
 
@@ -91,10 +110,25 @@ export function getBoundedOnnxSessionOptions(): OnnxThreadBounds {
 
 export type OnnxSlotPriority = 'normal' | 'high';
 
-let inFlightNormal = 0;
-let inFlightHigh = 0;
-const waitersNormal: Array<() => void> = [];
-const waitersHigh: Array<() => void> = [];
+// The semaphore lives on globalThis, NOT at module scope: this module is
+// inlined into 32 dist bundles (whisper, embedding, reranker, RAG, main), and
+// a per-bundle copy caps sessions at 2 PER COPY — a harness co-loading three
+// ONNX consumers could run six native sessions, exactly the multi-hundred-MB
+// BFC-arena condition this gate exists to prevent. The comment above covers
+// the worker-heap dimension; this covers the bundle dimension.
+interface OnnxSemaphore {
+    inFlightNormal: number;
+    inFlightHigh: number;
+    waitersNormal: Array<() => void>;
+    waitersHigh: Array<() => void>;
+}
+const _sem: OnnxSemaphore = (() => {
+    const g = globalThis as unknown as Record<string, OnnxSemaphore | undefined>;
+    if (!g.__nativelyOnnxSemaphoreV1__) {
+        g.__nativelyOnnxSemaphoreV1__ = { inFlightNormal: 0, inFlightHigh: 0, waitersNormal: [], waitersHigh: [] };
+    }
+    return g.__nativelyOnnxSemaphoreV1__;
+})();
 
 function readMaxConcurrent(): number {
     return readIntEnv('NATIVELY_ONNX_MAX_CONCURRENT_SESSIONS', 2);
@@ -107,65 +141,241 @@ function readMinFreeGB(): number {
     return Number.isFinite(n) && n >= 0 ? n : 2.0;
 }
 
-function canAcquireNow(priority: OnnxSlotPriority): boolean {
+// A weight-exceeds-cap acquisition (see canAcquireNow's exclusive-mode
+// branch) is admitted only when the gate is completely free, and the
+// holder that eventually wins keeps it for its ENTIRE session lifetime
+// (e.g. a whole meeting for LocalWhisperSTT) — not a brief critical
+// section. So a wait past cold-start-plus-margin here isn't "queued a bit
+// longer", it's permanent: the current holder will not release until ITS
+// session ends, which for a live recording could be hours away. Reject
+// after this bound so the caller's existing error path can engage instead
+// of hanging forever. Deliberately NOT applied to weight <= cap
+// acquisitions (normal-priority queuing under ordinary contention is
+// expected to legitimately wait longer than this). Overridable via env var
+// (matching readMaxConcurrent/readMinFreeGB's own pattern) so tests don't
+// need to hand-wait the real default.
+function readExclusiveTimeoutMs(): number {
+    return readIntEnv('NATIVELY_ONNX_EXCLUSIVE_TIMEOUT_MS', 15000);
+}
+
+function canAcquireNow(priority: OnnxSlotPriority, weight: number): boolean {
     const cap = readMaxConcurrent();
-    if (priority === 'high') {
-        return inFlightNormal + inFlightHigh < cap;
+    const current = _sem.inFlightNormal + _sem.inFlightHigh;
+    // A request whose own weight exceeds the cap (Nemotron's 3 sessions
+    // against the default cap of 2) can never satisfy "current + weight <=
+    // cap" — that would deadlock forever. Treat it as exclusive: admit only
+    // when nothing else is in flight, then let it run alone even though it
+    // temporarily exceeds the nominal cap.
+    if (weight > cap) {
+        if (current > 0) return false;
+    } else if (current + weight > cap) {
+        return false;
     }
+    if (priority === 'high') return true;
     // Normal priority: only acquire when there are no high-priority waiters
     // queued (so Whisper can grab the next slot promptly).
-    if (waitersHigh.length > 0) return false;
-    return inFlightNormal + inFlightHigh < cap;
+    return _sem.waitersHigh.length === 0;
+}
+
+function removeFromQueue(queue: Array<() => void>, resolver: () => void): void {
+    const idx = queue.indexOf(resolver);
+    if (idx !== -1) queue.splice(idx, 1);
 }
 
 /**
  * Acquire a shared ONNX session slot. Returns a release function the caller
  * MUST call when the session is torn down (typically in worker `error`/`exit`
- * handlers). Blocks until a slot is available; NEVER rejects.
+ * handlers).
  *
  * Priority 'high' is for latency-critical consumers (Whisper) — it acquires
  * ahead of queued normal-priority waiters but does NOT preempt a running
  * session. If the cap is exhausted, high-priority waiters block normal-priority
  * acquisitions so Whisper can take the next free slot promptly.
+ *
+ * `weight` (default 1) is how many concurrent native ONNX sessions this one
+ * acquisition represents — NemotronEngine opens 3 (encoder/decoder/joint)
+ * per worker, so its caller passes `weight: 3`. A `weight` that exceeds the
+ * cap runs in exclusive mode (see canAcquireNow) and is subject to
+ * readExclusiveTimeoutMs(): since an exclusive holder keeps the gate for
+ * its entire session lifetime, a wait past that bound means the request
+ * cannot be satisfied while the current holder is alive, not that it needs
+ * a bit more patience — the promise REJECTS in that case instead of hanging
+ * forever. A `weight <= cap` acquisition still never rejects and blocks
+ * however long ordinary contention requires, exactly as before.
  */
-export async function acquireOnnxSlot(priority: OnnxSlotPriority = 'normal'): Promise<() => void> {
-    const queue = priority === 'high' ? waitersHigh : waitersNormal;
-    // Only enqueue when we're actually going to wait — otherwise stale
-    // resolvers accumulate in the queue and confuse the FIFO order.
-    while (!canAcquireNow(priority)) {
-        const waiterP = new Promise<void>(resolve => queue.push(resolve));
-        await waiterP;
+export async function acquireOnnxSlot(priority: OnnxSlotPriority = 'normal', weight: number = 1): Promise<() => void> {
+    const cap = readMaxConcurrent();
+    const exclusive = weight > cap;
+    const queue = priority === 'high' ? _sem.waitersHigh : _sem.waitersNormal;
+    const timeoutMs = readExclusiveTimeoutMs();
+    const deadline = exclusive ? Date.now() + timeoutMs : null;
+
+    while (!canAcquireNow(priority, weight)) {
+        let resolveWaiter!: () => void;
+        const waiterP = new Promise<void>((resolve) => {
+            resolveWaiter = resolve;
+            queue.push(resolve);
+        });
+
+        if (deadline === null) {
+            await waiterP;
+            continue;
+        }
+
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+            removeFromQueue(queue, resolveWaiter);
+            throw new Error(
+                `ONNX slot acquisition timed out after ${timeoutMs}ms — ` +
+                `weight ${weight} exceeds the concurrency cap (${cap}), and another exclusive-mode ` +
+                `session is already holding the gate for its full lifetime. This model cannot run ` +
+                `concurrently with the session currently holding the ONNX gate.`
+            );
+        }
+
+        const TIMEOUT = Symbol('onnx-slot-acquire-timeout');
+        const outcome = await Promise.race([
+            waiterP.then(() => 'resolved' as const),
+            new Promise<typeof TIMEOUT>((resolve) => setTimeout(() => resolve(TIMEOUT), remaining)),
+        ]);
+        if (outcome === TIMEOUT) {
+            removeFromQueue(queue, resolveWaiter);
+            throw new Error(
+                `ONNX slot acquisition timed out after ${timeoutMs}ms — ` +
+                `weight ${weight} exceeds the concurrency cap (${cap}), and another exclusive-mode ` +
+                `session is already holding the gate for its full lifetime. This model cannot run ` +
+                `concurrently with the session currently holding the ONNX gate.`
+            );
+        }
+        // Resolved normally within the deadline — loop re-checks canAcquireNow.
     }
-    if (priority === 'high') inFlightHigh++;
-    else inFlightNormal++;
+
+    if (priority === 'high') _sem.inFlightHigh += weight;
+    else _sem.inFlightNormal += weight;
 
     let released = false;
     return () => {
         if (released) return;
         released = true;
-        if (priority === 'high') inFlightHigh--;
-        else inFlightNormal--;
-        // Wake the next eligible waiter. Try high first, then normal — keeps
-        // Whisper latency-critical even when embeddings are queued.
-        const nextHigh = waitersHigh.shift();
-        if (nextHigh) nextHigh();
-        else {
-            const nextNormal = waitersNormal.shift();
-            if (nextNormal) nextNormal();
-        }
+        if (priority === 'high') _sem.inFlightHigh -= weight;
+        else _sem.inFlightNormal -= weight;
+        // Wake EVERY waiter, not just one: a multi-unit release (weight > 1)
+        // can free capacity for more than one queued weight-1 waiter, and a
+        // single-wake design (correct when every release always freed
+        // exactly what one waiter needed) would leave the extra capacity
+        // idle with nobody polling for it. Each woken waiter re-checks
+        // canAcquireNow itself (the `while` loop above) and re-enqueues if
+        // it still doesn't fit — waking more than necessary is safe, just
+        // slightly less efficient than a targeted wake.
+        const highWaiters = _sem.waitersHigh.splice(0);
+        const normalWaiters = _sem.waitersNormal.splice(0);
+        highWaiters.forEach(resolve => resolve());
+        normalWaiters.forEach(resolve => resolve());
     };
 }
 
+// ── Available-memory measurement ───────────────────────────────────────────
+//
+// CRITICAL: `os.freemem()` is the WRONG metric for "can I afford to load a
+// model right now". On macOS it returns ONLY the truly-free page list, which
+// the kernel deliberately keeps near-zero — idle RAM is used as file cache
+// (inactive/speculative pages) and reclaimed instantly on demand. On a healthy
+// 16-48GB Mac `os.freemem()` routinely reads 100-400MB, so a 2GB floor tested
+// against it refuses EVERY local ONNX session (embedder, reranker, intent
+// classifier, Whisper) essentially always — even with tens of GB reclaimable.
+// This silently killed on-device embeddings/RAG for keyless users (the model
+// is installed and preflight-verified, but the gate wrongly reports OOM).
+//
+// The right metric is AVAILABLE memory (free + reclaimable), which is what
+// Activity Monitor / `top` mean by "available":
+//   - macOS:  vm_stat → (free + inactive + speculative) * page_size
+//   - Linux:  /proc/meminfo → MemAvailable
+//   - other:  fall back to os.freemem() (best effort; Windows os.freemem() is
+//             already closer to "available" than macOS's).
+//
+// Measurement is cached briefly (the value only needs to gate a burst of model
+// loads at ingest/boot; spawning `vm_stat` per chunk would be wasteful).
+
+const AVAIL_MEM_CACHE_TTL_MS = 1000;
+let availMemCache: { gb: number; at: number } | null = null;
+
+/** macOS: parse `vm_stat` into available GB (free + inactive + speculative). */
+function readMacAvailableGB(): number | null {
+    // execFileSync (no shell) — args are fixed literals, no injection surface.
+    const out = execFileSync('vm_stat', [], { encoding: 'utf8', timeout: 1000 });
+    // "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+    const pageSize = Number.parseInt(out.match(/page size of (\d+) bytes/)?.[1] || '4096', 10);
+    const pages = (label: string): number => {
+        const m = out.match(new RegExp(`${label}:\\s+(\\d+)\\.`));
+        return m ? Number.parseInt(m[1], 10) : 0;
+    };
+    const free = pages('Pages free');
+    const inactive = pages('Pages inactive');
+    const speculative = pages('Pages speculative');
+    if (!Number.isFinite(pageSize) || pageSize <= 0) return null;
+    const bytes = (free + inactive + speculative) * pageSize;
+    return bytes / 1024 ** 3;
+}
+
+/** Linux: read MemAvailable (kB) from /proc/meminfo. */
+function readLinuxAvailableGB(): number | null {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const kb = Number.parseInt(meminfo.match(/^MemAvailable:\s+(\d+)\s+kB/m)?.[1] || '', 10);
+    if (!Number.isFinite(kb)) return null;
+    return (kb * 1024) / 1024 ** 3;
+}
+
 /**
- * Free-memory floor for admitting a new ONNX session. Returns true if the
- * system has at least `NATIVELY_ONNX_MIN_FREE_GB` (default 2.0 GB) free.
+ * Best-effort AVAILABLE (not merely free) system memory in GB. Falls back to
+ * `os.freemem()` when the platform-specific probe is unavailable or throws.
+ * Cached for AVAIL_MEM_CACHE_TTL_MS to avoid spawning vm_stat per model load.
+ *
+ * Override for tests / incident tuning with NATIVELY_ONNX_AVAILABLE_MEM_GB
+ * (a fixed value forces the gate deterministically).
+ */
+export function getAvailableMemoryGB(): number {
+    const override = process.env.NATIVELY_ONNX_AVAILABLE_MEM_GB;
+    if (override) {
+        const n = Number.parseFloat(override);
+        if (Number.isFinite(n) && n >= 0) return n;
+    }
+
+    const now = Date.now();
+    if (availMemCache && now - availMemCache.at < AVAIL_MEM_CACHE_TTL_MS) {
+        return availMemCache.gb;
+    }
+
+    let gb: number | null = null;
+    try {
+        if (process.platform === 'darwin') gb = readMacAvailableGB();
+        else if (process.platform === 'linux') gb = readLinuxAvailableGB();
+    } catch {
+        gb = null;
+    }
+    // Fallback: os.freemem(). On Windows this is already reasonable; on
+    // macOS/Linux it only lands here if the probe failed, and it's a
+    // conservative (low) estimate — the gate fails toward refusing, which is
+    // the pre-existing behavior, so we never regress.
+    if (gb == null || !Number.isFinite(gb)) {
+        gb = os.freemem() / 1024 ** 3;
+    }
+
+    availMemCache = { gb, at: now };
+    return gb;
+}
+
+/**
+ * Available-memory floor for admitting a new ONNX session. Returns true if the
+ * system has at least `NATIVELY_ONNX_MIN_FREE_GB` (default 2.0 GB) of
+ * AVAILABLE memory (free + OS-reclaimable cache), NOT merely `os.freemem()`.
+ * See getAvailableMemoryGB() for why the distinction is load-bearing on macOS.
  *
  * Fails OPEN (returns true) if the measurement itself throws — refusing on
  * a measurement failure would block the app for no real reason.
  */
 export function hasEnoughMemoryForOnnxSession(): boolean {
     try {
-        return (os.freemem() / 1024 ** 3) >= readMinFreeGB();
+        return getAvailableMemoryGB() >= readMinFreeGB();
     } catch {
         return true;
     }
@@ -187,8 +397,8 @@ export function getMaxConcurrentOnnxSessions(): number {
  * test suite.
  */
 export function __resetOnnxGateForTests(): void {
-    inFlightNormal = 0;
-    inFlightHigh = 0;
-    waitersNormal.length = 0;
-    waitersHigh.length = 0;
+    _sem.inFlightNormal = 0;
+    _sem.inFlightHigh = 0;
+    _sem.waitersNormal.length = 0;
+    _sem.waitersHigh.length = 0;
 }

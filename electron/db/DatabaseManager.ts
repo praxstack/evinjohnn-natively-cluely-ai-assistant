@@ -125,6 +125,85 @@ export class DatabaseManager {
     }
 
     /**
+     * Truncate the WAL file by running a `PRAGMA wal_checkpoint(TRUNCATE)`.
+     * On a force-quit or a crash mid-write, the `-wal` file is left in an
+     * inconsistent state and the next launch's `new Database(dbPath)` may
+     * either hang on a kernel lock the OS thinks is held, or read partial
+     * committed data. This call is best-effort: if it fails (db is null or
+     * the connection is closed) it does nothing. Should be called from
+     * `before-quit` AND from any force-quit-handler path so a SIGKILL of
+     * the Electron main process is the ONLY way the WAL stays dirty.
+     *
+     * This is the missing piece for the "fresh-profile crash, never opens
+     * again" bug: a half-written .db-wal on a brand-new install would lock
+     * the next launch's `new Database(dbPath)` against a phantom lock.
+     */
+    public checkpoint(): void {
+        if (!this.db) return;
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch (e: any) {
+            // best-effort: a checkpoint failure should not block shutdown.
+            console.warn('[DatabaseManager] wal_checkpoint(TRUNCATE) failed:', e?.message || e);
+        }
+    }
+
+    /**
+     * Close the better-sqlite3 connection cleanly. After this, all public
+     * methods are no-ops (db is null). Idempotent. Safe to call from
+     * `before-quit` AND from the `window-all-closed` handler so the
+     * launcher hides-to-tray path also releases the connection.
+     *
+     * This path DOES checkpoint (TRUNCATE) because it runs from a HEALTHY
+     * process (clean quit). Do NOT call this from a crash handler — use
+     * `closeWithoutCheckpoint()` there instead (see below).
+     */
+    public close(): void {
+        if (!this.db) return;
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch { /* best-effort */ }
+        try {
+            this.db.close();
+        } catch (e: any) {
+            console.warn('[DatabaseManager] close failed:', e?.message || e);
+        }
+        this.db = null;
+    }
+
+    /**
+     * Crash-safe close: release the connection WITHOUT running a
+     * wal_checkpoint(TRUNCATE).
+     *
+     * REGRESSION FIX (2026-07-10): v2.8.1 wired an emergency
+     * checkpoint+close into every crash handler (uncaughtException,
+     * unhandledRejection, SIGTERM/SIGINT, render-process-gone, …). But a
+     * TRUNCATE checkpoint run from a CRASHING or half-initialized process
+     * — or interrupted by the macOS SIGTERM→SIGKILL race — can leave
+     * `natively.db-wal` / `natively.db-shm` half-truncated, which then
+     * BLOCKS the next `new Database()` open (SQLITE_BUSY on Windows'
+     * mandatory locks, or an unreconcilable WAL on macOS). That converted a
+     * one-time crash into a permanent "app never boots again" brick on both
+     * platforms. v2.7.0 never checkpointed on crash — it let SQLite's own
+     * automatic WAL recovery replay the log safely on the next open, which
+     * is exactly what we restore here.
+     *
+     * So on a crash we ONLY close the handle (to drop the OS lock) and let
+     * SQLite auto-recover the WAL next launch. `better_sqlite3`'s `close()`
+     * itself does NOT checkpoint (only our `close()` wrapper above does), so
+     * calling the raw handle close is checkpoint-free.
+     */
+    public closeWithoutCheckpoint(): void {
+        if (!this.db) return;
+        try {
+            this.db.close();
+        } catch (e: any) {
+            console.warn('[DatabaseManager] closeWithoutCheckpoint failed:', e?.message || e);
+        }
+        this.db = null;
+    }
+
+    /**
      * The error that caused initialization to fail, if any. Lets the app surface
      * a single user-facing banner (e.g. "Local database unavailable — meeting
      * history disabled") instead of relying on log scraping.
@@ -162,6 +241,56 @@ export class DatabaseManager {
         }
     }
 
+    /**
+     * Open the better-sqlite3 connection, self-healing a poisoned WAL sidecar
+     * left by an unclean prior exit / interrupted crash-time checkpoint.
+     *
+     * On the first open failure whose code indicates lock contention or a torn
+     * WAL (SQLITE_BUSY / SQLITE_IOERR / SQLITE_CORRUPT / SQLITE_NOTADB /
+     * SQLITE_CANTOPEN / SQLITE_PROTOCOL), delete the `-wal` and `-shm` sidecars
+     * (NOT the main `.db`, which holds the last committed state) and retry the
+     * open exactly once. If the retry also fails, the original error propagates
+     * so the ctor's catch degrades to `db: null` (meeting history/modes
+     * disabled) instead of hanging — same as before, but only as a last resort.
+     *
+     * See the REGRESSION FIX note on closeWithoutCheckpoint() for the root cause.
+     */
+    private openWithWalSelfHeal(): Database.Database {
+        try {
+            return new Database(this.dbPath);
+        } catch (openErr: any) {
+            const code = String(openErr?.code || '');
+            const healable =
+                /SQLITE_BUSY|SQLITE_IOERR|SQLITE_CORRUPT|SQLITE_NOTADB|SQLITE_CANTOPEN|SQLITE_PROTOCOL/.test(code) ||
+                /database is locked|disk I\/O error|file is not a database|malformed/i.test(String(openErr?.message || ''));
+            if (!healable) throw openErr;
+
+            console.warn(
+                `[DB-RECOVERY] initial open failed (${code || openErr?.message}); ` +
+                `clearing stale WAL sidecars (-wal/-shm) and retrying once. ` +
+                `This recovers an install bricked by an interrupted crash-time checkpoint.`
+            );
+            for (const suffix of ['-wal', '-shm'] as const) {
+                const sidecar = `${this.dbPath}${suffix}`;
+                try {
+                    if (fs.existsSync(sidecar)) {
+                        fs.unlinkSync(sidecar);
+                        console.warn(`[DB-RECOVERY] removed stale ${suffix} sidecar at ${sidecar}`);
+                    }
+                } catch (rmErr: any) {
+                    // If we cannot remove the sidecar (permissions, or a zombie
+                    // process still holds the handle on Windows), the retry will
+                    // fail and the original error propagates. Log and continue.
+                    console.warn(`[DB-RECOVERY] could not remove ${suffix} sidecar: ${rmErr?.message || rmErr}`);
+                }
+            }
+            // Retry ONCE. Let any error here propagate to the ctor catch.
+            const db = new Database(this.dbPath);
+            console.warn('[DB-RECOVERY] reopened successfully after clearing WAL sidecars ✅');
+            return db;
+        }
+    }
+
     private init() {
         try {
             console.log(`[DatabaseManager] Initializing database at ${this.dbPath}`);
@@ -187,8 +316,69 @@ export class DatabaseManager {
                 }
             }
 
-            this.db = new Database(this.dbPath);
+            // SELF-HEAL (2026-07-10): open the DB, and if the open fails
+            // because a prior crash left a poisoned WAL sidecar, clear the
+            // stale -wal/-shm and retry ONCE. Background: v2.8.1 ran a
+            // wal_checkpoint(TRUNCATE) from crash handlers; if that was
+            // interrupted it left natively.db-wal/-shm in a state that made
+            // this very open throw (SQLITE_BUSY on Windows' mandatory locks,
+            // SQLITE_IOERR/CORRUPT/NOTADB on a torn WAL) — permanently bricking
+            // every subsequent launch. The main .db holds the last COMMITTED
+            // state; a dirty/uncheckpointed WAL only contains not-yet-merged
+            // frames, so deleting the sidecars and reopening recovers the DB to
+            // its last consistent commit rather than leaving the app unbootable.
+            // Any user already bricked by a shipped v2.8.x build self-heals on
+            // the next launch with this — they do NOT need to hand-delete files.
+            this.db = this.openWithWalSelfHeal();
             this.db.pragma('journal_mode = WAL');
+            // Hotfix 2026-07-09: with WAL enabled, background indexing workers
+            // and foreground chat reads/writes can briefly contend. Waiting is
+            // safer than throwing SQLITE_BUSY during startup or active sessions.
+            this.db.pragma('busy_timeout = 5000');
+            // Enforce foreign keys on the shared connection. Several delete paths
+            // (deleteMeeting, deleteMode, deleteKnowledgePack) do a bare parent-row
+            // DELETE and rely ENTIRELY on `ON DELETE CASCADE` to reap child rows
+            // (transcripts, ai_interactions, chunks, chunk_summaries). SQLite ships
+            // with foreign_keys OFF per-connection, so those cascades are inert
+            // unless something enables the pragma. Historically the ONLY place that
+            // did was the premium KnowledgeDatabaseManager's constructor — meaning
+            // FK enforcement silently depended on the premium module loading. If
+            // premium failed to load (source-available build, packaging regression),
+            // every meeting/mode/pack delete would orphan its children. Enable it
+            // here, unconditionally, on the one shared connection all writes use.
+            // Must run OUTSIDE any transaction (SQLite no-ops `foreign_keys` if set
+            // mid-transaction) and BEFORE migrations — both hold here.
+            this.db.pragma('foreign_keys = ON');
+            // Leave synchronous = FULL (the WAL default). NORMAL trades crash
+            // durability for throughput — a power loss between commit and
+            // fsync loses the transaction. The emergency-close path added in
+            // electron/main.ts (uncaughtException / SIGTERM / process-gone)
+            // checkpoint+closes the DB so the next launch never sees a stale
+            // WAL holding a kernel lock from a dead writer.
+
+            // 2026-07-09: detect crash-recovery conditions on startup. If we
+            // see a WAL file > 50MB or a `-wal` left over from a hard kill,
+            // log it so the user can correlate a slow/stuck launch with the
+            // previous session's crash. Anything >5MB after a clean previous
+            // session is unusual and worth surfacing; >50MB is "the previous
+            // session probably wrote a lot without checkpointing".
+            try {
+                const walPath = `${this.dbPath}-wal`;
+                const shmPath = `${this.dbPath}-shm`;
+                const walBytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+                const shmExists = fs.existsSync(shmPath);
+                if (walBytes >= 50 * 1024 * 1024) {
+                    console.warn(`[DB-RECOVERY] large WAL on open: ${walBytes} bytes at ${walPath} (previous session likely died mid-transaction). SQLite will auto-recover it on this open; a manual TRUNCATE checkpoint runs only on the next clean quit.`);
+                } else if (walBytes >= 5 * 1024 * 1024) {
+                    console.log(`[DB-RECOVERY] non-trivial WAL on open: ${walBytes} bytes at ${walPath}`);
+                }
+                if (shmExists) {
+                    console.log(`[DB-RECOVERY] -shm index file present (typical after WAL-mode open; SQLite manages it).`);
+                }
+            } catch (recovErr: any) {
+                // Recovery detection is best-effort — never block startup.
+                console.warn('[DB-RECOVERY] detection check failed (non-fatal):', recovErr?.message || recovErr);
+            }
 
             // Load sqlite-vec extension for native vector search
             try {
@@ -345,60 +535,48 @@ export class DatabaseManager {
 
         // Version 2 → 3: sqlite-vec virtual tables for native vector search
         if (version < 3) {
-            console.log('[DatabaseManager] Applying migration v2 → v3: vec0 virtual tables');
+            // PHASE-2D (Fix-2): the historical v3 step attempted to create
+            // a vec0 table with `embedding float` (no dimension), which
+            // sqlite-vec rejects with "At least one vector column is
+            // required". The fix is to skip that broken CREATE entirely
+            // and let the v8/v9 per-dimension migration below provision
+            // the working tables. We still bump user_version to 3 so the
+            // migration loop advances normally.
+            //
+            // The happy path (fresh install) is now COMPLETELY SILENT —
+            // no log line, no error. We only log when there's actual
+            // legacy cleanup to report (a prior install that DID create
+            // the broken tables).
             try {
-                // Create vec0 virtual table for chunk embeddings (dynamic dimension)
-                this.db.exec(`
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-                        chunk_id INTEGER PRIMARY KEY,
-                        embedding float
-                    );
-                `);
-
-                // Create vec0 virtual table for summary embeddings (dynamic dimension)
-                this.db.exec(`
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_summaries USING vec0(
-                        summary_id INTEGER PRIMARY KEY,
-                        embedding float
-                    );
-                `);
-
-                // Migrate existing chunk embeddings from BLOB column to vec0 table
-                this.migrateExistingEmbeddings();
-
-                console.log('[DatabaseManager] vec0 virtual tables created successfully');
+                this.tryProvisionLegacyVecTables();
+                if (this._lastLegacyCleanup > 0) {
+                    console.log(`[DatabaseManager] v3 migration: cleared ${this._lastLegacyCleanup} legacy broken vec0 table(s) (replaced by per-dim v8/v9)`);
+                    this._lastLegacyCleanup = 0;
+                }
             } catch (e) {
-                console.error('[DatabaseManager] vec0 migration failed (sqlite-vec may not be loaded):', e);
-                console.warn('[DatabaseManager] VectorStore will fall back to JS cosine similarity');
+                // Only log on ACTUAL failure, not on the historic "vec0
+                // constructor error: At least one vector column is
+                // required" which we now explicitly do NOT raise.
+                console.error('[DatabaseManager] v3 migration failed unexpectedly (non-fatal, will be retried at v8/v9):', (e as { message?: string })?.message || e);
             }
             this.db.pragma('user_version = 3');
         }
 
         // Version 3 → 4: Drop strict 768-dim vec0 tables to allow flexible embedding dimensions
         if (version < 4) {
-            console.log('[DatabaseManager] Applying migration v3 → v4: Drop strict dimension vec0 tables');
+            // PHASE-2D (Fix-2): same fix as v3 — silent on fresh installs.
+            // The only action this step used to take was DROP TABLE on
+            // tables that v3 just CREATED. Since v3 no longer creates
+            // them, and legacy repos already had them dropped in v3,
+            // there's nothing to do on the happy path.
             try {
-                this.db.exec('DROP TABLE IF EXISTS vec_chunks;');
-                this.db.exec('DROP TABLE IF EXISTS vec_summaries;');
-
-                this.db.exec(`
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-                        chunk_id INTEGER PRIMARY KEY,
-                        embedding float
-                    );
-                `);
-
-                this.db.exec(`
-                    CREATE VIRTUAL TABLE IF NOT EXISTS vec_summaries USING vec0(
-                        summary_id INTEGER PRIMARY KEY,
-                        embedding float
-                    );
-                `);
-
-                this.migrateExistingEmbeddings();
-                console.log('[DatabaseManager] vec0 virtual tables recreated for flexible dimensions');
+                this.tryProvisionLegacyVecTables();
+                if (this._lastLegacyCleanup > 0) {
+                    console.log(`[DatabaseManager] v4 migration: cleared ${this._lastLegacyCleanup} legacy broken vec0 table(s)`);
+                    this._lastLegacyCleanup = 0;
+                }
             } catch (e) {
-                console.error('[DatabaseManager] vec0 migration v4 failed:', e);
+                console.error('[DatabaseManager] v4 migration failed (non-fatal):', (e as { message?: string })?.message || e);
             }
             this.db.pragma('user_version = 4');
         }
@@ -678,6 +856,8 @@ export class DatabaseManager {
             this.db.pragma('user_version = 13');
         }
 
+        // NOTE: profile_custom_notes and profile_persona (v13→14, v14→15 below) are orphaned —
+        // the Custom Context / AI Persona feature they backed was removed. Kept non-destructively.
         // Version 13 → 14: Add profile_custom_notes table
         if (version < 14) {
             console.log('[DatabaseManager] Applying migration v13 → v14: Add profile_custom_notes table');
@@ -1089,65 +1269,451 @@ export class DatabaseManager {
             this.db.pragma('user_version = 23');
         }
 
+        // Version 23 → 24: Context OS memory safety (docs/context-os/, Phase 9).
+        // assistant_claims separates factual CLAIMS from conversational assistant
+        // messages: a claim starts `unverified` and only `verified` claims (with
+        // evidence pointers) may ever be re-used as evidence in a later turn.
+        // turn_context_contracts persists the privacy-safe per-turn source
+        // decision so contamination incidents can be reproduced from the trace.
+        // Both tables are ADDITIVE — no existing table or write path changes.
+        if (version < 24) {
+            console.log('[DatabaseManager] Applying migration v23 → v24: Context OS assistant_claims + turn_context_contracts');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS assistant_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    source_owner TEXT NOT NULL,
+                    requested_property TEXT,
+                    validation_status TEXT NOT NULL DEFAULT 'unverified',
+                    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    contradicted_by_claim_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_assistant_claims_turn ON assistant_claims(turn_id);
+                CREATE INDEX IF NOT EXISTS idx_assistant_claims_status ON assistant_claims(validation_status);
+
+                CREATE TABLE IF NOT EXISTS turn_context_contracts (
+                    turn_id TEXT PRIMARY KEY,
+                    surface TEXT NOT NULL,
+                    active_mode_id TEXT,
+                    answer_shape TEXT NOT NULL,
+                    source_owner TEXT NOT NULL,
+                    requested_property TEXT,
+                    allowed_sources_json TEXT NOT NULL DEFAULT '[]',
+                    forbidden_sources_json TEXT NOT NULL DEFAULT '[]',
+                    memory_write_policy_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_turn_contracts_surface ON turn_context_contracts(surface);
+            `);
+            this.db.pragma('user_version = 24');
+        }
+
+        // Version 24 → 25: persisted ModeSourceContract (real-custom-mode-repair,
+        // 2026-07-11). Closes the root cause of the P0 contamination incident:
+        // `documentGrounded`/`sourceAuthority` were previously RE-DERIVED on every
+        // turn by regex-matching the mode's free-text prompt, so a real user's
+        // natural phrasing silently failed to satisfy the detector and modes
+        // defaulted to `general_mixed` (everything allowed) with no user
+        // visibility. `source_contract_json` stores the explicit, typed,
+        // user-editable ModeSourceContract (electron/services/modeSourceContract.ts).
+        // NULL means "not yet migrated" — ModesManager migrates it once on first
+        // read and persists the result (never re-derives per-turn again).
+        if (version < 25) {
+            console.log('[DatabaseManager] Applying migration v24 → v25: Add modes.source_contract_json');
+            const hasColumn = this.db.prepare(`PRAGMA table_info(modes)`).all()
+                .some((col: any) => col.name === 'source_contract_json');
+            if (!hasColumn) {
+                this.db.exec(`ALTER TABLE modes ADD COLUMN source_contract_json TEXT`);
+            }
+            this.db.pragma('user_version = 25');
+        }
+
+        // Version 25 → 26: modes.is_builtin (2026-08-09).
+        //
+        // Until now there were no default modes. Every row was a user-created
+        // `mode_<uuid>` with a freely editable template, including the ones
+        // NAMED "General" / "Team Meet" / "Technical Interview", and updateMode
+        // would persist any template onto any row. A mode named "Technical
+        // Interview" therefore ran as `general` — the one built-in with
+        // `profileSources: []` — and the user's résumé was silently out of
+        // scope.
+        //
+        // This migration only ADDS the column. Deciding which existing rows
+        // become built-ins reclassifies user data, so that rule lives in
+        // services/builtinModes.ts (pure, tested) and is applied once at
+        // startup by ModesManager.ensureBuiltinModes() — where seeding can reuse
+        // createMode and get note sections and a source contract for free.
+        if (version < 26) {
+            console.log('[DatabaseManager] Applying migration v25 → v26: Add modes.is_builtin');
+            const hasColumn = this.db.prepare(`PRAGMA table_info(modes)`).all()
+                .some((col: any) => col.name === 'is_builtin');
+            if (!hasColumn) {
+                this.db.exec(`ALTER TABLE modes ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0`);
+            }
+            this.db.pragma('user_version = 26');
+        }
+
+        // Version 26 → 27: usage_outbox — durable queue for client-reported
+        // usage events (2026-08-14, Usage Ledger campaign 2).
+        //
+        // WHY A DURABLE QUEUE AND NOT fetch-and-forget.
+        //
+        // The events this carries are the ONLY evidence that a BYOK feature ran.
+        // When a customer uses their own provider key, the backend executes
+        // nothing and meters nothing, so an event dropped because the laptop was
+        // on a plane is not a gap in telemetry — it is the entire record of that
+        // session, gone. A fetch() that fails during a network blip loses it
+        // silently and forever.
+        //
+        // WHY IT LIVES HERE rather than in a JSON file or electron-store: this
+        // is where the app already keeps durable local state, it is already
+        // migrated, already WAL-checkpointed on shutdown, and already survives
+        // crash/sleep/restart. A second persistence engine would have to earn
+        // all of that again.
+        //
+        // NOTE ON `status`: 'delivered' rows are kept briefly rather than
+        // deleted on ACK, so a duplicate enqueue of the same event_id inside the
+        // compaction window is caught by the UNIQUE constraint instead of being
+        // re-sent. compactOutbox() removes them after 7 days.
+        if (version < 27) {
+            console.log('[DatabaseManager] Applying migration v26 → v27: usage_outbox');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS usage_outbox (
+                    event_id        TEXT PRIMARY KEY,
+                    layer           TEXT NOT NULL DEFAULT 'ledger',
+                    payload_json    TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count   INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at   INTEGER NOT NULL DEFAULT 0,
+                    last_error      TEXT,
+                    created_at      INTEGER NOT NULL,
+                    delivered_at    INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS usage_outbox_due_idx
+                    ON usage_outbox (status, next_retry_at);
+                CREATE INDEX IF NOT EXISTS usage_outbox_created_idx
+                    ON usage_outbox (created_at);
+            `);
+            this.db.pragma('user_version = 27');
+        }
+
         console.log('[DatabaseManager] Migrations completed.');
     }
 
     // ============================================
-    // Profile Custom Notes
+    // Usage outbox (v27) — durable queue for client-reported usage events
+    // ============================================
+    //
+    // Every method here is guarded and returns a neutral value when the database
+    // is unavailable. This queue must never be able to break the feature it is
+    // observing: a customer whose disk is full still gets to run a meeting.
+
+    /**
+     * Queue one event for delivery.
+     *
+     * INSERT OR IGNORE, not INSERT: enqueuing the same event_id twice is a
+     * no-op, so a retry loop in a caller cannot produce two rows for one logical
+     * event. That is the local half of the replay protection the server enforces
+     * with UNIQUE(event_id).
+     *
+     * Returns 'queued' | 'duplicate' | 'dropped' | 'unavailable'.
+     */
+    public enqueueUsageEvent(eventId: string, layer: 'ledger' | 'telemetry', payload: unknown, opts?: { maxRows?: number }): string {
+        if (!this.db) return 'unavailable';
+        try {
+            // Hard cap. An app that has been offline for a month, or whose
+            // licence has lapsed so every delivery 401s, must not grow this
+            // table without bound. Dropping the OLDEST undelivered event is the
+            // least-bad choice: recent activity is what a dispute is usually
+            // about, and the drop is counted so the loss is visible rather than
+            // silent.
+            const maxRows = opts?.maxRows ?? 10_000;
+            const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM usage_outbox`).get() as any)?.n ?? 0;
+            if (total >= maxRows) {
+                // Make room for exactly one new row.
+                //
+                // ORDER MATTERS. `total` counts EVERY row, but delivered rows are
+                // deliberately retained for a 7-day support window and compaction
+                // only runs on a 6-hour timer — so in a normal desktop session the
+                // table fills with delivered rows. Evicting only `status != 'delivered'`
+                // (the previous behaviour) meant a table of 9,999 delivered rows
+                // destroyed the one live event on every insert, and once EVERY row
+                // was delivered there was no victim at all and the incoming event was
+                // dropped before the INSERT — permanently, for every later event.
+                // Both are the exact loss this file's header forbids.
+                //
+                // Delivered rows are already safely upstream, so reclaiming them
+                // costs nothing. An undelivered event is sacrificed only when no
+                // delivered row remains to give up.
+                const surplus = total - maxRows + 1;
+                const freed = this.db.prepare(`
+                    DELETE FROM usage_outbox WHERE event_id IN (
+                        SELECT event_id FROM usage_outbox
+                         WHERE status = 'delivered'
+                         ORDER BY created_at ASC LIMIT ?
+                    )
+                `).run(surplus).changes ?? 0;
+                if (freed < surplus) {
+                    const sacrificed = this.db.prepare(`
+                        DELETE FROM usage_outbox WHERE event_id IN (
+                            SELECT event_id FROM usage_outbox
+                             WHERE status != 'delivered'
+                             ORDER BY created_at ASC LIMIT ?
+                        )
+                    `).run(surplus - freed).changes ?? 0;
+                    // Losing an undelivered event IS the loss this queue exists to
+                    // prevent. It must never be silent — the previous code evicted
+                    // one and still returned 'queued', so nothing counted it.
+                    if (sacrificed > 0) {
+                        console.warn(`[DatabaseManager] usage_outbox at cap (${maxRows}) — discarded ${sacrificed} UNDELIVERED event(s) to enqueue a new one`);
+                    }
+                }
+                // Deliberately fall through to the INSERT even if nothing could be
+                // freed: bounding the table is worth less than the incoming event.
+            }
+            const res = this.db.prepare(`
+                INSERT OR IGNORE INTO usage_outbox (event_id, layer, payload_json, status, created_at, next_retry_at)
+                VALUES (?, ?, ?, 'pending', ?, 0)
+            `).run(eventId, layer, JSON.stringify(payload), Date.now());
+            return res.changes > 0 ? 'queued' : 'duplicate';
+        } catch (e: any) {
+            console.warn('[DatabaseManager] enqueueUsageEvent failed:', e?.message || e);
+            return 'unavailable';
+        }
+    }
+
+    /** Events due for delivery now, oldest first. */
+    public claimUsageOutboxBatch(limit = 100, now = Date.now()): Array<{ event_id: string; layer: string; payload: any; attempt_count: number }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare(`
+                SELECT event_id, layer, payload_json, attempt_count
+                  FROM usage_outbox
+                 WHERE status = 'pending' AND next_retry_at <= ?
+                 ORDER BY created_at ASC
+                 LIMIT ?
+            `).all(now, limit) as any[];
+            return rows.map((r) => ({
+                event_id: r.event_id,
+                layer: r.layer,
+                attempt_count: r.attempt_count,
+                payload: JSON.parse(r.payload_json),
+            }));
+        } catch (e: any) {
+            console.warn('[DatabaseManager] claimUsageOutboxBatch failed:', e?.message || e);
+            return [];
+        }
+    }
+
+    /** Mark delivered. Rows linger until compaction so a duplicate enqueue is caught. */
+    public markUsageEventsDelivered(eventIds: string[], now = Date.now()): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const stmt = this.db.prepare(`UPDATE usage_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE event_id = ?`);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(now, id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] markUsageEventsDelivered failed:', e?.message || e);
+        }
+    }
+
+    /**
+     * Server said these are permanently unacceptable (schema rejection).
+     * Deleted rather than retried: a payload this server build refuses will be
+     * refused identically forever, and retrying it is how a queue wedges.
+     */
+    public dropUsageEvents(eventIds: string[]): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const stmt = this.db.prepare(`DELETE FROM usage_outbox WHERE event_id = ?`);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] dropUsageEvents failed:', e?.message || e);
+        }
+    }
+
+    /** Record a failed attempt and schedule the next one. */
+    public markUsageEventsFailed(eventIds: string[], nextRetryAt: number, error: string): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const msg = String(error || '').slice(0, 200);
+            const stmt = this.db.prepare(`
+                UPDATE usage_outbox
+                   SET attempt_count = attempt_count + 1, next_retry_at = ?, last_error = ?
+                 WHERE event_id = ?
+            `);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(nextRetryAt, msg, id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] markUsageEventsFailed failed:', e?.message || e);
+        }
+    }
+
+    /** Remove delivered rows older than the retention window (default 7 days). */
+    public compactUsageOutbox(olderThanMs = 7 * 24 * 60 * 60 * 1000, now = Date.now()): number {
+        if (!this.db) return 0;
+        try {
+            const res = this.db.prepare(
+                `DELETE FROM usage_outbox WHERE status = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < ?`
+            ).run(now - olderThanMs);
+            return res.changes ?? 0;
+        } catch (e: any) {
+            console.warn('[DatabaseManager] compactUsageOutbox failed:', e?.message || e);
+            return 0;
+        }
+    }
+
+    /** Queue depth by status — the §20 `event_queue_depth` health metric. */
+    public getUsageOutboxStats(): { pending: number; delivered: number; total: number; oldestPendingAgeMs: number | null } {
+        if (!this.db) return { pending: 0, delivered: 0, total: 0, oldestPendingAgeMs: null };
+        try {
+            const rows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM usage_outbox GROUP BY status`).all() as any[];
+            const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.n]));
+            const oldest = this.db.prepare(
+                `SELECT MIN(created_at) AS t FROM usage_outbox WHERE status = 'pending'`
+            ).get() as any;
+            return {
+                pending: byStatus.pending ?? 0,
+                delivered: byStatus.delivered ?? 0,
+                total: rows.reduce((s, r) => s + r.n, 0),
+                oldestPendingAgeMs: oldest?.t ? Date.now() - oldest.t : null,
+            };
+        } catch {
+            return { pending: 0, delivered: 0, total: 0, oldestPendingAgeMs: null };
+        }
+    }
+
+    // ============================================
+    // Context OS — assistant claims + turn contracts (v24, Phase 9)
     // ============================================
 
-    public getCustomNotes(): string {
-        if (!this.db) return '';
+    /** Insert an extracted assistant claim (default validation_status='unverified'). */
+    public saveAssistantClaim(claim: {
+        claimId: string;
+        turnId: string;
+        claimText: string;
+        sourceOwner: string;
+        requestedProperty?: string | null;
+        validationStatus?: 'unverified' | 'verified' | 'contradicted';
+        evidenceIds?: string[];
+    }): void {
+        if (!this.db) return;
+        // Context OS invariant (Phase 7): a VERIFIED claim MUST carry evidence
+        // IDs — a verified claim with no provenance is exactly the contamination
+        // trap the claims table exists to prevent. Enforce fail-closed at the DAO
+        // boundary: downgrade rather than store an unprovable "verified" row.
+        let status = claim.validationStatus ?? 'unverified';
+        const evidenceIds = claim.evidenceIds ?? [];
+        if (status === 'verified' && evidenceIds.length === 0) {
+            console.warn('[DatabaseManager] refusing to store verified claim without evidence IDs — downgrading to unverified');
+            status = 'unverified';
+        }
         try {
-            const row = this.db.prepare('SELECT content FROM profile_custom_notes WHERE id = 1').get() as { content: string } | undefined;
-            return row?.content ?? '';
+            this.db.prepare(`
+                INSERT OR REPLACE INTO assistant_claims
+                    (claim_id, turn_id, claim_text, source_owner, requested_property, validation_status, evidence_ids_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                claim.claimId,
+                claim.turnId,
+                claim.claimText,
+                claim.sourceOwner,
+                claim.requestedProperty ?? null,
+                status,
+                JSON.stringify(evidenceIds),
+            );
         } catch (e) {
-            console.error('[DatabaseManager] getCustomNotes failed:', e);
-            return '';
+            console.error('[DatabaseManager] saveAssistantClaim failed:', e);
         }
     }
 
-    public saveCustomNotes(content: string): void {
+    /** Only VERIFIED claims may be re-used as evidence (memory-safety invariant). */
+    public getVerifiedAssistantClaims(limit = 50): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare(`
+                SELECT * FROM assistant_claims
+                WHERE validation_status = 'verified'
+                ORDER BY created_at DESC LIMIT ?
+            `).all(limit);
+        } catch (e) {
+            console.error('[DatabaseManager] getVerifiedAssistantClaims failed:', e);
+            return [];
+        }
+    }
+
+    /**
+     * Phase 6 Slice 7 (context-rebuild, 2026-07-25, RC8 precedence
+     * enforcement): the read-side counterpart to getVerifiedAssistantClaims
+     * needed to check whether a draft answer restates a claim already
+     * marked contradicted from an earlier turn.
+     */
+    public getContradictedAssistantClaims(limit = 50): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare(`
+                SELECT * FROM assistant_claims
+                WHERE validation_status = 'contradicted'
+                ORDER BY created_at DESC LIMIT ?
+            `).all(limit);
+        } catch (e) {
+            console.error('[DatabaseManager] getContradictedAssistantClaims failed:', e);
+            return [];
+        }
+    }
+
+    /** Mark a stored claim contradicted by newer evidence (never deleted — audit trail). */
+    public markAssistantClaimContradicted(claimId: string, contradictedByClaimId?: string | null): void {
         if (!this.db) return;
         try {
-            this.db.prepare(
-                'INSERT INTO profile_custom_notes (id, content, updated_at) VALUES (1, ?, datetime(\'now\')) ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at'
-            ).run(content);
+            this.db.prepare(`
+                UPDATE assistant_claims
+                SET validation_status = 'contradicted', contradicted_by_claim_id = ?
+                WHERE claim_id = ?
+            `).run(contradictedByClaimId ?? null, claimId);
         } catch (e) {
-            console.error('[DatabaseManager] saveCustomNotes failed:', e);
+            console.error('[DatabaseManager] markAssistantClaimContradicted failed:', e);
         }
     }
 
-    public getPersona(): string {
-        if (!this.db) return '';
-        try {
-            const row = this.db.prepare('SELECT content FROM profile_persona WHERE id = 1').get() as { content: string } | undefined;
-            return row?.content ?? '';
-        } catch (e) {
-            console.error('[DatabaseManager] getPersona failed:', e);
-            return '';
-        }
-    }
-
-    public savePersona(content: string): void {
+    /** Persist the privacy-safe per-turn contract snapshot (no content, source kinds only). */
+    public saveTurnContextContract(row: {
+        turnId: string;
+        surface: string;
+        activeModeId?: string | null;
+        answerShape: string;
+        sourceOwner: string;
+        requestedProperty?: string | null;
+        allowedSources: string[];
+        forbiddenSources: string[];
+        memoryWritePolicy: Record<string, boolean>;
+    }): void {
         if (!this.db) return;
         try {
-            this.db.prepare(
-                'INSERT INTO profile_persona (id, content, updated_at) VALUES (1, ?, datetime(\'now\')) ON CONFLICT(id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at'
-            ).run(content);
+            this.db.prepare(`
+                INSERT OR REPLACE INTO turn_context_contracts
+                    (turn_id, surface, active_mode_id, answer_shape, source_owner, requested_property,
+                     allowed_sources_json, forbidden_sources_json, memory_write_policy_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                row.turnId,
+                row.surface,
+                row.activeModeId ?? null,
+                row.answerShape,
+                row.sourceOwner,
+                row.requestedProperty ?? null,
+                JSON.stringify(row.allowedSources),
+                JSON.stringify(row.forbiddenSources),
+                JSON.stringify(row.memoryWritePolicy),
+            );
         } catch (e) {
-            console.error('[DatabaseManager] savePersona failed:', e);
+            console.error('[DatabaseManager] saveTurnContextContract failed:', e);
         }
     }
 
-    public clearProfilePersona(): void {
-        if (!this.db) return;
-        try {
-            this.db.prepare('UPDATE profile_persona SET content = \'\', updated_at = datetime(\'now\') WHERE id = 1').run();
-        } catch (e) {
-            console.error('[DatabaseManager] clearProfilePersona failed:', e);
-        }
-    }
 
     // ============================================
     // Modes CRUD
@@ -1173,19 +1739,29 @@ export class DatabaseManager {
         }
     }
 
-    public createMode(mode: { id: string; name: string; templateType: string; customContext: string }): void {
+    public createMode(mode: { id: string; name: string; templateType: string; customContext: string; sourceContractJson?: string }): void {
         if (!this.db) return;
         try {
             this.db.prepare(`
-                INSERT INTO modes (id, name, template_type, custom_context, is_active)
-                VALUES (?, ?, ?, ?, 0)
-            `).run(mode.id, mode.name, mode.templateType, mode.customContext);
+                INSERT INTO modes (id, name, template_type, custom_context, is_active, source_contract_json)
+                VALUES (?, ?, ?, ?, 0, ?)
+            `).run(mode.id, mode.name, mode.templateType, mode.customContext, mode.sourceContractJson ?? null);
         } catch (e) {
             console.error('[DatabaseManager] createMode failed:', e);
         }
     }
 
-    public updateMode(id: string, updates: { name?: string; templateType?: string; customContext?: string }): void {
+    /** Mark/unmark a mode as an app default (migration v26). */
+    public setModeBuiltin(id: string, isBuiltin: boolean): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('UPDATE modes SET is_builtin = ? WHERE id = ?').run(isBuiltin ? 1 : 0, id);
+        } catch (e) {
+            console.error('[DatabaseManager] setModeBuiltin failed:', e);
+        }
+    }
+
+    public updateMode(id: string, updates: { name?: string; templateType?: string; customContext?: string; sourceContractJson?: string | null }): void {
         if (!this.db) return;
         try {
             if (updates.name !== undefined) {
@@ -1196,6 +1772,9 @@ export class DatabaseManager {
             }
             if (updates.customContext !== undefined) {
                 this.db.prepare('UPDATE modes SET custom_context = ? WHERE id = ?').run(updates.customContext, id);
+            }
+            if (updates.sourceContractJson !== undefined) {
+                this.db.prepare('UPDATE modes SET source_contract_json = ? WHERE id = ?').run(updates.sourceContractJson, id);
             }
         } catch (e) {
             console.error('[DatabaseManager] updateMode failed:', e);
@@ -1325,16 +1904,15 @@ export class DatabaseManager {
     /**
      * Explicit cascade delete for a knowledge_sources row and everything
      * hanging off it (packs, cards, entities, relations, index versions).
-     * This codebase never enables `PRAGMA foreign_keys = ON` (confirmed:
-     * zero references anywhere in electron/), so the `ON DELETE CASCADE`
-     * clauses declared on these tables in the v19→v20/v20→v21 migrations are
-     * inert — SQLite silently ignores FK actions when enforcement is off. A
-     * bare `DELETE FROM knowledge_sources` would leave every dependent row
-     * permanently orphaned (unreclaimable disk growth, since a re-upload
-     * mints a fresh random file id that never matches the orphaned rows).
-     * Deletes in dependency order (children before the pack, pack before
-     * the source) inside one transaction so a mid-delete failure can't
-     * leave a partially-cleaned pack.
+     *
+     * NOTE (2026-07-10): `PRAGMA foreign_keys = ON` is now enabled directly in
+     * initialize() on the shared connection, so the `ON DELETE CASCADE` clauses
+     * on these tables ARE enforced at runtime and a bare parent delete would
+     * cascade. This method's manual, dependency-ordered delete is kept as
+     * belt-and-suspenders: it is harmless with FK enforcement on, and it keeps
+     * this path correct (and self-documenting about the reap order) regardless of
+     * pragma state. Deletes children before the pack, pack before the source,
+     * inside one transaction so a mid-delete failure can't leave a partial pack.
      */
     public deleteKnowledgeSource(id: string): void {
         if (!this.db) return;
@@ -1733,7 +2311,7 @@ export class DatabaseManager {
                             insert.run(row.id, row.embedding);
                         } catch (err) {
                             // On mismatch (e.g. mixed 768 and 3072 dims), nullify to re-embed later
-                            this.db.prepare('UPDATE chunks SET embedding = NULL WHERE id = ?').run(row.id);
+                            this.db!.prepare('UPDATE chunks SET embedding = NULL WHERE id = ?').run(row.id);  // guarded at method entry; narrowing lost in catch
                         }
                     }
                 });
@@ -1759,7 +2337,7 @@ export class DatabaseManager {
                         try {
                             insert.run(row.id, row.embedding);
                         } catch (err) {
-                            this.db.prepare('UPDATE chunk_summaries SET embedding = NULL WHERE id = ?').run(row.id);
+                            this.db!.prepare('UPDATE chunk_summaries SET embedding = NULL WHERE id = ?').run(row.id);  // guarded at method entry; narrowing lost in catch
                         }
                     }
                 });
@@ -1811,6 +2389,47 @@ export class DatabaseManager {
             console.log(`[DatabaseManager] Ensured vec0 tables for dim=${dim}`);
         } catch (e) {
             console.error(`[DatabaseManager] Failed to create vec0 tables for dim=${dim}:`, e);
+        }
+    }
+
+    /**
+     * PHASE-2D (Fix-2): drop any orphan legacy vec0 tables from prior
+     * installs that DID create the broken schema, and bump a counter so
+     * the v3/v4 migration blocks can log a single line IF something was
+     * actually cleaned up. The happy path (fresh install from a clean
+     * git clone) drops nothing and emits no log line.
+     *
+     * Also returns the number of tables dropped via `this._lastLegacyCleanup`
+     * so the migration loop can include it in its log message.
+     */
+    private _lastLegacyCleanup: number = 0;
+    private tryProvisionLegacyVecTables(): void {
+        if (!this.db) return;
+        this._lastLegacyCleanup = 0;
+        // The two legacy tables from the broken v3/v4 schema are
+        // `vec_chunks` and `vec_summaries`. They have no dimension
+        // column so sqlite-vec would reject any CREATE that references
+        // them — but they CAN exist as orphans if a prior install DID
+        // create them before the fix landed.
+        const legacyNames = ['vec_chunks', 'vec_summaries'];
+        for (const name of legacyNames) {
+            try {
+                // probe existence with sqlite_master — DROP IF EXISTS is
+                // a no-op when the table is absent, but we want to
+                // distinguish "dropped" from "didn't exist" so the log
+                // is accurate.
+                const row = this.db.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
+                ).get(name);
+                if (!row) continue;
+                this.db.exec(`DROP TABLE ${name};`);
+                this._lastLegacyCleanup++;
+                console.log(`[DatabaseManager] Dropped orphan legacy vec0 table: ${name}`);
+            } catch (_) {
+                // Best-effort: dropping an orphan should never crash
+                // startup. If DROP fails here, the v8/v9 per-dim
+                // migration below will still create the working tables.
+            }
         }
     }
 

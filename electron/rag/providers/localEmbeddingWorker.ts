@@ -23,6 +23,7 @@
 
 import { parentPort } from 'worker_threads';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
+import { classifyWorkerFailure } from '../../utils/workerStatus';
 
 if (!parentPort) throw new Error('localEmbeddingWorker must be run as a Worker thread');
 
@@ -53,9 +54,20 @@ async function ensureLoaded(msg: any): Promise<void> {
     console.log('[LocalEmbeddingWorker] Loading feature-extraction model (all-MiniLM-L6-v2)...');
     pipe = await pipeline('feature-extraction', MODEL_ID, {
       local_files_only: true,
+      // dtype MUST be explicit on transformers.js v3. v2 defaulted to the
+      // quantized variant; v3 ignores `quantized` and defaults to fp32, so a
+      // bare pipeline() call asks for onnx/model.onnx — while the installer
+      // ships onnx/model_quantized.onnx and NOTHING else (see
+      // LocalFallbackAssets.ts and scripts/verify-packaged-local-assets.mjs).
+      // In a packaged build that is local_files_only, so the load fails and the
+      // feature silently degrades. scripts/download-models.js already documents
+      // this trap for the DOWNLOAD side; these consumers were missed.
+      // localRerankerWorker already passes `dtype: msg.dtype || 'q8'`.
+      dtype: 'q8',
       session_options: getBoundedOnnxSessionOptions(),
     });
     console.log('[LocalEmbeddingWorker] Feature-extraction model loaded successfully.');
+    parentPort!.postMessage({ type: 'status', status: { type: 'ready', backend: 'onnx', modelPath: msg.modelPath } });
   })();
 
   try {
@@ -63,6 +75,17 @@ async function ensureLoaded(msg: any): Promise<void> {
   } catch (e) {
     loadingPromise = null;
     pipe = null;
+    const failure = classifyWorkerFailure(e);
+    parentPort!.postMessage({
+      type: 'status',
+      status: {
+        type: failure.recoverable ? 'degraded' : 'failed',
+        backend: 'none',
+        reason: failure.reason,
+        message: failure.message,
+        recoverable: failure.recoverable,
+      },
+    });
     throw e;
   }
 }

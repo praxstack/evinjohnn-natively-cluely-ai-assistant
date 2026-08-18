@@ -25,9 +25,22 @@ import { app } from 'electron';
 import { IEmbeddingProvider } from './IEmbeddingProvider';
 import { embeddingSpaceKey } from '../embeddingSpace';
 import { acquireOnnxSlot, hasEnoughMemoryForOnnxSession, getMinFreeGBForOnnxSession } from '../../utils/onnxThreadConfig';
+import {
+    clearLoadSentinel as clearOnnxLoadSentinel,
+    consumePoisonedOnnxLoad,
+    isSentinelWithinTtl,
+    writeLoadSentinel as writeOnnxLoadSentinel,
+} from '../../utils/onnxLoadSentinel';
+import { ProviderStatusRegistry } from '../../services/ProviderStatusRegistry';
+import type { LocalWorkerStatus } from '../../utils/workerStatus';
 
 const WORKER_INIT_TIMEOUT_MS = 60_000; // model load (cold disk read + ORT session init)
 const WORKER_EMBED_TIMEOUT_MS = 30_000; // a single embed()/embedBatch() call
+
+/** Process-local poison flag: set by the cold-start consume path to tell the
+ *  ensureLoaded + embed paths to fast-fail this launch. Mirrors
+ *  IntentClassifier's startupPoisoned. */
+let startupPoisoned = false;
 
 export class LocalEmbeddingProvider implements IEmbeddingProvider {
   readonly name = 'local';
@@ -41,6 +54,8 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
   private loadingPromise: Promise<void> | null = null; // prevents concurrent init races
   private loaded = false;
   private slotRelease: (() => void) | null = null;
+  private lastWorkerStatus: LocalWorkerStatus | null = null;
+  private nonRecoverableLoadError: Error | null = null;
   private modelPath: string;
 
   constructor() {
@@ -95,13 +110,25 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
 
   private getWorker(): Worker {
     if (!this.worker) {
+      // Cross-launch disk sentinel: written BEFORE new Worker() so a native
+      // ORT abort that kills the process before the JS `ready` arrives
+      // leaves a recoverable breadcrumb for the next launch's consume.
+      writeOnnxLoadSentinel('embeddings', this.model);
       this.worker = new Worker(this.getWorkerPath());
 
-      this.worker.on('message', (msg: { type: string; requestId: number; vectors?: number[][]; error?: string }) => {
-        const pending = this.pendingRequests.get(msg.requestId);
+      this.worker.on('message', (msg: { type: string; requestId?: number; vectors?: number[][]; error?: string; status?: LocalWorkerStatus }) => {
+        if (msg.type === 'status' && msg.status) {
+          if (msg.status.type === 'ready') {
+            // Worker reached `ready` — clear the poisoned-load sentinel.
+            clearOnnxLoadSentinel('embeddings', this.model);
+          }
+          this.handleWorkerStatus(msg.status);
+          return;
+        }
+        const pending = this.pendingRequests.get(msg.requestId as number);
         if (!pending) return;
         clearTimeout(pending.timer);
-        this.pendingRequests.delete(msg.requestId);
+        this.pendingRequests.delete(msg.requestId as number);  // same cast as the .get() above
 
         if (msg.type === 'error') {
           pending.reject(new Error(msg.error || 'Worker error'));
@@ -114,6 +141,11 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
         console.error('[LocalEmbeddingProvider] Worker error:', err);
         this.loaded = false;
         this.loadingPromise = null;
+        // Worker died mid-load — latch non-recoverable so future embed
+        // calls don't spin up a fresh worker against the same broken asset.
+        if (!this.loaded && !this.nonRecoverableLoadError) {
+          this.latchNonRecoverableLoadError(`Worker error before ready: ${err?.message || err}`);
+        }
         if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
         this.rejectAllPending(err);
       });
@@ -122,12 +154,33 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
         if (code !== 0) {
           console.warn(`[LocalEmbeddingProvider] Worker exited with code ${code}`);
         }
+        // Clear on clean exit; non-zero exit keeps the sentinel so the
+        // next launch knows the previous attempt died hard.
+        if (code === 0) clearOnnxLoadSentinel('embeddings', this.model);
         this.worker = null;
         this.loaded = false;
         this.loadingPromise = null;
         if (this.slotRelease) { this.slotRelease(); this.slotRelease = null; }
         this.rejectAllPending(new Error(`Worker exited with code ${code}`));
+        if (!this.loaded && !this.nonRecoverableLoadError) {
+          this.latchNonRecoverableLoadError(`Worker exited with code ${code} before model loaded`);
+        }
       });
+
+      // Do not let this worker hold the Node event loop open.
+      //
+      // MUST be after the listeners above: attaching a 'message' listener
+      // re-references the underlying MessagePort, so an unref() next to
+      // `new Worker()` is undone by the following line.
+      //
+      // Electron's main process is anchored by `app` and its windows, so this
+      // cannot cause a premature exit. Under `node --test` there is no anchor,
+      // and a referenced worker made every importing test file pass its
+      // assertions and then never exit — blocking the whole suite.
+      // See docs/context-intelligence-v3/01_INVESTIGATION_REPORT.md F21.
+      // Optional call: test doubles substitute a mock Worker that does not
+      // implement unref(). A hard call throws there and disables the model.
+      this.worker.unref?.();
     }
     return this.worker;
   }
@@ -138,6 +191,71 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
       pending.reject(err);
     }
     this.pendingRequests.clear();
+  }
+
+  private handleWorkerStatus(status: LocalWorkerStatus): void {
+    this.lastWorkerStatus = status;
+    if (status.type === 'ready') {
+      ProviderStatusRegistry.getInstance().setStatus({
+        id: 'local-embedding',
+        kind: 'packaged_local',
+        health: 'ready',
+        requiredForStartup: false,
+        requiredForCoreFallback: true,
+        message: 'Local embedding fallback ready',
+        recoverable: true,
+        details: { backend: status.backend, modelPath: status.modelPath },
+      });
+      return;
+    }
+    if (!status.recoverable) {
+      this.nonRecoverableLoadError = new Error(status.message);
+    }
+    ProviderStatusRegistry.getInstance().setStatus({
+      id: 'local-embedding',
+      kind: 'packaged_local',
+      health: status.recoverable ? 'degraded' : 'missing_required_asset',
+      requiredForStartup: false,
+      requiredForCoreFallback: true,
+      // Human-readable status; `details.reason` carries the debug classification.
+      message: status.recoverable
+        ? 'Local embedding fallback running in degraded mode. Some semantic search features may be slower or less accurate.'
+        : 'Natively local embedding fallback assets are missing or corrupted. Please reinstall Natively.',
+      recoverable: status.recoverable,
+      details: { backend: status.backend, reason: status.reason, error: status.message },
+    });
+  }
+
+  getStatus(): LocalWorkerStatus | null {
+    return this.lastWorkerStatus ? { ...this.lastWorkerStatus } : null;
+  }
+
+  /**
+   * Test-only: returns the synthetic non-recoverable load error if the worker
+   * latch has been triggered. Returns null otherwise.
+   */
+  __getNonRecoverableLoadError(): Error | null {
+    return this.nonRecoverableLoadError;
+  }
+
+  /**
+   * Latch a synthetic non-recoverable failure when the worker dies before
+   * the model is fully loaded. Idempotent. Mirrors IntentClassifier's latch
+   * so the retry-on-every-call pathology can't happen against a missing
+   * packaged asset.
+   */
+  private latchNonRecoverableLoadError(message: string): void {
+    this.nonRecoverableLoadError = new Error(message);
+    ProviderStatusRegistry.getInstance().setStatus({
+      id: 'local-embedding',
+      kind: 'packaged_local',
+      health: 'missing_required_asset',
+      requiredForStartup: false,
+      requiredForCoreFallback: true,
+      message: 'Natively local embedding fallback assets are missing or corrupted. Please reinstall Natively.',
+      recoverable: false,
+      details: { reason: 'worker-died-before-ready', error: message },
+    });
   }
 
   private postToWorker<T>(message: any, timeoutMs: number): Promise<T> {
@@ -188,6 +306,12 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
 
   private async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
+    if (startupPoisoned) {
+      throw new Error(
+        '[LocalEmbeddingProvider] skipped: previous launch poisoned the load (see `onnx-load-sentinel-embeddings.json`)',
+      );
+    }
+    if (this.nonRecoverableLoadError) throw this.nonRecoverableLoadError;
 
     // If another caller already kicked off loading, wait for that same promise
     // rather than launching a second concurrent init.
@@ -203,7 +327,7 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
     // behavior); a later, less-pressured moment will retry automatically.
     if (!hasEnoughMemoryForOnnxSession()) {
       throw new Error(
-        `insufficient free memory (<${getMinFreeGBForOnnxSession()}GB) — skipping local embedder load`,
+        `insufficient available memory (<${getMinFreeGBForOnnxSession()}GB) — skipping local embedder load`,
       );
     }
 
@@ -249,4 +373,38 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
     );
     return result.vectors;
   }
+}
+
+/**
+ * Cold-start helper: read the leftover embeddings sentinel from disk and
+ * seed the in-memory poison flag so the next embed() call fast-fails and
+ * `isAvailable()` returns false → retrieval routes to lexical. Returns the
+ * recovered sentinel record so the caller can stash a recovery notice on
+ * AppState. Idempotent.
+ */
+export function consumeLocalEmbeddingSentinel(): { modelId: string; startedAt: number; attempt: number } | null {
+  const consumed = consumePoisonedOnnxLoad('embeddings');
+  if (consumed && isSentinelWithinTtl(consumed)) {
+    startupPoisoned = true;
+    return consumed;
+  }
+  return null;
+}
+
+/**
+ * Public reset: clears the cold-start poison flag, allowing the next
+ * embed() call to attempt a fresh load. Mirrors `clearIntentClassifierPoison`
+ * and the local-whisper-reset-to-default IPC but generalized. Idempotent.
+ */
+export function clearLocalEmbeddingPoison(): void {
+  startupPoisoned = false;
+  clearOnnxLoadSentinel('embeddings');
+}
+
+/**
+ * Diagnostic accessor: is the local embedder currently skipped because the
+ * previous launch poisoned the load?
+ */
+export function isLocalEmbeddingPoisoned(): boolean {
+  return startupPoisoned;
 }

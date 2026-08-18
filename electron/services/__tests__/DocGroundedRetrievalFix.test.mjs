@@ -154,8 +154,12 @@ test('ipcHandlers: false-refusal repair gated on document entity/title overlap (
     'ipcHandlers false-refusal must gate on whole-name-hit OR >=2 distinct title tokens',
   );
   assert.ok(
-    ipcHandlersSrc.includes('const shouldRepair = hasStrongEvidence;'),
-    'shouldRepair must derive from the entity-evidence-based hasStrongEvidence',
+    // Governance-integrity fix (2026-07-13, ffbc193) added `&& !governedRefusal`
+    // so an explicit governed evidence-refusal is trusted instead of being
+    // overridden by this legacy, ungoverned repair — shouldRepair must still
+    // derive from hasStrongEvidence as its base signal.
+    ipcHandlersSrc.includes('const shouldRepair = hasStrongEvidence && !governedRefusal;'),
+    'shouldRepair must derive from the entity-evidence-based hasStrongEvidence (and respect a governed refusal)',
   );
 });
 
@@ -198,10 +202,20 @@ test('ipcHandlers: false-refusal detector catches "could not find" refusal phras
 // 4. LLMHelper — hybrid timeout and budget changes
 // ---------------------------------------------------------------------------
 test('LLMHelper: HYBRID_BUDGET_MS raised to 2000 for doc-grounded paths', () => {
-  // The fix uses a conditional: forceDocumentGrounding ? 2000 : 1000
+  // Phase 2 (2026-08-13): the budget conditional moved from an inline
+  // HYBRID_BUDGET_MS in LLMHelper into the SHARED eligibility module so the
+  // two entry points cannot drift. The invariant this test protects is
+  // unchanged — doc-grounded gets 2000ms, everything else 1000ms — it just
+  // lives in modeHybridEligibility now, and LLMHelper must consume it from
+  // there (behavioral pin: ModeHybridEligibility2026_08_13.test.mjs).
+  const eligibilitySrc = read('electron/llm/modeHybridEligibility.ts');
   assert.ok(
-    llmHelperSrc.includes('forceDocumentGrounding ? 2000 : 1000'),
-    'LLMHelper must use 2000ms hybrid budget for doc-grounded (was 1000ms for all paths)',
+    eligibilitySrc.includes('forceDocumentGrounding ? 2000 : 1000'),
+    'the shared eligibility module must use the 2000ms doc-grounded hybrid budget (was 1000ms for all paths)',
+  );
+  assert.ok(
+    llmHelperSrc.includes('hybridRetrievalBudgetMs(forceDocumentGrounding)'),
+    'LLMHelper must take the budget from the shared module, not re-declare it inline',
   );
 });
 

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useT } from '../../i18n';
 import { ArrowRight, Loader, Check } from 'lucide-react';
 import { motion } from 'framer-motion';
 // Static import keeps Vite from warning about a "mixed" dynamic+static import
@@ -14,7 +15,8 @@ interface ConnectCalendarButtonProps extends React.ButtonHTMLAttributes<HTMLButt
     onConnect?: () => void;
 }
 
-const ConnectCalendarButton: React.FC<ConnectCalendarButtonProps> = ({ className = '', variant = 'default', ...props }) => {
+const ConnectCalendarButton: React.FC<ConnectCalendarButtonProps> = ({ className = '', variant = 'default', onConnect, ...props }) => {
+    const t = useT();
     const [loading, setLoading] = useState(false);
     const [connected, setConnected] = useState(false);
 
@@ -23,10 +25,12 @@ const ConnectCalendarButton: React.FC<ConnectCalendarButtonProps> = ({ className
             window.electronAPI.getCalendarStatus().then(status => {
                 setConnected(status.connected);
                 if (status.connected) {
-                    props.onConnect?.();
+                    onConnect?.();
                 }
             });
         }
+        // Only check the persisted calendar status on mount; callers may pass inline callbacks.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const handleClick = async (e: React.MouseEvent<HTMLButtonElement>) => {
@@ -38,7 +42,7 @@ const ConnectCalendarButton: React.FC<ConnectCalendarButtonProps> = ({ className
             const res = await window.electronAPI.calendarConnect();
             if (res.success) {
                 setConnected(true);
-                props.onConnect?.();
+                onConnect?.();
                 // Track calendar connection (analytics imported statically above)
                 analytics.trackCalendarConnected();
             }
@@ -200,7 +204,7 @@ const ConnectCalendarButton: React.FC<ConnectCalendarButtonProps> = ({ className
                     </svg>
                 )}
 
-                {loading ? 'Connecting...' : 'Connect calendar'}
+                {loading ? t('Connecting...') : t('Connect calendar')}
 
                 {!loading && (
                     <ArrowRight
