@@ -2,6 +2,7 @@
 
 import * as crypto from 'crypto';
 import { app, BrowserWindow, dialog, desktopCapturer, ipcMain, shell, systemPreferences } from 'electron';
+import { micSettingsUri } from '../src/lib/micPermissionPolicy.mjs';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -25,7 +26,7 @@ import { TRIAL_SENTINEL_KEY, DOM_CONTEXT_MAX_CHARS } from './config/constants';
 import { AI_RESPONSE_LANGUAGES, RECOGNITION_LANGUAGES } from './config/languages';
 import { resolveCodingPromptSignals } from './llm/codingPromptSignals';
 import { isBareCodeRequest, looksLikeCodingAnswer, buildPriorCodingContextBlock as buildPriorCodingBlockForV3 } from './llm/codingFollowup';
-import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, isRefinementFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, acceptRepairedAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError, detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode, CODING_VERIFICATION_INSTRUCTION, humanizeDirectiveFor, detectCorporateFiller, humanizeForAnswerType, applySpeakabilityBudget, compressTechnicalConcept, checkCodeCompleteness, varySpokenOpening, type ExplicitCodingContract, type AnswerType } from './llm';
+import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, CODING_REGEN_ABORT_CHARS, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, isRefinementFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, acceptRepairedAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError, detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode, CODING_VERIFICATION_INSTRUCTION, humanizeDirectiveFor, detectCorporateFiller, humanizeForAnswerType, applySpeakabilityBudget, compressTechnicalConcept, checkCodeCompleteness, varySpokenOpening, type ExplicitCodingContract, type AnswerType } from './llm';
 import { stripPriorAssistantTurns } from './llm/conversationHistoryPolicy';
 import { mintTurnId } from './llm/turnIdentity';
 import type { StreamRouteOptions } from './llm/streamContextPolicy';
@@ -168,6 +169,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (modelId === 'natively') return 'natively';
         if (modelId.startsWith('codex-cli')) return 'codex-cli';
         if (modelId.startsWith('litellm/')) return 'litellm';
+        if (modelId.startsWith('nvidia_nim/')) return 'nvidia_nim';
         if (modelId.startsWith('ollama-')) return 'ollama';
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return 'gemini';
         if (isKnownGroqModel(modelId)) return 'groq';
@@ -219,6 +221,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (modelId === 'natively') return has(cm.getNativelyApiKey());
         if (modelId.startsWith('codex-cli')) return codexConfig.enabled === true && codexSignedIn;
         if (modelId.startsWith('litellm/')) return has(cm.getLitellmBaseURL());
+        if (modelId.startsWith('nvidia_nim/')) return has(cm.getNvidiaNimApiKey());
         if (modelId.startsWith('ollama-')) return true; // live Ollama probe happens at execution time
         if (allProviders.some((p: any) => p?.id === modelId)) return true;
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return has(cm.getGeminiApiKey());
@@ -3464,6 +3467,13 @@ export function initializeIpcHandlers(appState: AppState): void {
             {
               answerType: answerPlan.answerType,
               forbiddenContextLayers: answerPlan.forbiddenContextLayers,
+              // F-502: the t0-pinned mode. streamContextPolicy documents this as
+              // the defence against a mid-request `modes:set-active` leaking a
+              // different mode's documents into an answer whose contract is
+              // scoped to the first mode — but only the WTA path ever set it, so
+              // every mode read inside streamChat after an await resolved the
+              // LIVE singleton instead.
+              pinnedModeId: manualActiveMode?.id ?? null,
               // Surface-scoped (Phase 9, 2026-07-14): the referent hint must come
               // from THIS manual-chat conversation's own last answer, never a
               // WTA/phone-mirror turn that happened to write the shared
@@ -3620,11 +3630,14 @@ export function initializeIpcHandlers(appState: AppState): void {
           // fallback line below. Codex CLI shares the cold-load profile
           // (subprocess spawn → codex CLI loads the model → first delta).
           const usingLocalLlm = llmHelper.isUsingOllama() || llmHelper.isUsingCodexCli();
+          // F-301: on the natively-api route the server rotates providers at
+          // 10s; give it room to rescue the turn instead of aborting at 7s.
+          const viaServerCascade = llmHelper.isUsingNativelyServerCascade?.() === true;
           let manualFirstUseful = false;
           let manualSuperseded = false;
           await raceStreamWithDeadline({
             stream: stream as AsyncGenerator<string>,
-            firstUsefulDeadlineMs: firstUsefulDeadlineMs(answerPlan.answerType, usingLocalLlm),
+            firstUsefulDeadlineMs: firstUsefulDeadlineMs(answerPlan.answerType, usingLocalLlm, viaServerCascade),
             isUsefulYet: () => manualFirstUseful,
             shouldAbort: () => {
               if (_chatStreamsBySender.get(senderId)?.streamId !== myStreamId) {
@@ -3641,7 +3654,20 @@ export function initializeIpcHandlers(appState: AppState): void {
               try { myController?.abort(); } catch { /* noop */ }
             },
             onToken: (token: string) => {
-              manualFirstUseful = true;
+              // F-302: "useful" must mean USER-USEFUL CONTENT, not "a token
+              // object arrived". raceStreamWithDeadline forwards every yielded
+              // value unfiltered, so a leading "\n\n" used to flip this flag —
+              // which (a) swapped the 7s first-useful budget for the 8s
+              // inter-token stall guard, and (b) made the blank-answer fallback
+              // below unreachable for a whitespace-only response, committing an
+              // EMPTY bubble. Every other call site in the repo already uses a
+              // content threshold (>=5/8/10 chars); this primary manual-chat
+              // path was the sole outlier.
+              // R-09: concatenate THEN trim once — trimming each side separately
+              // loses the interior whitespace ("a b" + " c" counted 4, not 5).
+              if ((fullResponse + token).trim().length >= 5) {
+                manualFirstUseful = true;
+              }
               // First token back from the provider — the gap from
               // provider_request_started is pre-work + provider TTFT (the real cost).
               chatTrace.markFirstUseful({ via: codingGate ? 'gated' : 'stream' });
@@ -3767,12 +3793,41 @@ export function initializeIpcHandlers(appState: AppState): void {
                   stream: llmHelper.streamChat(regenPrompt, undefined, codingPriorProblemBlock || undefined, undefined, true, true, [], regenAbort.signal) as AsyncGenerator<string>,
                   firstUsefulDeadlineMs: usingLocalLlm ? LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS : 8000,
                   isUsefulYet: () => regen.length >= 10,
-                  shouldAbort: () => regen.length > 4000,
+                  shouldAbort: () => regen.length > CODING_REGEN_ABORT_CHARS,
                   onToken: (tok: string) => { regen += tok; },
                   onCleanup: () => { try { regenAbort.abort(); } catch { /* best effort */ } },
                 });
                 const regenTrim = regen.trim();
-                if (regenTrim.length >= 20 && /```[a-zA-Z0-9_+\-]*\n[\s\S]*?```/.test(regenTrim)) {
+                // F-305: a closed code fence is NOT proof the answer is whole.
+                // shouldAbort cuts this regen at 4000 chars while liveDeadlines
+                // sizes the very artifact it asks for — a six-section coding
+                // answer — at ~8000, so a correct answer whose fence closes
+                // early (## Approach, fenced code, then ## Complexity / ## Edge
+                // cases) is routinely truncated mid-sentence AFTER the fence.
+                // The old test passed on that truncation and then atomically
+                // REPLACED the streamed row with it, so the user's final answer
+                // ended mid-word. The sibling regen ~80 lines below already
+                // guards with checkCodeCompleteness; use the same bar here.
+                //
+                // R-06: that change REPLACED the closed-fence test instead of ADDING
+                // to it, which made the gate strictly WEAKER. extractFencedCodeBlocks
+                // requires a CLOSING fence, so an answer with no fences — or with an
+                // unterminated one — yields zero blocks and checkCodeCompleteness
+                // returns ok:true vacuously. Two regressions followed:
+                //   - another meta-reply (>=20 chars, no code at all) was accepted,
+                //     directly violating the invariant stated at the top of this block
+                //     ("only accept if the regen actually contains a code fence; never
+                //     overwrite with another meta-reply") and emitting a bogus
+                //     retry-succeeded telemetry event;
+                //   - raising CODING_REGEN_ABORT_CHARS to 8000 made the unclosed-fence
+                //     case REACHABLE: when shouldAbort fires mid-code-block the regen
+                //     ends on a dangling fence, and accepting it atomically replaces
+                //     the streamed answer with one whose fence never closes, so
+                //     markdown swallows everything after it.
+                // Both bars are required: the fence must close AND its contents must
+                // be complete.
+                const regenHasClosedFence = /```[a-zA-Z0-9_+\-]*\n[\s\S]*?```/.test(regenTrim);
+                if (regenTrim.length >= 20 && regenHasClosedFence && checkCodeCompleteness(regenTrim).ok) {
                   fullResponse = regenTrim;
                   finalText = regenTrim;
                   // Re-strip <verification_spec>: the regen prompt includes the
@@ -3847,7 +3902,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                   stream: llmHelper.streamChat(regenPrompt, undefined, codingPriorProblemBlock || undefined, undefined, true, true, [], regenAbort.signal) as AsyncGenerator<string>,
                   firstUsefulDeadlineMs: usingLocalLlm ? LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS : 8000,
                   isUsefulYet: () => regen.length >= 10,
-                  shouldAbort: () => regen.length > 4000,
+                  shouldAbort: () => regen.length > CODING_REGEN_ABORT_CHARS,
                   onToken: (tok: string) => { regen += tok; },
                   onCleanup: () => { try { regenAbort.abort(); } catch { /* best effort */ } },
                 });
@@ -4631,7 +4686,37 @@ export function initializeIpcHandlers(appState: AppState): void {
                   // confident/synthesis-tier verdict, OR'd in as an additional
                   // signal. matchedHighSignalEntity is a whole-entity hit that
                   // is also present in the retrieved context.
-                  const hasStrongEvidence = hasRealEvidence || Boolean(matchedHighSignalEntity) || isTier1Or2Evidence;
+                  // F-412: the tier signal is deliberately NOT consulted here.
+                  //
+                  // EvidenceAssembler.computeTier is TOPIC-BLIND — it returns
+                  // tier 2 for ANY synthesis-classified question as soon as the
+                  // pack yields >=1 card, and OkfRetriever's type boost still
+                  // clears the score floor with ZERO query-word overlap (that is
+                  // its purpose: surface the one `result` card for a `result`
+                  // question worded differently). R-04 narrowed this — confidence
+                  // ALONE no longer admits on the document path — but a card can
+                  // still be admitted without any topical overlap, so the tier
+                  // remains topic-blind. As an independent disjunct it therefore
+                  // made the off-topic gate above unable to veto anything: an
+                  // off-topic synthesis question ("What is the key takeaway for
+                  // the Kyoto Protocol?" against a robotics thesis) produced
+                  // hasEntityEvidence=false yet still repaired, discarding an
+                  // honest "not in the document" refusal and re-prompting the
+                  // model with a stronger-synthesis instruction — the exact
+                  // hallucination pressure this gate exists to prevent.
+                  //
+                  // HONESTY NOTE (self-review): the first version of this fix
+                  // wrote `|| (isTier1Or2Evidence && hasEntityEvidence)` and
+                  // described the tier as a "corroborating signal". That was
+                  // false. `hasRealEvidence` IS `hasEntityEvidence` (see its
+                  // assignment above), so that disjunct could only ever be true
+                  // when the first disjunct had already fired — provably dead
+                  // code. The real, and correct, effect is that the tier no
+                  // longer participates at all; the expression now says so.
+                  // isTier1Or2Evidence is still COMPUTED above and reported in
+                  // the diagnostic below, which is where its value belongs.
+                  const hasStrongEvidence =
+                    hasRealEvidence || Boolean(matchedHighSignalEntity);
                   // GOVERNANCE INTEGRITY (2026-07-13): when EvidenceResolver
                   // GOVERNED this turn and its typed pack's policy is an explicit
                   // refusal, that decision is authoritative — it already ran
@@ -4665,6 +4750,9 @@ export function initializeIpcHandlers(appState: AppState): void {
                       tokenHits: [...tokenHits].slice(0, 8),
                       isSystemOwnRefusalPhrase,
                       matchedHighSignalEntity: matchedHighSignalEntity || null,
+                      // F-412: reported for explainability only — the tier is
+                      // topic-blind and deliberately does NOT gate this decision.
+                      isTier1Or2Evidence,
                     });
                     piTelemetry.emit('pi_doc_grounded_false_refusal_repair_attempted', {
                       isSystemOwnRefusalPhrase,
@@ -4681,6 +4769,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                       wholeNameHit,
                       tokenHits: [...tokenHits].slice(0, 8),
                       isSystemOwnRefusalPhrase,
+                      isTier1Or2Evidence,
                     });
                   }
                 }
@@ -5711,6 +5800,15 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  safeHandle('get-auto-answer-enabled', async () => {
+    return appState.getAutoAnswerEnabled();
+  });
+
+  safeHandle('set-auto-answer-enabled', async (_, enabled: boolean) => {
+    appState.setAutoAnswerEnabled(enabled);
+    return { success: true };
+  });
+
   safeHandle('get-code-verification', async () => {
     // Default OFF: code verification is currently disabled. Only true when the
     // user has explicitly opted in via Settings → General or env override.
@@ -5722,7 +5820,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_type' };
     }
-    SettingsManager.getInstance().set('codeVerificationEnabled', enabled);
+    if (!SettingsManager.getInstance().set('codeVerificationEnabled', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     try {
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
@@ -5741,7 +5844,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (!['forever', '7d', '30d', 'never'].includes(retention)) {
       return { success: false, error: 'invalid_retention' };
     }
-    SettingsManager.getInstance().set('meetingRetention', retention);
+    if (!SettingsManager.getInstance().set('meetingRetention', retention)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('meeting-retention-changed', retention);
@@ -5767,7 +5875,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     // model-generated code to the cloud runner.
     const settings = SettingsManager.getInstance();
     const merged = mergeProviderDataScopes(settings.get('providerDataScopes'), scopes);
-    settings.set('providerDataScopes', merged as any);
+    if (!settings.set('providerDataScopes', merged as any)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         // Broadcast the MERGED object, not the incoming payload: the renderer
@@ -5789,7 +5902,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!['vision_first', 'vision_only', 'private_vision'].includes(mode)) {
         return { success: false, error: 'invalid_mode' };
       }
-      SettingsManager.getInstance().setScreenUnderstandingMode(mode);
+      // CR-04: report the REAL outcome. A refused write used to return success
+      // AND broadcast the change, so every renderer switched mode while disk
+      // still held the old value and the app reverted on restart.
+      if (!SettingsManager.getInstance().setScreenUnderstandingMode(mode)) {
+        return { success: false, error: 'settings_store_degraded' };
+      }
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
           win.webContents.send('screen-understanding-mode-changed', mode);
@@ -5807,7 +5925,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_value' };
     }
-    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    if (!SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('technical-interview-vision-first-changed', enabled);
@@ -5889,16 +6012,24 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('hindsight-config:set', async (_, cfg: { baseUrl?: string; apiKey?: string; autoStart?: boolean; serverCommand?: string; llmProvider?: string }) => {
     try {
       const sm = SettingsManager.getInstance();
-      if (typeof cfg?.baseUrl === 'string') sm.set('hindsightBaseUrl', cfg.baseUrl.trim());
+      // R-24: this handler writes up to six keys. A refused write must not be
+      // reported as success, and must not go on to start() a server against
+      // config that was never persisted. Collect the outcomes and fail as one.
+      let persisted = true;
+      const put = (key: any, value: any): void => { if (!sm.set(key, value)) persisted = false; };
+      if (typeof cfg?.baseUrl === 'string') put('hindsightBaseUrl', cfg.baseUrl.trim());
       // Blank apiKey on resave = KEEP the stored one (don't wipe a saved key with an empty
       // field — the documented blank-key-on-resave gotcha). Only write a non-empty value.
-      if (typeof cfg?.apiKey === 'string' && cfg.apiKey.trim()) sm.set('hindsightApiKey', cfg.apiKey.trim());
-      if (typeof cfg?.autoStart === 'boolean') sm.set('hindsightAutoStart', cfg.autoStart);
-      if (typeof cfg?.serverCommand === 'string') sm.set('hindsightServerCommand', cfg.serverCommand.trim());
-      if (typeof cfg?.llmProvider === 'string') sm.set('hindsightLlmProvider', cfg.llmProvider.trim());
+      if (typeof cfg?.apiKey === 'string' && cfg.apiKey.trim()) put('hindsightApiKey', cfg.apiKey.trim());
+      if (typeof cfg?.autoStart === 'boolean') put('hindsightAutoStart', cfg.autoStart);
+      if (typeof cfg?.serverCommand === 'string') put('hindsightServerCommand', cfg.serverCommand.trim());
+      if (typeof cfg?.llmProvider === 'string') put('hindsightLlmProvider', cfg.llmProvider.trim());
       // Saving ANY config reverses the explicit-opt-out sentinel. The user is engaging
       // with Hindsight again — the override should not silently re-apply.
-      if (sm.get('hindsightExplicitlyDisabled') === true) sm.set('hindsightExplicitlyDisabled', false);
+      if (sm.get('hindsightExplicitlyDisabled') === true) put('hindsightExplicitlyDisabled', false);
+      if (!persisted) {
+        return { success: false, error: 'settings_store_degraded' };
+      }
       // Re-run start() so the auto-spawn fires IN-SESSION — previously the user had to restart
       // the app for the boot-time start() to see the new config. start() is idempotent and a
       // no-op when nothing changed (e.g. user just saved the same baseUrl).
@@ -5980,7 +6111,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('hindsight:disable', async () => {
     try {
       const sm = SettingsManager.getInstance();
-      sm.set('hindsightExplicitlyDisabled', true);
+      if (!sm.set('hindsightExplicitlyDisabled', true)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       const { HindsightManager } = require('./services/HindsightManager') as typeof import('./services/HindsightManager');
       // If we spawned an app-managed server, kill it. Cloud / user-managed servers stay up.
       try { HindsightManager.getInstance().stopSync(); } catch { /* nothing to stop */ }
@@ -6008,7 +6144,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_value' };
     }
-    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    if (!SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('technical-interview-vision-first-changed', enabled);
@@ -6086,7 +6227,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (level !== 'off' && level !== 'standard' && level !== 'verbose') {
         return { ok: false, error: 'invalid_level' };
       }
-      SettingsManager.getInstance().setContextDebugLevel(level);
+      // CR-04: a refused write used to be reported as success.
+      if (!SettingsManager.getInstance().setContextDebugLevel(level)) {
+        return { ok: false, error: 'settings_store_degraded' };
+      }
       // Effective config is re-read per turn, so this applies to the next
       // question without a restart. Env override (if set) still wins.
       return { ok: true };
@@ -6661,6 +6805,25 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle('set-nvidia-nim-api-key', async (_, apiKey: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      const normalizedKey = (apiKey || '').trim();
+      const keyChanged = cm.getNvidiaNimApiKey() !== normalizedKey;
+      cm.setNvidiaNimApiKey(normalizedKey);
+      appState.processingHelper.getLLMHelper().setNvidiaNimApiKey(normalizedKey);
+      await appState.reconfigureSttProvider();
+      appState.getIntelligenceManager().resetEngine();
+      appState.getIntelligenceManager().initializeLLMs();
+      if (keyChanged) {
+        await refreshRuntimeDefaultIfUnavailable();
+        broadcastCredentialsChanged();
+      }
+      return { success: true };
+    } catch (error: any) { return { success: false, error: error.message }; }
+  });
+
   safeHandle('set-litellm-config', async (_, config: { apiKey: string; baseURL: string; maxTokens?: number }) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -7032,13 +7195,29 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
 
-      // Get hardware ID for HWID-binding
-      let hwid = 'unavailable';
+      // Get hardware ID for HWID-binding.
+      //
+      // F-601: this MUST be a real per-machine identity. LicenseManager
+      // returns the literal string 'unavailable' when the native module
+      // failed to load (its own JSDoc scopes that value to "display to the
+      // user for support purposes"), and the trial row is keyed
+      // `hwid text NOT NULL UNIQUE` server-side. Sending the sentinel makes
+      // every machine with a broken native module collide on ONE
+      // free_trials row: the server's idempotent re-issue branch hands back
+      // a valid signed trial token for a STRANGER's trial, exposing their
+      // usage counters and billing every request against their quota.
+      // Fail closed instead — a trial that cannot be bound to this machine
+      // must not be started.
+      let hwid = '';
       try {
         const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-        hwid = LicenseManager.getInstance().getHardwareId() || 'unavailable';
+        hwid = LicenseManager.getInstance().getHardwareId() || '';
       } catch {
-        /* LicenseManager not available — fall back */
+        /* LicenseManager not available — handled by the guard below */
+      }
+      if (!hwid || hwid === 'unavailable') {
+        console.error('[Trial] Refusing to start a trial without a real hardware id (native module unavailable).');
+        return { ok: false, error: 'hardware_id_unavailable' };
       }
 
       const res = await fetch('https://api.natively.software/v1/trial/start', {
@@ -7621,6 +7800,38 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // Get stored API keys (masked for UI display)
+  // R-10 resolution flow (§19.1): let the settings UI surface the ambiguous
+  // two-store state and apply the user's choice. Summary carries key NAMES and
+  // last-4 only — never values.
+  safeHandle('credentials:get-ambiguous-stores', async () => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      return CredentialsManager.getInstance().getAmbiguousStoreSummary();
+    } catch (e) {
+      console.error('[IPC] credentials:get-ambiguous-stores error:', e);
+      return null;
+    }
+  });
+
+  safeHandle('credentials:resolve-ambiguous-stores', async (_event, choice: 'keyring' | 'fallback' | 'merge') => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const result = CredentialsManager.getInstance().resolveAmbiguousStores(choice);
+      if (result.ok) {
+        // The active credential set just changed wholesale — tell every window
+        // the same way an ordinary key edit does.
+        const { BrowserWindow } = require('electron');
+        for (const win of BrowserWindow.getAllWindows()) {
+          try { win.webContents.send('credentials-changed'); } catch { /* window closing */ }
+        }
+      }
+      return result;
+    } catch (e) {
+      console.error('[IPC] credentials:resolve-ambiguous-stores error:', e);
+      return { ok: false, error: 'internal_error' };
+    }
+  });
+
   safeHandle('get-stored-credentials', async () => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -7635,6 +7846,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: hasKey(creds.openaiApiKey),
         hasClaudeKey: hasKey(creds.claudeApiKey),
         hasDeepseekKey: hasKey(creds.deepseekApiKey),
+        hasNvidiaNimKey: hasKey(creds.nvidiaNimApiKey),
         hasLitellmBaseURL: hasKey(creds.litellmBaseURL),
         // The base URL is config, not a secret — returned in full so Settings can
         // prefill it (unlike API keys, which are only reported as booleans).
@@ -7643,6 +7855,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasNativelyKey: hasKey(creds.nativelyApiKey),
         googleServiceAccountPath: creds.googleServiceAccountPath || null,
         sttProvider: creds.sttProvider || 'none',
+        nvidiaNimSttModel: creds.nvidiaNimSttModel || 'nemotron-asr-streaming',
         groqSttModel: creds.groqSttModel || 'whisper-large-v3-turbo',
         hasSttGroqKey: hasKey(creds.groqSttApiKey),
         hasSttOpenaiKey: hasKey(creds.openAiSttApiKey),
@@ -7671,6 +7884,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         openaiPreferredModel: creds.openaiPreferredModel || undefined,
         claudePreferredModel: creds.claudePreferredModel || undefined,
         deepseekPreferredModel: creds.deepseekPreferredModel || undefined,
+        nvidia_nimPreferredModel: creds.nvidia_nimPreferredModel || undefined,
         // Stored prefixed (`litellm/<model>`) — see StoredCredentials.litellmPreferredModel.
         litellmPreferredModel: creds.litellmPreferredModel || undefined,
         disabledProviders: creds.disabledProviders || [],
@@ -7684,6 +7898,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: false,
         hasClaudeKey: false,
         hasDeepseekKey: false,
+        hasNvidiaNimKey: false,
         hasLitellmBaseURL: false,
         litellmBaseURL: null,
         litellmMaxTokens: null,
@@ -7718,7 +7933,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'fetch-provider-models',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey: string) => {
       try {
         // Fall back to stored key if no key was explicitly provided
         let key = apiKey?.trim();
@@ -7730,6 +7945,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           else if (provider === 'openai') key = cm.getOpenaiApiKey();
           else if (provider === 'claude') key = cm.getClaudeApiKey();
           else if (provider === 'deepseek') key = cm.getDeepseekApiKey();
+          else if (provider === 'nvidia_nim') key = cm.getNvidiaNimApiKey();
         }
 
         if (!key) {
@@ -7767,7 +7983,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'set-provider-preferred-model',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'litellm', modelId: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'litellm', modelId: string) => {
       try {
         const { CredentialsManager } = require('./services/CredentialsManager');
         CredentialsManager.getInstance().setPreferredModel(provider, modelId);
@@ -7795,6 +8011,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         | 'azure'
         | 'ibmwatson'
         | 'soniox'
+        | 'nvidia_nim'
         | 'natively'
         | 'local-whisper',
     ) => {
@@ -7834,6 +8051,24 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       return 'none';
     }
+  });
+
+  safeHandle('set-nvidia-nim-stt-model', async (_, model: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      // Single source of truth — see NVIDIA_NIM_STT_MODELS. A second hardcoded
+      // list here would silently reject models the picker already offers.
+      const { isNvidiaNimSttModel } = require('./audio/nvidiaNimSttModels');
+      if (!isNvidiaNimSttModel(model)) {
+        return { success: false, error: 'Unsupported NVIDIA NIM speech model' };
+      }
+      const cm = CredentialsManager.getInstance();
+      const persisted = cm.setNvidiaNimSttModel(model);
+      if (!persisted) return { success: false, error: 'Could not save NVIDIA NIM speech model' };
+      await appState.reconfigureSttProvider();
+      broadcastCredentialsChanged();
+      return { success: true };
+    } catch (error: any) { return { success: false, error: error.message }; }
   });
 
   // Shared guard for STT key saves. Keys persist via the OS keyring or, when that is
@@ -8067,7 +8302,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     'test-stt-connection',
     async (
       _,
-      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox',
+      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
       apiKey: string,
       region?: string,
     ) => {
@@ -8091,7 +8326,16 @@ export function initializeIpcHandlers(appState: AppState): void {
           return { success: false, error: 'Invalid region' };
         }
 
-        if (provider === 'deepgram') {
+        if (provider === 'nvidia_nim') {
+          // Extracted so the settle-on-any-terminal-event logic is unit-testable
+          // (scripts/dev/riva-probe-check.cjs) instead of buried in this handler.
+          const { probeNvidiaNimStt } = require('./audio/nvidiaNimSttProbe');
+          const { CredentialsManager: CM } = require('./services/CredentialsManager');
+          // Probe the model the user actually selected — the models sit behind
+          // different NVCF function-ids, so testing a fixed one can pass while
+          // the selected model is unreachable.
+          return await probeNvidiaNimStt(apiKey, CM.getInstance().getNvidiaNimSttModel());
+        } else if (provider === 'deepgram') {
           const WebSocket = require('ws');
           const token = apiKey.trim();
           return await new Promise<{ success: boolean; error?: string }>((resolve) => {
@@ -8396,7 +8640,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!MODEL_CATALOG_IDS.has(modelId)) {
         return { success: false, error: `Unknown local Whisper model: ${modelId}` };
       }
-      SettingsManager.getInstance().set('localWhisperModel', modelId);
+      if (!SettingsManager.getInstance().set('localWhisperModel', modelId)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       return { success: true };
     } catch (e: any) {
       return { success: false, error: e.message };
@@ -8417,7 +8666,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       const badGlobal = sm.get('localWhisperModel');
       const badMic = sm.get('localWhisperModelMic');
       const badSystem = sm.get('localWhisperModelSystem');
-      sm.set('localWhisperModel', DEFAULT_MODEL);
+      if (!sm.set('localWhisperModel', DEFAULT_MODEL)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       if (badMic) sm.set('localWhisperModelMic', DEFAULT_MODEL);
       if (badSystem) sm.set('localWhisperModelSystem', DEFAULT_MODEL);
       // Drop the recent-failure cooldown for every id we just replaced.
@@ -8465,7 +8719,12 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (typeof cfg?.enabled === 'boolean') sm.set('localWhisperPerChannelEnabled', cfg.enabled);
         if (typeof cfg?.micModelId === 'string') sm.set('localWhisperModelMic', cfg.micModelId);
         if (typeof cfg?.systemModelId === 'string')
-          sm.set('localWhisperModelSystem', cfg.systemModelId);
+          if (!sm.set('localWhisperModelSystem', cfg.systemModelId)) {
+            // R-24: the write was refused (degraded settings store). Returning
+            // success — and broadcasting below — put every window on a value disk
+            // never received, which silently reverted on the next launch.
+            return { success: false, error: 'settings_store_degraded' };
+          }
         return { success: true };
       } catch (e: any) {
         return { success: false, error: e.message };
@@ -8576,7 +8835,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'test-llm-connection',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey?: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey?: string) => {
       console.log(`[IPC] Received test-llm-connection request for provider: ${provider}`);
       try {
         if (!apiKey || !apiKey.trim()) {
@@ -8587,6 +8846,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           else if (provider === 'openai') apiKey = creds.getOpenaiApiKey();
           else if (provider === 'claude') apiKey = creds.getClaudeApiKey();
           else if (provider === 'deepseek') apiKey = creds.getDeepseekApiKey();
+          else if (provider === 'nvidia_nim') apiKey = creds.getNvidiaNimApiKey();
         }
 
         if (!apiKey || !apiKey.trim()) {
@@ -8666,6 +8926,11 @@ export function initializeIpcHandlers(appState: AppState): void {
             },
           );
         }
+        else if (provider === 'nvidia_nim') {
+          response = await axios.post('https://integrate.api.nvidia.com/v1/chat/completions', {
+            model: 'meta/llama-3.1-8b-instruct', messages: [{ role: 'user', content: 'Hello' }], max_tokens: 10,
+          }, { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 15000 });
+        }
 
         if (response && (response.status === 200 || response.status === 201)) {
           return { success: true };
@@ -8714,7 +8979,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       llmHelper.setGroqFastTextMode(enabled);
 
       const { SettingsManager } = require('./services/SettingsManager');
-      SettingsManager.getInstance().set('groqFastTextMode', enabled);
+      if (!SettingsManager.getInstance().set('groqFastTextMode', enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
 
       // Broadcast to all windows
       BrowserWindow.getAllWindows().forEach((win) => {
@@ -8740,7 +9010,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const normalized = CodexCliService.normalizeConfig(config || {});
       const sm = SettingsManager.getInstance();
-      sm.set('codexCliEnabled', normalized.enabled);
+      if (!sm.set('codexCliEnabled', normalized.enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       sm.set('codexCliPath', normalized.path);
       sm.set('codexCliModel', normalized.model);
       sm.set('codexCliFastModel', normalized.fastModel);
@@ -9956,7 +10231,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-action-button-mode', (_, mode: 'recap' | 'brainstorm') => {
     const { SettingsManager } = require('./services/SettingsManager');
     const sm = SettingsManager.getInstance();
-    sm.set('actionButtonMode', mode);
+    if (!sm.set('actionButtonMode', mode)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
 
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
@@ -10805,7 +11085,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       orchestrator.setKnowledgeMode(enabled);
 
       const { SettingsManager } = require('./services/SettingsManager');
-      SettingsManager.getInstance().set('knowledgeMode', enabled);
+      if (!SettingsManager.getInstance().set('knowledgeMode', enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
 
       return { success: true };
     } catch (error: any) {
@@ -11638,16 +11923,59 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       return { microphone: mic, screen, platform: 'darwin' };
     }
-    // Windows/Linux: no TCC — permissions handled by OS at install/first-use time
+    // F-706: Windows 10/11 DOES expose a queryable microphone privacy state —
+    // Electron's own typings document getMediaAccessStatus('microphone') as
+    // @platform win32,darwin, and note the global setting that controls it.
+    // Reporting a hardcoded 'granted' meant that with the per-app or global
+    // microphone toggle off, onboarding never prompted, the launcher's
+    // permission check stayed green, and capture silently yielded nothing with
+    // no diagnosable cause. Screen capture has no equivalent Windows gate, so
+    // 'granted' remains correct there.
+    if (process.platform === 'win32') {
+      let microphone: string = 'granted';
+      try {
+        // Any non-'granted' value (denied / restricted / not-determined) must
+        // surface; fall back to 'granted' only if the API itself is unavailable,
+        // so a query failure can never LOCK a working machine out of capture.
+        microphone = systemPreferences.getMediaAccessStatus('microphone') || 'granted';
+      } catch {
+        microphone = 'granted';
+      }
+      return { microphone, screen: 'granted', platform: 'win32' };
+    }
+    // Linux: no queryable per-app permission model here.
     return { microphone: 'granted', screen: 'granted', platform: process.platform };
   });
 
   safeHandle('permissions:request-mic', async () => {
-    if (process.platform !== 'darwin') return true;
+    // CR-03: askForMediaAccess is documented @platform darwin and is a no-op
+    // elsewhere. Returning a bare `true` off darwin told the renderer the grant
+    // SUCCEEDED, so the Windows onboarding re-read an unchanged 'denied' and
+    // presented a control that could never turn green. Report honestly: false
+    // means "this platform cannot grant programmatically" — the caller's remedy
+    // is permissions:open-mic-settings.
+    if (process.platform !== 'darwin') return false;
     try {
       return await systemPreferences.askForMediaAccess('microphone');
     } catch {
       return false;
+    }
+  });
+
+  // CR-03: on win32 there is NO per-app grant API — the privacy panel is the
+  // only remedy, and before this the renderer had no way to reach it (its
+  // settings link early-returned for non-darwin). The platform decision lives in
+  // src/lib/micPermissionPolicy so main and renderer cannot disagree about which
+  // platforms have a reachable panel.
+  safeHandle('permissions:open-mic-settings', async () => {
+    const uri = micSettingsUri(process.platform);
+    if (!uri) return { ok: false, reason: 'no-settings-panel' };
+    try {
+      await shell.openExternal(uri);
+      return { ok: true };
+    } catch (e: any) {
+      console.warn('[IPC] permissions:open-mic-settings failed:', e?.message || e);
+      return { ok: false, reason: 'open-failed' };
     }
   });
 
@@ -12877,9 +13205,19 @@ export function initializeIpcHandlers(appState: AppState): void {
       // strip prior-assistant turns from the snapshot (topic-collapse), and block
       // an invalid answer from being saved (contamination loop).
       let phoneDocGrounded = false;
+      // F-502: pin the mode id at t0 as well. phoneDocGrounded is captured here,
+      // BEFORE the awaits, but every mode read inside streamChat resolved the
+      // LIVE ModesManager singleton — so a `modes:set-active` landing mid-request
+      // made retrieval read a DIFFERENT mode's documents than the contract this
+      // turn was planned against. The phone surface is the worse half: unlike
+      // desktop it never registers in _chatStreamsBySender, so modes:set-active
+      // does not abort it either.
+      let phonePinnedModeId: string | null = null;
       try {
         const { ModesManager } = require('./services/ModesManager');
-        phoneDocGrounded = ModesManager.getInstance().getActiveModeInfo()?.documentGroundedCustomModeActive === true;
+        const phoneModeInfo = ModesManager.getInstance().getActiveModeInfo();
+        phoneDocGrounded = phoneModeInfo?.documentGroundedCustomModeActive === true;
+        phonePinnedModeId = phoneModeInfo?.id ?? null;
       } catch { /* mode unavailable — treat as non-doc-grounded */ }
 
       // Doc-grounded strict-isolation (audit #3, 2026-07-05): mirror the
@@ -12947,6 +13285,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             phoneRouteOptions = {
               answerType: phonePlan?.answerType || 'unknown_answer',
               forbiddenContextLayers: phonePlan?.forbiddenContextLayers,
+              // F-502: t0-pinned mode — see phonePinnedModeId above.
+              pinnedModeId: phonePinnedModeId,
             };
           }
         } catch { /* plan unavailable — fall back to no routeOptions (legacy behavior) */ }
@@ -13028,8 +13368,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             const clarify = buildSourceSwitchClarification(_pOwn.owner, _pExplicitSwitch);
             try { phoneMirror.publishToken(String(myStreamId), clarify); } catch (_) {}
             try { phoneMirror.publishDone(String(myStreamId), clarify); } catch (_) {}
-            win?.webContents.send('gemini-stream-token', clarify, { streamId: myStreamId });
-            win?.webContents.send('gemini-stream-done', { streamId: myStreamId });
+            win?.webContents.send('gemini-stream-token', clarify, { streamId: myStreamId, source: 'phone' });
+            win?.webContents.send('gemini-stream-done', { streamId: myStreamId, source: 'phone' });
             intelligenceManager.addAssistantMessage(clarify, undefined, 'phone_mirror');
             intelligenceManager.logUsage('chat', message, clarify);
             if (isIntelligenceFlagEnabled('trace')) {
@@ -13047,9 +13387,22 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Deadline-guarded (Issue 1) — this is a live streaming surface too: a hung
         // provider must never block it forever. Uses the standard chat first-useful
         // budget; an inter-token stall guard protects long answers.
+        //
+        // CR-05: this passed NEITHER route flag, so it always took the 7s cloud
+        // cap. Both defaults are wrong here for the same reasons the manual-chat
+        // site documents, and the rationale is surface-agnostic:
+        //   • viaServerCascade — the natively-api server cuts over to the next
+        //     provider at AI_TTFT_BUDGET_MS (10s). Aborting at 7s tore the HTTP
+        //     request down 3s BEFORE the rescue, producing exactly the "did not
+        //     produce an answer in time" outcome F-301 exists to eliminate.
+        //   • isLocal — a local model cold-loads its weights (8-12s for a 7-9B)
+        //     before the first token, so 7s aborted every cold local generation
+        //     on the phone path to zero tokens.
+        const phoneUsingLocalLlm = llmHelper.isUsingOllama() || llmHelper.isUsingCodexCli();
+        const phoneViaServerCascade = llmHelper.isUsingNativelyServerCascade?.() === true;
         await raceStreamWithDeadline({
           stream: stream as AsyncGenerator<string>,
-          firstUsefulDeadlineMs: firstUsefulDeadlineMs('general_meeting_answer'),
+          firstUsefulDeadlineMs: firstUsefulDeadlineMs('general_meeting_answer', phoneUsingLocalLlm, phoneViaServerCascade),
           isUsefulYet: () => full.trim().length >= 5,
           shouldAbort: () => {
             if (_phoneChatLatestId !== myPhoneId) {
@@ -13064,7 +13417,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             try { phoneMirror.publishToken(String(myStreamId), token); } catch (_) {}
             // streamId lets the desktop renderer drop tokens from a superseded
             // chat stream (audit finding #3); backward-compatible optional arg.
-            win?.webContents.send('gemini-stream-token', token, { streamId: myStreamId });
+            win?.webContents.send('gemini-stream-token', token, { streamId: myStreamId, source: 'phone' });
             full += token;
           },
           onCleanup: () => { try { phoneController.abort(); } catch { /* noop */ } },
@@ -13074,7 +13427,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           try {
             phoneMirror.publishDone(String(myStreamId), full);
           } catch (_) {}
-          win?.webContents.send('gemini-stream-done', { streamId: myStreamId });
+          win?.webContents.send('gemini-stream-done', { streamId: myStreamId, source: 'phone' });
           // Document-grounded: block a greeting/empty answer from SessionTracker
           // so it can't contaminate the next turn (same backstop as the desktop
           // path, minus the regenerate — the phone surface keeps it simple).

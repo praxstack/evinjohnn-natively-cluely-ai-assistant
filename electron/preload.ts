@@ -115,6 +115,7 @@ interface ElectronAPI {
   setOpenaiApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setClaudeApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setDeepseekApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
+  setNvidiaNimApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setLitellmConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number }) => Promise<{ success: boolean; error?: string }>;
   getAvailableLiteLLMModels: () => Promise<string[]>;
   refreshLiteLLMModels: () => Promise<string[]>;
@@ -192,6 +193,7 @@ interface ElectronAPI {
     hasOpenaiKey: boolean;
     hasClaudeKey: boolean;
     hasDeepseekKey: boolean;
+    hasNvidiaNimKey?: boolean;
     disabledProviders?: string[];
     cloudEnabledModels?: Record<string, string[]>;
     hasNativelyKey: boolean;
@@ -261,6 +263,7 @@ interface ElectronAPI {
       | 'azure'
       | 'ibmwatson'
       | 'soniox'
+      | 'nvidia_nim'
       | 'natively'
       | 'local-whisper',
   ) => Promise<{ success: boolean; error?: string }>;
@@ -327,9 +330,10 @@ interface ElectronAPI {
   setIbmWatsonApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
   setGroqSttModel: (model: string) => Promise<{ success: boolean; error?: string }>;
   setSonioxApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
+  setNvidiaNimSttModel: (model: string) => Promise<{ success: boolean; error?: string }>;
   setIbmWatsonRegion: (region: string) => Promise<{ success: boolean; error?: string }>;
   testSttConnection: (
-    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox',
+    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
     apiKey: string,
     region?: string,
   ) => Promise<{ success: boolean; error?: string }>;
@@ -728,13 +732,13 @@ interface ElectronAPI {
   }>;
   ragRetryEmbeddings: () => Promise<{ success: boolean }>;
   onRAGStreamChunk: (
-    callback: (data: { meetingId?: string; global?: boolean; chunk: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; chunk: string }) => void,
   ) => () => void;
   onRAGStreamComplete: (
-    callback: (data: { meetingId?: string; global?: boolean }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean }) => void,
   ) => () => void;
   onRAGStreamError: (
-    callback: (data: { meetingId?: string; global?: boolean; error: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; error: string }) => void,
   ) => () => void;
 
   // Keybind Management
@@ -907,6 +911,8 @@ interface ElectronAPI {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => Promise<boolean>;
   setAmbientChatEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
+  getAutoAnswerEnabled: () => Promise<boolean>;
+  setAutoAnswerEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
   getCodeVerification: () => Promise<boolean>;
   setCodeVerification: (enabled: boolean) => Promise<{ success: boolean }>;
   getMeetingRetention: () => Promise<'forever' | '7d' | '30d' | 'never'>;
@@ -1457,7 +1463,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('switch-to-ollama', model, url),
   switchToGemini: (apiKey?: string, modelId?: string) =>
     ipcRenderer.invoke('switch-to-gemini', apiKey, modelId),
-  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey: string) =>
+  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey: string) =>
     ipcRenderer.invoke('test-llm-connection', provider, apiKey),
   selectServiceAccount: () => ipcRenderer.invoke('select-service-account'),
 
@@ -1467,6 +1473,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setOpenaiApiKey: (apiKey: string) => ipcRenderer.invoke('set-openai-api-key', apiKey),
   setClaudeApiKey: (apiKey: string) => ipcRenderer.invoke('set-claude-api-key', apiKey),
   setDeepseekApiKey: (apiKey: string) => ipcRenderer.invoke('set-deepseek-api-key', apiKey),
+  setNvidiaNimApiKey: (apiKey: string) => ipcRenderer.invoke('set-nvidia-nim-api-key', apiKey),
   setLitellmConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number }) => ipcRenderer.invoke('set-litellm-config', config),
   getAvailableLiteLLMModels: () => ipcRenderer.invoke('get-available-litellm-models'),
   refreshLiteLLMModels: () => ipcRenderer.invoke('refresh-litellm-models'),
@@ -1495,10 +1502,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getNativelyPricing: () => ipcRenderer.invoke('get-natively-pricing'),
   getNativelyUsage: (force?: boolean) => ipcRenderer.invoke('get-natively-usage', force ? { force: true } : undefined),
   getStoredCredentials: () => ipcRenderer.invoke('get-stored-credentials'),
+  // R-10 resolution flow: ambiguous credential stores (names + last-4 only).
+  getAmbiguousCredentialStores: () => ipcRenderer.invoke('credentials:get-ambiguous-stores'),
+  resolveAmbiguousCredentialStores: (choice: 'keyring' | 'fallback' | 'merge') =>
+    ipcRenderer.invoke('credentials:resolve-ambiguous-stores', choice),
 
   // Permissions
   checkPermissions: () => ipcRenderer.invoke('permissions:check'),
   requestMicPermission: () => ipcRenderer.invoke('permissions:request-mic'),
+  openMicSettings: () => ipcRenderer.invoke('permissions:open-mic-settings'),
 
   // Free Trial
   startTrial: () => ipcRenderer.invoke('trial:start'),
@@ -1525,6 +1537,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       | 'azure'
       | 'ibmwatson'
       | 'soniox'
+      | 'nvidia_nim'
       | 'natively'
       | 'local-whisper',
   ) => ipcRenderer.invoke('set-stt-provider', provider),
@@ -1539,9 +1552,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setIbmWatsonApiKey: (apiKey: string) => ipcRenderer.invoke('set-ibmwatson-api-key', apiKey),
   setGroqSttModel: (model: string) => ipcRenderer.invoke('set-groq-stt-model', model),
   setSonioxApiKey: (apiKey: string) => ipcRenderer.invoke('set-soniox-api-key', apiKey),
+  setNvidiaNimSttModel: (model: string) => ipcRenderer.invoke('set-nvidia-nim-stt-model', model),
   setIbmWatsonRegion: (region: string) => ipcRenderer.invoke('set-ibmwatson-region', region),
   testSttConnection: (
-    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox',
+    provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
     apiKey: string,
     region?: string,
   ) => ipcRenderer.invoke('test-stt-connection', provider, apiKey, region),
@@ -2383,7 +2397,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   reindexIncompatibleMeetings: () => ipcRenderer.invoke('rag:reindex-incompatible-meetings'),
 
   onRAGStreamChunk: (
-    callback: (data: { meetingId?: string; global?: boolean; chunk: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; chunk: string }) => void,
   ) => {
     const subscription = (_: any, data: any) => callback(data);
     ipcRenderer.on('rag:stream-chunk', subscription);
@@ -2399,7 +2413,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     };
   },
   onRAGStreamError: (
-    callback: (data: { meetingId?: string; global?: boolean; error: string }) => void,
+    callback: (data: { meetingId?: string; global?: boolean; live?: boolean; error: string }) => void,
   ) => {
     const subscription = (_: any, data: any) => callback(data);
     ipcRenderer.on('rag:stream-error', subscription);
@@ -2539,9 +2553,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setTavilyApiKey: (apiKey: string) => ipcRenderer.invoke('set-tavily-api-key', apiKey),
 
   // Dynamic Model Discovery
-  fetchProviderModels: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey: string) =>
+  fetchProviderModels: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey: string) =>
     ipcRenderer.invoke('fetch-provider-models', provider, apiKey),
-  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'litellm', modelId: string) =>
+  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'litellm', modelId: string) =>
     ipcRenderer.invoke('set-provider-preferred-model', provider, modelId),
 
   // License Management
@@ -2585,6 +2599,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => ipcRenderer.invoke('get-ambient-chat-enabled'),
   setAmbientChatEnabled: (enabled: boolean) => ipcRenderer.invoke('set-ambient-chat-enabled', enabled),
+  getAutoAnswerEnabled: () => ipcRenderer.invoke('get-auto-answer-enabled'),
+  setAutoAnswerEnabled: (enabled: boolean) => ipcRenderer.invoke('set-auto-answer-enabled', enabled),
   getCodeVerification: () => ipcRenderer.invoke('get-code-verification'),
   setCodeVerification: (enabled: boolean) => ipcRenderer.invoke('set-code-verification', enabled),
   getMeetingRetention: () => ipcRenderer.invoke('get-meeting-retention'),
