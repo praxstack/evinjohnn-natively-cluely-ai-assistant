@@ -5794,6 +5794,23 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  safeHandle('get-stealth-shortcut-guard', async () => {
+    return appState.getStealthShortcutGuardEnabled();
+  });
+
+  safeHandle('set-stealth-shortcut-guard', async (_, enabled: boolean) => {
+    appState.setStealthShortcutGuardEnabled(!!enabled);
+    return { success: true };
+  });
+
+  // DEV/TEST ONLY — gated by NATIVELY_DEBUG_HOTKEYS=1 inside KeybindManager.
+  // Simulates the OS dropping a RegisterHotKey registration so a Windows tester
+  // can confirm the hook-level swallow / shortcut-guard still fire the action.
+  safeHandle('debug:drop-hotkey', async (_, id: string) => {
+    const { KeybindManager } = require('./services/KeybindManager');
+    return { dropped: KeybindManager.getInstance().debugDropRegistration(id) };
+  });
+
   safeHandle('get-ambient-chat-enabled', async () => {
     return appState.getAmbientChatEnabled();
   });
@@ -6818,6 +6835,24 @@ export function initializeIpcHandlers(appState: AppState): void {
       const keyChanged = cm.getNvidiaNimApiKey() !== normalizedKey;
       cm.setNvidiaNimApiKey(normalizedKey);
       appState.processingHelper.getLLMHelper().setNvidiaNimApiKey(normalizedKey);
+
+      // One NVIDIA key backs BOTH the chat provider and speech recognition
+      // (verified: the same nvapi- credential authenticates integrate.api
+      // .nvidia.com and the NVCF speech functions). That sharing is fine; the
+      // silent coupling was not. Removing the key from AI Providers used to
+      // leave sttProvider on 'nvidia_nim' with nothing to authenticate with, so
+      // buildSttProvider fell through to GoogleSTT — which, with no service
+      // account, meant transcription simply stopped mid-meeting with a console
+      // warning and no user-visible cause.
+      // Turning the provider off explicitly puts the user in the ordinary "no
+      // speech provider configured" state, which the UI already explains.
+      // Only on CLEAR: setting or rotating a key must not touch the selection.
+      const sttWasNvidia = !normalizedKey && cm.getSttProvider() === 'nvidia_nim';
+      if (sttWasNvidia) {
+        cm.setSttProvider('none');
+        console.log('[IPC] NVIDIA key cleared while it was the speech provider — speech provider set to none');
+      }
+
       await appState.reconfigureSttProvider();
       appState.getIntelligenceManager().resetEngine();
       appState.getIntelligenceManager().initializeLLMs();
@@ -6825,7 +6860,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         await refreshRuntimeDefaultIfUnavailable();
         broadcastCredentialsChanged();
       }
-      return { success: true };
+      // Reported back so Settings can say WHY speech switched off, rather than
+      // the user discovering it later in a meeting.
+      return { success: true, sttProviderCleared: sttWasNvidia };
     } catch (error: any) { return { success: false, error: error.message }; }
   });
 
@@ -12429,6 +12466,9 @@ export function initializeIpcHandlers(appState: AppState): void {
           appState.applyAutoAnswerThresholds?.(activeMode.templateType);
         } else if (appStateIntMgr && !id) {
           appStateIntMgr.clearDynamicActionContext();
+          // Mode cleared: back to the registry's no-mode Auto Answer bar
+          // instead of keeping the previous mode's thresholds (review#10).
+          appState.applyAutoAnswerThresholds?.(null);
         }
       } catch {
         /* non-fatal */

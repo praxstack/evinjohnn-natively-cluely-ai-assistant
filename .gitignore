@@ -10,8 +10,6 @@ FIXES.md
 python-installer.pkg
 Sales20260405-60-494j8t.csv
 /Sales20260405-60-494j8t.csv
-natively-api
-/natively-api
 /natively
 natively/
 .natively
@@ -495,6 +493,9 @@ tools/
 !docs/
 docs/*
 !docs/VISION_MODEL_BENCHMARK.md
+# Per-release notes are published artifacts (linked from the README), not scratch notes.
+!docs/releases/
+!docs/releases/**
 # Usage ledger — the progress file is the mandated handoff contract across three
 # campaigns (16 architectural decisions, 5 open findings, the full forensics
 # record), the architecture doc is the system's specification, and the privacy
@@ -505,8 +506,6 @@ docs/*
 !docs/usage-ledger-privacy-diff.md
 # TypeScript 7 upgrade — audit + report are deliverables, not scratch notes,
 # so they are allowlisted out of the blanket `docs/*` ignore above.
-!docs/ts7-upgrade-audit.md
-!docs/ts7-upgrade-report.md
 # Auto Answer V3 campaign — the progress file is the resume contract for the
 # autopilot (a fresh session must be able to continue from it alone) and the
 # two specs govern every phase. Same reasoning as the usage-ledger entries.
@@ -533,7 +532,13 @@ benchmark-results/
 #   undefined/           written by a bug that resolved a path to the literal
 #                        string "undefined" — if this reappears, fix the caller
 #   natively_debug.size* one-off debug dumps
+#   pitch/               investor pitch deck + DPIIT notes (business material,
+#                        and this repo is public — a deck does not belong in it)
+#   researc              a personal chat transcript, saved by a shell redirect
+#                        that lost its filename. Kept locally, never committed.
 /natively-control/
 /chargeback_evidence/
 /undefined/
 /natively_debug.size*
+/pitch/
+/researc
