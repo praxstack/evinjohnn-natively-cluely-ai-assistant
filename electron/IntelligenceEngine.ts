@@ -3153,8 +3153,97 @@ export class IntelligenceEngine extends EventEmitter {
                                         hasImages: (imagePaths?.length ?? 0) > 0,
                                         screenText: _screenText || undefined,
                                     });
-                                return resolveV2SystemPrompt({
-                                    action: 'answer',
+                                // ── T3: the live spoken surface asks for SPOKEN WORDS ──
+                                //
+                                // This resolved `action: 'answer'`, which is the
+                                // manual-chat contract. `what_to_say` is this
+                                // surface's own action — `runWhatShouldISay` is
+                                // literally its caller — and it carries the one
+                                // instruction the live overlay most needs:
+                                // "Output only the exact words the user should
+                                // say next in the active role. No coaching,
+                                // alternatives, labels, or quotation marks."
+                                // Measured: that sentence is absent from the
+                                // composed prompt under 'answer' and present
+                                // under 'what_to_say'.
+                                //
+                                // NOT on coding turns, and that exception is the
+                                // point. Dumping all four combinations shows
+                                // `what_to_say` + codingTask composes BOTH
+                                // "output only the exact words to say" AND the
+                                // six-section coding contract (Complexity, Dry
+                                // Run) into one prompt — two instructions that
+                                // cannot both be obeyed. A coding answer on the
+                                // live surface is a written artifact, not words
+                                // to read aloud, so it keeps 'answer'.
+                                //
+                                // The findings doc also expected this switch to
+                                // restore Team Meet's "only when directly
+                                // addressed" overlay rule. It does not need to:
+                                // that rule is ALREADY present under 'answer'
+                                // (verified by dumping the composed prompt for
+                                // all four combinations), so that half of the
+                                // finding did not reproduce.
+                                // `codingSignals.codingTask` is in this OR for a
+                                // reason found by review. `_promoted` is defined
+                                // as `!codingSignals.codingTask && …`, so it goes
+                                // FALSE exactly when the signals say coding — and
+                                // the bridge's `codingTask` is
+                                // `isCodingAnswerType(answerPlan.answerType)`,
+                                // which is false for `unknown_answer`. A deictic
+                                // ask ("how do I do this?") over a code template
+                                // on screen therefore satisfied NEITHER term.
+                                //
+                                // That turn would have taken 'what_to_say' — "no
+                                // coaching, alternatives, LABELS" — while
+                                // `wtaPromotedScreenCoding` independently armed
+                                // the CodingStreamGate and the post-stream repair
+                                // to enforce the six-section shape. The prompt
+                                // would forbid the very headings the repair
+                                // requires, so every such answer would be
+                                // deterministically rewritten. Three call sites
+                                // asking the same question three ways is the
+                                // divergence the 2026-08-22 note above exists to
+                                // end; this makes them agree.
+                                const _liveCoding = codingTask || codingSignals.codingTask || _promoted;
+                                // EXPLANATORY modes keep 'answer'. Its text
+                                // branches — "in a live role mode, output the
+                                // exact words that role should say; IN DIRECT CHAT
+                                // OR AN EXPLANATORY MODE, ANSWER THE USER
+                                // DIRECTLY" — and `what_to_say` has no such
+                                // branch. The per-mode voice table is the source
+                                // of truth: `lecture` reads "a quiet study partner
+                                // explaining to the student … never speak as the
+                                // student", and `general` reads "the assistant in
+                                // direct chat, or the user's own voice … as the
+                                // moment requires". Handing either a
+                                // script-for-the-user contract turns "what is the
+                                // professor's definition of entropy?" into words
+                                // to recite instead of an explanation.
+                                const _explanatoryMode = snapshotModeInfo?.templateType === 'lecture'
+                                    || snapshotModeInfo?.templateType === 'general';
+                                // ── T3: the repeat-press directive, on the SYSTEM channel ──
+                                //
+                                // Its only carrier was `intentContext` ->
+                                // `packet`, which V3 replaces wholesale, so on
+                                // every V3 turn it was assembled and discarded.
+                                // The coding CONTRACT still arrived (personaBase
+                                // passes `_promoted` as codingTask, and the
+                                // composed prompt does contain Complexity/Dry
+                                // Run) — but the directive telling the model that
+                                // a blind re-press is a request for the WHOLE
+                                // answer did not. Measured live 2026-08-19: the
+                                // model responded with commentary on its own
+                                // previous answer and then agreed with it.
+                                //
+                                // It rides the system prompt rather than
+                                // `realtimeInstruction` deliberately. That field
+                                // is documented "Tone/length only — cannot widen
+                                // authorization"; this is an answer-SHAPE mandate
+                                // and belongs on the same channel that already
+                                // carries the coding contract it refers to.
+                                const _base = resolveV2SystemPrompt({
+                                    action: (_liveCoding || _explanatoryMode) ? 'answer' : 'what_to_say',
                                     tier: v2TierForPromptTier(this.llmHelper.getPromptTier?.()),
                                     activeMode: snapshotModeInfo ?? undefined,
                                     codingTask: codingTask || _promoted,
@@ -3162,6 +3251,8 @@ export class IntelligenceEngine extends EventEmitter {
                                     codingFormat: codingSignals.codingFormat,
                                     suppliedTemplate: codingSignals.suppliedTemplate,
                                 });
+                                if (!_promoted || !_base) return _base;
+                                return `${_base}\n\n<repeat_press_directive>\nThe user triggered this action with a coding problem on screen and NO new question. That is a request for the COMPLETE solution to the on-screen problem, following the coding contract's full section shape — even if a previous answer in this conversation already covered it, and even if this looks like a follow-up. Never respond with commentary on, agreement with, or a summary of an earlier answer. Produce the full answer as if asked for the first time.\n</repeat_press_directive>`;
                             } catch { return null; } // no persona ⇒ composition unchanged
                         },
                     });
@@ -3175,6 +3266,12 @@ export class IntelligenceEngine extends EventEmitter {
                     }
                     return _v3 ? {
                         system: _v3.system, user: _v3.user,
+                        // T4: the evidence this prompt was composed from. The
+                        // post-stream doc-grounded validator uses THIS rather
+                        // than a fresh legacy retrieval — see the validator's
+                        // own note. Carrying it is what makes "never validate
+                        // against a block that was never sent" enforceable.
+                        evidenceBlock: (_v3 as { evidenceBlock?: string }).evidenceBlock ?? '',
                         // Carried for the source badge: when V3 composed the
                         // prompt, the label must reflect V3's decision, not the
                         // legacy TurnPlan that did not drive the answer.
@@ -3195,6 +3292,20 @@ export class IntelligenceEngine extends EventEmitter {
                 ...(wtaContextOsGeneration ? { contextOsGeneration: wtaContextOsGeneration } : {}),
                 ...(wtaV3Prompt ? { v3Prompt: wtaV3Prompt } : {}),
             });
+
+            // T4 (2026-08-28): did V3 compose this turn's prompt? Every
+            // post-stream layer below needs the answer, because when V3 composed,
+            // `_v3p.user` REPLACED the legacy packet — so the candidate profile,
+            // the legacy retrieved block and the legacy answer contract were all
+            // built and then discarded unsent. A validator that judges the
+            // streamed answer against one of those is judging it against
+            // something the model never saw.
+            //
+            // Resolved once, here, from the frozen snapshot: the two consumers
+            // are ~1000 lines apart, and this whole class of defect is one copy
+            // of a condition drifting from another.
+            const _v3ComposedTurn = Boolean(wtaV3Prompt)
+                && isIntelligenceFlagEnabled('docGroundedValidatorUsesSentEvidence');
 
             // RC-03 fix: hold a reference to the generator so we can call .return()
             // to properly terminate the network request when a new generation starts.
@@ -3909,7 +4020,19 @@ export class IntelligenceEngine extends EventEmitter {
                     && !(imagePaths?.length)
                     && this.currentGenerationId === generationId) {
                     const docQuestion = (answerPlan.question || question || extractedQuestion.latestQuestion || lastInterviewerTurn || '').trim();
-                    if (docQuestion) {
+                    // T4 (2026-08-28) — see the long note at the docContextBlock
+                    // assignment below. `_v3Composed` says the answer was grounded in
+                    // V3's evidence, so that is what it must be validated against.
+                    const _v3Composed = _v3ComposedTurn;
+                    const _v3EvidenceBlock = (requestSnapshot.v3Prompt?.evidenceBlock ?? '').trim();
+                    // A V3 turn that carried NO evidence cannot be checked against
+                    // document excerpts at all: the composer already told the model so
+                    // and shaped the answer around that absence. Replacing it with "I
+                    // could not find that in the retrieved sections" would claim
+                    // sections were searched when none were.
+                    if (_v3Composed && !_v3EvidenceBlock) {
+                        trace.mark('validation_completed', { reason: 'v3_turn_carried_no_evidence_to_validate_against' });
+                    } else if (docQuestion) {
                         const { ModesManager } = require('./services/ModesManager') as typeof import('./services/ModesManager');
                         const mm = ModesManager.getInstance();
                         const buildDocContext = async (relaxed: boolean): Promise<string> => {
@@ -3965,9 +4088,29 @@ export class IntelligenceEngine extends EventEmitter {
                         const _governedPack = wtaContextOsGeneration?.govern
                             ? wtaContextOsGeneration.evidencePack
                             : undefined;
-                        let docContextBlock = (_governedPack && _governedPack.items.length > 0)
-                            ? _governedPack.items.map((it) => `[Section: ${it.pointer?.section || it.sourceId}]\n${it.text}`).join('\n\n')
-                            : await buildDocContext(false);
+                        // T4 (2026-08-28) — VALIDATE AGAINST THE BLOCK THAT WAS SENT.
+                        //
+                        // This is the same repair as the 2026-07-11 note above, applied
+                        // to the layer that now composes most turns. When V3 composed
+                        // the prompt, the answer was grounded in V3's evidence
+                        // (`_v3p.user`) — a DIFFERENT evidence set from anything
+                        // `buildDocContext` returns, because that helper re-runs the
+                        // LEGACY retrieval with its own params, minutes of model time
+                        // after the fact. Judging a V3 answer by a legacy re-retrieval
+                        // and then overwriting it with the canonical refusal is not
+                        // validation; it is a second opinion from a witness who was not
+                        // in the room.
+                        //
+                        // Note this is NOT a blanket V3 exemption. A blanket exemption
+                        // was the obvious reading of the finding and it is the wrong
+                        // fix: V3 is the default path, so exempting it would retire the
+                        // zero-fabrication guard for essentially every WTA turn. The
+                        // guard stays on — it is simply pointed at the right evidence.
+                        let docContextBlock = _v3Composed
+                            ? _v3EvidenceBlock
+                            : (_governedPack && _governedPack.items.length > 0)
+                                ? _governedPack.items.map((it) => `[Section: ${it.pointer?.section || it.sourceId}]\n${it.text}`).join('\n\n')
+                                : await buildDocContext(false);
                         const hasOkfEvidence = /STRUCTURED KNOWLEDGE CARDS|Direct quote|knowledge_card/i.test(docContextBlock);
                         const firstCheck = validateDocumentGroundedAnswer({
                             question: docQuestion,
@@ -3980,8 +4123,71 @@ export class IntelligenceEngine extends EventEmitter {
                         if (!firstCheck.ok) {
                             trace.mark('validation_failed', { reason: firstCheck.reason, action: firstCheck.action });
                             if (firstCheck.action === 'refuse') {
-                                fullAnswer = 'I could not find that in the retrieved sections of the document.';
-                                trace.mark('repair_used', { reason: 'doc_grounded_refusal', coverage: firstCheck.coverage.reason });
+                                // T4 — ONE REWRITTEN-QUERY RETRIEVAL BEFORE REFUSING.
+                                //
+                                // The pre-existing retry re-retrieved with the SAME
+                                // query text that had just failed. A second identical
+                                // retrieval is not a second attempt; it is the first
+                                // attempt again, and the refusal shipped whenever the
+                                // first pass ranked the answer out.
+                                //
+                                // `rewriteQueryForRetry` is the port's own distillation
+                                // (retrieval/query-rewrite.ts), generalized: it fires
+                                // only when the question carries a structural handle the
+                                // first pass may have ranked past — an exact identifier
+                                // that no admitted chunk contains, or a document-position
+                                // compound lexical search reads as part of the head term.
+                                // With neither, it returns null and no retrieval is spent.
+                                //
+                                // Bounded at ONE extra retrieval, and it only ever
+                                // ADDS evidence: on success the answer is re-validated
+                                // against the wider block, and `computeEvidenceCoverage`
+                                // — the fabrication guard — is untouched and still has
+                                // the final word. This sits in FRONT of it, never inside.
+                                let rescued = false;
+                                try {
+                                    const { rewriteQueryForRetry } = require('./context-intelligence/retrieval/query-rewrite') as typeof import('./context-intelligence/retrieval/query-rewrite');
+                                    const rewrite = rewriteQueryForRetry(docQuestion, docContextBlock);
+                                    if (rewrite) {
+                                        const opts = { forceDocumentGrounding: true, relaxed: true, topK: 24 };
+                                        const retriedBlock = typeof mm.buildRetrievedActiveModeContextBlockHybrid === 'function'
+                                            ? await mm.buildRetrievedActiveModeContextBlockHybrid(
+                                                rewrite.query, preparedTranscript, 5200, answerPlan.answerType,
+                                                true, requestSnapshot.modeUniqueId, undefined, opts)
+                                            : mm.buildRetrievedActiveModeContextBlock(
+                                                rewrite.query, preparedTranscript, 5200, answerPlan.answerType,
+                                                true, requestSnapshot.modeUniqueId, opts);
+                                        if (retriedBlock && retriedBlock.trim()) {
+                                            // Validate against the UNION: the rewritten
+                                            // query is narrower by construction, so
+                                            // replacing the block could lose evidence
+                                            // the first pass legitimately found.
+                                            const widened = `${docContextBlock}\n\n${retriedBlock}`.trim();
+                                            const recheck = validateDocumentGroundedAnswer({
+                                                question: docQuestion,
+                                                answer: fullAnswer,
+                                                retrievedBlock: widened,
+                                                answerType: answerPlan.answerType as DocumentQuestionShape,
+                                                hasOkfEvidence: /STRUCTURED KNOWLEDGE CARDS|Direct quote|knowledge_card/i.test(widened),
+                                            });
+                                            if (recheck.ok) {
+                                                docContextBlock = widened;
+                                                rescued = true;
+                                                trace.mark('validation_completed', {
+                                                    reason: 'doc_grounded_rescued_by_rewritten_query',
+                                                    rewrite: rewrite.reason,
+                                                });
+                                            }
+                                        }
+                                    }
+                                } catch (retryErr: any) {
+                                    // A failed rescue must never be worse than no rescue.
+                                    console.warn('[IntelligenceEngine] rewritten-query re-retrieval skipped:', retryErr?.message || retryErr);
+                                }
+                                if (!rescued) {
+                                    fullAnswer = 'I could not find that in the retrieved sections of the document.';
+                                    trace.mark('repair_used', { reason: 'doc_grounded_refusal', coverage: firstCheck.coverage.reason });
+                                }
                             } else {
                                 const relaxedBlock = await buildDocContext(true);
                                 if (relaxedBlock.trim()) docContextBlock = relaxedBlock;
@@ -4102,7 +4308,33 @@ export class IntelligenceEngine extends EventEmitter {
             // (b) a profile is loaded, and (c) a violation is actually detected, so
             // the happy path adds ZERO latency.
             try {
-                const profileLoaded = Boolean(candidateProfile && candidateProfile.trim().length > 0);
+                // T4 / review finding #5 (2026-08-28) — THE MOST SECURITY-RELEVANT
+                // OF THE TEN, and the only one that leaks a source rather than
+                // losing an answer.
+                //
+                // The comment below used to end "the evidence is exactly the
+                // candidateProfile block the model saw". Under V3 that sentence is
+                // FALSE: `_v3p.user` replaced the packet, so `candidateProfile` was
+                // assembled and never dispatched. Two consequences, both bad:
+                //
+                //   • `validateProfileEvidence` flags "fabricated" metrics by
+                //     comparing the answer against a block the model never read —
+                //     wrong in both directions.
+                //   • worse, on `false_no_access_refusal` the repair REGENERATES
+                //     from the full `candidateProfile`. In a mode whose V3 decision
+                //     authorized no profile source, an honest decline therefore
+                //     triggered a regeneration that injected the résumé anyway —
+                //     re-opening a source V3 deliberately closed.
+                //
+                // So the repair stands down on a V3-composed turn. That does cost
+                // its persona and false-refusal guards there, which is a real loss
+                // and is recorded as such: the right end state is a V3-native
+                // equivalent validating against V3's own packed evidence. Until
+                // that exists, losing a legacy safety net is strictly better than
+                // leaking an unauthorized source, and V3's composer supplies its
+                // own persona and absence handling.
+                const profileLoaded = !_v3ComposedTurn
+                    && Boolean(candidateProfile && candidateProfile.trim().length > 0);
                 // CONTEXT OS (Phase 8): the profile REPAIR may not re-open a
                 // source the contract denied (WTA regen leak — baseline §5.5).
                 // candidateProfile is already cleared above when the contract
@@ -5839,7 +6071,14 @@ export class IntelligenceEngine extends EventEmitter {
                         profileSourceCount: _ctx.profileSourceCount,
                         resolvedProfileSources: _ctx.resolvedProfileSources,
                         requestSequence: this.currentGenerationId,
-                        scope: { meetingId: _ctx.meetingId ?? undefined },
+                        // T7 (2026-08-28): `sessionId` was MISSING here while both
+                        // sibling call sites (:5517 and the WTA snapshot) set it
+                        // explicitly, each with a comment saying why. Without it the
+                        // V3 conversation-state store falls back to the literal key
+                        // 'engine', so every session on this surface shared one
+                        // continuity slot -- one user's activeTopic resolving another
+                        // turn's "that project". A one-line omission, not a design.
+                        scope: { meetingId: _ctx.meetingId ?? undefined, sessionId: _ctx.meetingId ?? undefined },
                         retrieval: _ctx.port as any,
                     });
                 } catch { return null; }

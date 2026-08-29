@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
+import { isRetrievalFixEnabled } from '../context-intelligence/contracts/retrieval-flags';
 import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
 import { ModeContextRetriever, type ModeRetrievalOptions, type RetrieveOptions } from './ModeContextRetriever';
 import type { ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
@@ -12,6 +13,7 @@ import {
     type ModeSourceContract,
     type ModeSourceOwner,
     CURRENT_MIGRATION_REVISION,
+    CURRENT_SEED_REVISION,
     defaultSourceContractForNewMode,
     migrateSourceContractFromPrompt,
     parseModeSourceContract,
@@ -821,7 +823,36 @@ export class ModesManager {
         const isInterviewPrep = input.templateType === 'looking-for-work'
             || input.templateType === 'technical-interview';
         const switches = input.switches.filter((s) => s !== 'transcript');
-        const defaultOwner: ModeSourceOwner = isInterviewPrep ? 'profile' : 'reference_files';
+        // Interview-prep modes are profile-first BY DEFAULT — but not when the
+        // user has explicitly said otherwise (2026-08-29).
+        //
+        // THE GAP THIS CLOSES. T8 gave technical-interview a reference pool and
+        // put `reference_files` in its permitted switches, so the "Primary
+        // knowledge source" control offers it and the file is now REACHABLE.
+        // But this function pinned `defaultOwner: 'profile'` for interview-prep
+        // regardless of what the user ticked, so the contract still resolved
+        // `profile_only`, `documentGroundedFromContract` still returned false,
+        // and `forceDocumentGrounding` stayed OFF. Measured: ticking "Reference
+        // files" in Technical Interview produced sourceAuthority=profile_only
+        // and docGrounded=false, while the identical selection in General
+        // produced reference_files_primary / true.
+        //
+        // Everything gated on that switch therefore stayed off in the one mode
+        // whose users are most likely to upload project documents: topK 6 and a
+        // 1800-token budget instead of 12/3600, no per-file floor, no
+        // answerability scoring, no section-target or positional restore, no
+        // identity block, no query normalization. The user could ask for their
+        // reference files and be given a materially weaker retrieval than the
+        // same files in General.
+        //
+        // The upload-is-not-consent rule is untouched: this reads the user's
+        // EXPLICIT switch, not the presence of a file. A mode with no
+        // `reference_files` tick keeps `profile` and behaves exactly as before.
+        const userChoseReferenceFiles = switches.includes('reference_files')
+            && isRetrievalFixEnabled('interviewPrepHonorsReferenceSwitch');
+        const defaultOwner: ModeSourceOwner = (isInterviewPrep && !userChoseReferenceFiles)
+            ? 'profile'
+            : 'reference_files';
         return buildUserSelectedSourceContract({
             defaultOwner,
             allowedExplicitSwitches: switches as any,
@@ -892,6 +923,20 @@ export class ModesManager {
                 || !mode.sourceContract.seededForTemplateType);
         const staleMigration = mode.sourceContract?.origin === 'migrated_from_prompt'
             && (mode.sourceContract.migrationRevision ?? 1) < CURRENT_MIGRATION_REVISION;
+        // Seed revision (T8, 2026-08-28). A SEEDED contract could not previously
+        // pick up a later change to the seed rules at all -- `staleMigration`
+        // above tests `migrated_from_prompt` only -- so an existing Technical
+        // Interview mode would have kept its pre-T8 permission set forever and
+        // the fix would have reached newly-created modes alone.
+        //
+        // Its own counter, NOT a bump of CURRENT_MIGRATION_REVISION: that would
+        // re-run the prompt-heuristic migration over every migrated contract in
+        // every user's database, and break the standing invariant that a
+        // prompt-migrated contract is never overwritten by a template switch.
+        // A seed carries no user intent by definition (see `isTemplateAwareSeed`
+        // above), so re-seeding it loses nothing; `user_selected` is untouched.
+        const staleSeedRevision = mode.sourceContract?.origin === 'default_new_mode'
+            && (mode.sourceContract.seedRevision ?? 1) < CURRENT_SEED_REVISION;
         // Stale-seed detection (Knowledge Source canonical-gate repair, 2026-07-16):
         // a default_new_mode contract whose seededForTemplateType differs from the
         // mode's current templateType was created for the wrong template (someone
@@ -905,6 +950,7 @@ export class ModesManager {
         const needsMigration = !mode.sourceContract
             || (mode.sourceContract.origin === 'default_new_mode' && !isTemplateAwareSeed && (hasCustomPrompt || hasReferenceFiles))
             || staleMigration
+            || staleSeedRevision
             || staleSeedForCurrentTemplate;
         if (!needsMigration) return mode.sourceContract!;
         // Stale-seed path (Knowledge Source canonical-gate repair, 2026-07-16):
