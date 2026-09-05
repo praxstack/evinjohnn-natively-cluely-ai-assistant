@@ -481,6 +481,17 @@ export const AIP_CSS = `
 .aip-btn[data-icon='true'] { width:32px; padding:0; }
 .aip-btn[data-variant='accent'] { background: var(--aip-accent-muted); border-color: var(--aip-accent-border); color: var(--aip-accent); }
 .aip-btn[data-variant='accent']:hover:not(:disabled) { background: var(--aip-accent-border); }
+/* Selected state for a button acting as a choice in a group (the candidate
+   counts in Settings > Reranker). React was already setting data-active there
+   and NOTHING styled it, so every press persisted the setting and repainted
+   identically -- the control looked dead. Scoped to .aip-btn on purpose:
+   .aip-card also carries data-active (reranker model rows) and shows selection
+   with its own 'In use' badge, which must not gain a second treatment.
+   The hover pair is required, not decorative: .aip-btn:hover:not(:disabled) is
+   specificity (0,3,0) against this rule's (0,2,0), so without it hovering the
+   selected button would drop it back to the unselected background. */
+.aip-btn[data-active='true'] { background: var(--aip-accent-muted); border-color: var(--aip-accent-border); color: var(--aip-accent); font-weight:600; }
+.aip-btn[data-active='true']:hover:not(:disabled) { background: var(--aip-accent-border); }
 .aip-btn[data-variant='ghost']  { background: transparent; border-color: transparent; color: var(--aip-secondary); }
 .aip-btn[data-variant='ghost']:hover:not(:disabled) { background: var(--aip-item-hover); color: var(--aip-primary); }
 .aip-btn[data-variant='danger-ghost'] { background: transparent; border-color: transparent; color: var(--aip-secondary); }
@@ -512,7 +523,7 @@ export const AIP_CSS = `
    label to nothing. */
 .aip-provider-field { display:flex; align-items:center; gap:8px; flex:1 1 280px;
                       min-width:0; }
-.aip-provider-note  { margin-top: var(--aip-gap-row); }
+.aip-provider-note  { margin-top: 0; }
 
 /* The credential shell: one 32px box holding glyph + input + Save. overflow:hidden is
    what clips the Save segment's outer corners to the shell radius — which is also why
@@ -1486,7 +1497,12 @@ export const AipModelList: React.FC<AipModelListProps> = ({
     );
 };
 
-export interface AipSelectOption { id: string; name: string }
+/**
+ * `name` is the OPEN menu row; `triggerName`, when present, is what the CLOSED
+ * trigger shows instead. Optional because most selectors (widths, plain
+ * choices) have one name and a required field would blank their triggers.
+ */
+export interface AipSelectOption { id: string; name: string; triggerName?: string }
 
 interface AipSelectProps {
     value: string;
@@ -1851,6 +1867,8 @@ interface AIProvidersSettingsProps {
     onToggleAiLangDropdown: () => void;
     onSelectAiLanguage: (code: string) => void;
     aiLangDropdownRef: React.RefObject<HTMLDivElement | null>;
+    /** Deep-link to another settings tab (used by the lightweight-embedding notice). */
+    onNavigate?: (tab: string) => void;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1971,6 +1989,73 @@ const AmbiguousStoresCard: React.FC = () => {
 
 export const AmbiguousCredentialStoresCard = AmbiguousStoresCard;
 
+/**
+ * §5 cross-panel notice: the user has configured a third-party AI provider, but
+ * retrieval is still running on a lightweight embedding model.
+ *
+ * The failure this prevents is silent and easy to misattribute — an excellent
+ * generation model still produces a poor answer when the wrong context was
+ * retrieved, and the user blames the model or Natively. Non-blocking by design,
+ * and "Continue" is permanent: an unstoppable warning becomes something to click
+ * past.
+ *
+ * The predicate lives in the main process (electron/rag/embeddingStatus.ts) so
+ * this component never re-derives "is it lightweight" from a model name — an
+ * Ollama user on nomic-embed-text must not be nagged.
+ */
+const LightweightEmbeddingNotice: React.FC<{ onOpenEmbeddings?: () => void }> = ({ onOpenEmbeddings }) => {
+    const t = useT();
+    const [state, setState] = React.useState<{ show: boolean; model?: string | null }>({ show: false });
+
+    React.useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const s = await window.electronAPI.getEmbeddingStatus?.();
+                if (!cancelled && s?.shouldWarn) setState({ show: true, model: s.active?.model });
+            } catch { /* best-effort notice */ }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    if (!state.show) return null;
+
+    return (
+        <div className="aip-card p-5 space-y-3">
+            <div className="flex items-start gap-3">
+                {/* One status primitive, as everywhere else in this panel. */}
+                <AipBadge tone="warn" label={t('Embeddings')} />
+                <div className="min-w-0">
+                    <p className="text-xs aip-hero font-medium">
+                        {t('Your AI provider is configured, but retrieval still uses a lightweight embedding model')}
+                    </p>
+                    <p className="text-[11px] aip-muted mt-1 leading-relaxed">
+                        {t('Natively embeds your files with')} <span className="aip-mono">{state.model || 'MiniLM'}</span>{t('. It may give weaker code and project retrieval than newer embedding models, which can affect answer quality even when your AI provider is excellent.')}
+                    </p>
+                    <p className="text-[11px] aip-muted mt-1 leading-relaxed">
+                        {t('For better results, choose a stronger local embedding model, or use a Natively API key, which includes managed embeddings.')}
+                    </p>
+                </div>
+            </div>
+            <div className="flex flex-wrap gap-2 pl-1">
+                <button type="button" className="aip-btn" onClick={() => onOpenEmbeddings?.()}>
+                    {t('Configure embedding model')}
+                </button>
+                <button
+                    type="button"
+                    className="aip-btn"
+                    onClick={async () => {
+                        await window.electronAPI.acknowledgeLightweightEmbeddings?.(true);
+                        setState({ show: false });
+                    }}
+                >
+                    {t('Continue with MiniLM')}
+                </button>
+            </div>
+        </div>
+    );
+};
+
 export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     aiResponseLanguage,
     availableAiLanguages,
@@ -1978,6 +2063,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     onToggleAiLangDropdown,
     onSelectAiLanguage,
     aiLangDropdownRef,
+    onNavigate,
 }) => {
     const t = useT();
     // Mirrors document.documentElement[data-theme] through the shared
@@ -2105,9 +2191,54 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     // without leaving Settings.
     const [codexOauthStatus, setCodexOauthStatus] = useState<{ signedIn: boolean; email?: string; expiresAt?: number }>({ signedIn: false });
     const [codexOauthInProgress, setCodexOauthInProgress] = useState(false);
+    const [antigravityStatus, setAntigravityStatus] = useState({ signedIn: false, inProgress: false, expiresAt: undefined as number | undefined });
+    const [antigravityModels, setAntigravityModels] = useState<{ id: string; label: string }[]>([]);
+    const [antigravityError, setAntigravityError] = useState('');
+    const [antigravityBusy, setAntigravityBusy] = useState(false);
+    const antigravityLoad = useRef(0);
+
+    useEffect(() => window.electronAPI.onAntigravityStatusChanged?.((status) => {
+        ++antigravityLoad.current;
+        setAntigravityStatus({ signedIn: status.signedIn, inProgress: status.inProgress, expiresAt: status.expiresAt });
+        if (!status.signedIn) setAntigravityModels([]);
+        setAntigravityError(status.error || '');
+    }), []);
+
+    const loadAntigravity = async (force = false) => {
+        const run = ++antigravityLoad.current;
+        if (!window.electronAPI.antigravityStatus) return;
+        try {
+            const status = await window.electronAPI.antigravityStatus();
+            const result = status.signedIn ? await window.electronAPI.antigravityModels(force) : null;
+            if (run !== antigravityLoad.current) return;
+            setAntigravityStatus({ signedIn: status.signedIn, inProgress: status.inProgress, expiresAt: status.expiresAt });
+            if (!status.signedIn || result?.success) setAntigravityModels(result?.models || []);
+            setAntigravityError(result?.error || status.error || '');
+        } catch {
+            if (run === antigravityLoad.current) setAntigravityError(t('Could not load Antigravity status. Try again.'));
+        }
+    };
+
+    const runAntigravityAction = async (action: 'login' | 'logout' | 'models') => {
+        setAntigravityBusy(true);
+        setAntigravityError('');
+        try {
+            if (action === 'models') { await loadAntigravity(true); return; }
+            const result = await (action === 'login' ? window.electronAPI.antigravityStartLogin()
+                : window.electronAPI.antigravitySignOut());
+            await loadAntigravity();
+            if (!result.success) setAntigravityError(result.error || t('Antigravity request failed. Try again.'));
+        } catch {
+            setAntigravityError(t('Could not reach Antigravity. Try again.'));
+        } finally { setAntigravityBusy(false); }
+    };
 
     // --- Default Model ---
-    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.7-flash');
+    // UNION, not a pick. 3.8-flash is this branch's bump and main has no
+    // reference to it at all (IntelligenceManager.ts, LLMHelper.ts, re-probed
+    // 2026-09-03), so the model default takes the branch side; the three
+    // Direct Assist states are main's and are additive.
+    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.8-flash');
     const [directAssistEnabled, setDirectAssistEnabled] = useState(false);
     const [directAssistBusy, setDirectAssistBusy] = useState(false);
     const [directAssistError, setDirectAssistError] = useState('');
@@ -2286,6 +2417,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                 }
 
                 const fastMode = await window.electronAPI?.getGroqFastTextMode();
+                await loadAntigravity();
                 if (fastMode) setFastResponseMode(fastMode.enabled);
 
                 // @ts-ignore
@@ -2423,6 +2555,12 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                 }
             });
         }
+        if (antigravityStatus.signedIn && isProviderEnabled('antigravity')) {
+            antigravityModels.forEach(({ id, label }) => {
+                const selectorId = `antigravity:${id}`;
+                if (isModelEnabled('antigravity', selectorId)) opts.push({ id: selectorId, name: `${label} (Antigravity)` });
+            });
+        }
         if (hasStoredKey.litellm && isProviderEnabled('litellm')) {
             // Same allow-list gate the cloud providers get above. Without it the proxy's
             // full catalogue reaches the picker while modelAvailable() filters it, and
@@ -2448,12 +2586,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     // changes instead of waiting for a failing request to discover stale state.
     useEffect(() => {
         if (!credentialsLoaded) return;
+        if (defaultModel.startsWith('antigravity:') && antigravityStatus.signedIn && antigravityError) return;
         const opts = buildAvailableModelOptions();
         if (!defaultModel || opts.some(o => o.id === defaultModel) || opts.length === 0) return;
-        const next = opts[0].id;
+        const next = (defaultModel.startsWith('antigravity:')
+            ? opts.find(option => option.id.startsWith('antigravity:'))?.id : undefined) || opts[0].id;
         setDefaultModel(next);
         window.electronAPI?.setDefaultModel?.(next).catch(console.error);
-    }, [credentialsLoaded, defaultModel, hasStoredKey, preferredModels, isCodexReady, codexCliConfig.model, customProviders, ollamaModels, litellmModels, disabledProviders, cloudEnabledModels]);
+    }, [credentialsLoaded, defaultModel, hasStoredKey, preferredModels, isCodexReady, codexCliConfig.model, customProviders, ollamaModels, litellmModels, disabledProviders, cloudEnabledModels, antigravityStatus.signedIn, antigravityModels, antigravityError]);
 
     // Load LiteLLM model IDs only when the proxy is configured. The active-model
     // selector should not expose stale `litellm/...` choices after the proxy is
@@ -3288,6 +3428,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         // in-tab panel switch. `.aip-root`'s own reduced-motion guard (~line 841)
         // already neutralises both.
         <div className="aip-root space-y-5 pb-10" data-theme={theme} data-settings-stagger>
+            <LightweightEmbeddingNotice onOpenEmbeddings={onNavigate ? () => onNavigate('embedding') : undefined} />
             <AmbiguousStoresCard />
             {confirmCopy && (
                 <ConfirmDialog
@@ -3564,6 +3705,41 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     })}
 
                 </div>
+            </div>
+
+            {/* Google Antigravity */}
+            <div className="aip-card p-5 space-y-4">
+                <div className="flex items-start justify-between gap-3">
+                    <div className="flex gap-3">
+                        <AipProviderMark provider="antigravity" name="Google Antigravity" className="mt-0.5" />
+                        <div>
+                            <h3 className="text-sm font-bold aip-hero mb-1">Google Antigravity</h3>
+                            <p className="text-xs aip-muted">{t('Sign in with Google to use your Antigravity models.')}</p>
+                        </div>
+                    </div>
+                    <button type="button" className="aip-btn" onClick={() => handleToggleProvider('antigravity', disabledProviders.includes('antigravity'))}>
+                        {disabledProviders.includes('antigravity') ? t('Enable provider') : t('Disable provider')}
+                    </button>
+                </div>
+                <p className="text-xs aip-muted" role="status">
+                    {antigravityStatus.inProgress ? t('Waiting for Google sign-in…')
+                        : antigravityStatus.signedIn ? t('Antigravity connected') : t('Not connected')}
+                    {antigravityStatus.signedIn && antigravityStatus.expiresAt && ` · ${t('Refreshes automatically before')} ${new Date(antigravityStatus.expiresAt).toLocaleTimeString()}`}
+                </p>
+                <div className="flex flex-wrap gap-2">
+                    {antigravityStatus.inProgress ? (
+                        <button type="button" className="aip-btn" onClick={() => window.electronAPI.antigravityCancelLogin().catch(() => setAntigravityError(t('Could not cancel sign-in. Try again.')))}>{t('Cancel sign-in')}</button>
+                    ) : !antigravityStatus.signedIn ? (
+                        <button type="button" className="aip-btn" disabled={antigravityBusy} onClick={() => void runAntigravityAction('login')}>{t('Sign in with Google')}</button>
+                    ) : <>
+                        <button type="button" className="aip-btn" disabled={antigravityBusy} onClick={() => void runAntigravityAction('models')}>{t('Reload models')}</button>
+                        <button type="button" className="aip-btn" onClick={() => void runAntigravityAction('logout')}>{t('Disconnect')}</button>
+                    </>}
+                </div>
+                {antigravityStatus.signedIn && <p className="text-xs aip-muted">{antigravityModels.length
+                    ? `${antigravityModels.length} ${t('models available in the model picker.')}`
+                    : t('No Antigravity models currently have quota. Reload models later.')}</p>}
+                {antigravityError && <p className="text-xs aip-warn-fg" role="alert">{antigravityError}</p>}
             </div>
 
             {/* Codex — ChatGPT subscription proxy */}
