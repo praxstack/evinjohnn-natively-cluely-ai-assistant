@@ -1233,7 +1233,6 @@ import { punctuationSourceFor } from "./llm/punctuationProvenance"
 import { ThemeManager } from "./ThemeManager"
 import { RAGManager } from "./rag/RAGManager"
 import { DatabaseManager } from "./db/DatabaseManager"
-import { warmupIntentClassifier } from "./llm"
 
 /** Unified type for all STT providers with optional extended capabilities */
 type STTProvider = (GoogleSTT | RestSTT | DeepgramStreamingSTT | SonioxStreamingSTT | ElevenLabsStreamingSTT | OpenAIStreamingSTT | NativelyProSTT | NvidiaNimStreamingSTT) & {
@@ -1705,20 +1704,10 @@ export class AppState {
     // experience instead of a crashloop.
     setImmediate(() => {
       try {
-        const { consumeIntentClassifierSentinel } = require('./llm/IntentClassifier');
         const { consumeLocalEmbeddingSentinel } = require('./rag/providers/LocalEmbeddingProvider');
         const { consumeLocalRerankerSentinel } = require('./rag/LocalReranker');
 
-        const intentPoisoned = consumeIntentClassifierSentinel();
-        if (intentPoisoned) {
-          const message = `Recovered from an intent classifier crash. ${intentPoisoned.modelId} is skipped this launch — falling back to regex/heuristic intent.`;
-          console.warn(`[AppState] ${message}`);
-          this.setOnnxRecoveryNotice('intent', {
-            family: 'intent',
-            badModelId: intentPoisoned.modelId,
-            message,
-          });
-        }
+        // Intent-classifier poison sentinel removed 2026-09-05 with the classifier.
 
         const embeddingPoisoned = consumeLocalEmbeddingSentinel();
         if (embeddingPoisoned) {
@@ -2588,6 +2577,36 @@ export class AppState {
             resolveCompanySearchProvider,
           } = require('./services/resolveCompanySearchProvider');
           this.knowledgeOrchestrator.setSearchProviderResolver(resolveCompanySearchProvider);
+        }
+
+        // Is company research appropriate in the active mode? (Routing audit,
+        // 2026-09-04.) The orchestrator's dossier gate was mode-blind, so a
+        // Team Meet or Lecture turn containing a bare token like "reviews" or
+        // "funding" could put a query on the wire to an external search
+        // provider whenever a JD was still loaded from an earlier session.
+        //
+        // In exactly those modes the result is discarded: the intercept gate in
+        // LLMHelper runs AFTER processQuestion returns, so the research had
+        // already happened and its output was thrown away. The call could never
+        // change the answer, only leak the query and spend the budget.
+        //
+        // Reuses the SAME predicate as that gate, so the two cannot drift: the
+        // modes that discard the result are exactly the modes that no longer
+        // request it. Resolved per call because the user switches modes
+        // mid-session. Optional-capability guard matches the sibling wiring
+        // above, so an older premium build without the setter is unaffected.
+        if (typeof this.knowledgeOrchestrator.setCompanyResearchAllowedFn === 'function') {
+          this.knowledgeOrchestrator.setCompanyResearchAllowedFn(() => {
+            try {
+              // Local require, matching every other ModesManager use in this
+              // file: the module is not statically imported here.
+              const { ModesManager } = require('./services/ModesManager');
+              return ModesManager.getInstance().isPremiumKnowledgeInterceptAllowed();
+            } catch {
+              // Never let a mode-lookup failure disable a paid capability.
+              return true;
+            }
+          });
         }
 
         // Embedding function — lazily delegate to the cascaded EmbeddingPipeline
@@ -8707,13 +8726,8 @@ if (process.env.THINKING_MATRIX === '1') {
   // Defer the zero-shot intent classifier warmup until after the launcher has
   // had a chance to paint and settle. The classifier still lazy-loads on first
   // use, so this only moves startup CPU work out of the visible launch path.
-  setTimeout(() => {
-    try {
-      warmupIntentClassifier();
-    } catch (err) {
-      console.warn('[Init] Intent classifier warmup scheduling failed (non-fatal):', err);
-    }
-  }, Number(process.env.NATIVELY_INTENT_WARMUP_DELAY_MS || '2500'));
+  // Intent classifier warmup removed 2026-09-05: the MobileBERT classifier is gone.
+  // See docs/natively-router-final-answer-2026-09-05.md.
 
   // DUAL-DOCK-ICON FIX (promotion half): now that the disguised name/icon are
   // applied and the window exists, promote back to 'regular' so a SINGLE dock

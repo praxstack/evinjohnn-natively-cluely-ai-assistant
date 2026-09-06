@@ -33,10 +33,6 @@ const REQUIRED_MODEL_FILES = [
   'Xenova/all-MiniLM-L6-v2/tokenizer.json',
   'Xenova/all-MiniLM-L6-v2/tokenizer_config.json',
   'Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx',
-  'Xenova/mobilebert-uncased-mnli/config.json',
-  'Xenova/mobilebert-uncased-mnli/tokenizer.json',
-  'Xenova/mobilebert-uncased-mnli/tokenizer_config.json',
-  'Xenova/mobilebert-uncased-mnli/onnx/model_quantized.onnx',
   // The bundled cross-encoder. ms-marco replaced bge-reranker-base on
   // 2026-09-04: bge measured WORSE than no reranker at all (MRR 0.7558 against
   // a 0.8368 baseline) while costing 283MB, where ms-marco is +0.0320 at 24MB
@@ -63,10 +59,14 @@ const REQUIRED_ASARUNPACK_GLOBS = [
   '**/node_modules/@huggingface/transformers/**',
   '**/node_modules/onnxruntime-common/**',
   '**/node_modules/onnxruntime-node/**',
-  '**/intentClassifierWorker.js',
   '**/localEmbeddingWorker.js',
   '**/localRerankerWorker.js',
   '**/whisperWorker.js',
+  // 2026-09-05: the interaction router's ONNX worker. RouterModel rewrites
+  // app.asar to app.asar.unpacked when it resolves this path, and without the
+  // glob that rewrite points at a file that was never unpacked. It fails only
+  // in a packaged build, and only when the flag is on.
+  '**/routerWorker.js',
   '**/node_modules/better-sqlite3/**',
   '**/node_modules/keytar/**',
   '**/node_modules/sqlite-vec/**',
@@ -88,10 +88,10 @@ const REQUIRED_ASARUNPACK_GLOBS = [
 
 // Required built worker scripts (only checked after build:electron has run).
 const REQUIRED_WORKER_FILES = [
-  'dist-electron/electron/llm/intentClassifierWorker.js',
   'dist-electron/electron/rag/providers/localEmbeddingWorker.js',
   'dist-electron/electron/rag/localRerankerWorker.js',
   'dist-electron/electron/audio/whisper/whisperWorker.js',
+  'dist-electron/electron/llm/routing/routerWorker.js',
 ];
 
 // Required native binaries for the packaged app (the asarUnpack globs must place
