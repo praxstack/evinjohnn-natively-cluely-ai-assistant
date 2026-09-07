@@ -88,7 +88,48 @@ export interface Classification {
   reason: string;
 }
 
-const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+// STT fillers and stutters are stripped BEFORE any rule sees the question
+// (2026-09-07, measured in a 1,000-turn live campaign): "What is erm the erm
+// basically period for churn pct?" went GENERAL_TECHNICAL → FAST while the clean
+// "What is the period for churn pct?" was a document lookup, because the
+// definite-value patterns look for "what is the <noun>". Live transcripts
+// arrive like this on every turn. Only unambiguous fillers are removed ("like",
+// "so", "right" are real words too); an immediately repeated word ("the the",
+// "5 5") collapses to one.
+const FILLER_RE = /\b(?:um+|uh+|uhm|erm+|hmm+|hm+|arh+|ah+|er+|basically|you know|i mean)\b[,]?\s*/g;
+const STUTTER_RE = /\b(\w+)(?:\s+\1\b)+/g;
+// "right", "okay", "so", "like", "you know" are real words, so they are only
+// fillers when WEDGED between a function word and what it governs: "what is
+// right the annual discount pct", "for okay so proposal, what is the acv"
+// (2026-09-08, measured: the first went FAST and the sales persona invented a
+// 20 percent discount over a file that says 12).
+const MID_FILLER_RE = /\b(is|are|was|were|what|which|how|does|did|do|for|about|of|in|on|to|the)\s+(?:(?:right|okay|ok|so|like|you know|i mean)[,\s]+)+(?=[a-z0-9$])/gi;
+// Transcriber spellings of things people SAY as letters or symbols
+// (2026-09-08, measured): "queue two 2026" for Q2 2026, "p ninety five" for
+// p95, "n d c g" for nDCG. The files hold the written form; the model was told
+// "queue two" is not a term in any file. Canonicalised once, here.
+type SttReplacer = string | ((match: string, ...groups: string[]) => string);
+const QUARTER_WORDS: Record<string, string> = { one: '1', two: '2', three: '3', four: '4' };
+const STT_CANON: ReadonlyArray<[RegExp, SttReplacer]> = [
+  [/\bqueue\s+(one|two|three|four|1|2|3|4)\b/gi, (_m: string, n: string) => 'Q' + (QUARTER_WORDS[n.toLowerCase()] ?? n)],
+  [/\bp\s+(?:fifty|50)\b/gi, 'p50'], [/\bp\s+(?:ninety\s+five|95)\b/gi, 'p95'], [/\bp\s+(?:ninety\s+nine|99)\b/gi, 'p99'], [/\bp\s+(?:ninety|90)\b/gi, 'p90'],
+  [/\bn\s+d\s+c\s+g\b/gi, 'nDCG'], [/\bm\s+r\s+r\b/gi, 'MRR'], [/\bs\s+l\s+a\b/gi, 'SLA'], [/\ba\s+p\s+i\b/gi, 'API'], [/\ba\s+r\s+r\b/gi, 'ARR'],
+  [/\bg\s+p\s+u\b/gi, 'GPU'], [/\bo\s+k\s+r\b/gi, 'OKR'], [/\bs\s+o\s+w\b/gi, 'SOW'], [/\bj\s+d\b/gi, 'JD'], [/\bbat\s+na\b/gi, 'BATNA'], [/\bL\s+([3-7])\b/g, 'L$1'],
+];
+export const canonicalizeSttSpellings = (s: string): string => {
+  let out = s;
+  for (const [re, rep] of STT_CANON) out = typeof rep === 'string' ? out.replace(re, rep) : out.replace(re, rep);
+  return out;
+};
+export const normalizeSttQuestion = (s: string): string =>
+  canonicalizeSttSpellings(s).toLowerCase().replace(FILLER_RE, ' ').replace(MID_FILLER_RE, '$1 ').replace(STUTTER_RE, '$1').replace(/\s+([,.?!])/g, '$1').replace(/\s+/g, ' ').trim();
+/** Case-preserving variant for the question the model and the retriever see:
+ *  "What is arh the discount pct?" reached the model verbatim and it answered
+ *  about an "ARH percentage"; "what is arh so due for" became an "ARIS chart".
+ *  Fillers are noise from the transcriber, never content. */
+export const stripSttFillers = (s: string): string =>
+  canonicalizeSttSpellings(s).replace(new RegExp(FILLER_RE.source, 'gi'), ' ').replace(new RegExp(MID_FILLER_RE.source, 'gi'), '$1 ').replace(new RegExp(STUTTER_RE.source, 'gi'), '$1').replace(/\s+([,.?!])/g, '$1').replace(/\s+/g, ' ').trim();
+const norm = (s: string) => normalizeSttQuestion(s);
 
 // ── signals ─────────────────────────────────────────────────────────────────
 // Second person addressed to the candidate ("your project"), or explicit
@@ -986,8 +1027,16 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
   // conceptual sent it to the FAST path and the model invented the weight.
   // `of/behind/between/to-verb` complements remain conceptual ("the goal of
   // dependency injection", "the difference between TCP and UDP").
+  // `to` counts as a conceptual complement only before a VERB ("the best way to
+  // learn", "the fastest way to scale it"). A compound noun that happens to
+  // contain "to" — "the free to paid conversion", "the end to end latency",
+  // "the peer to peer sync" — is a value lookup (2026-09-08, measured in a
+  // 1,000-turn live campaign: "What is the free to paid conversion?" went FAST
+  // with the metrics file attached and shipped a textbook definition).
   const conceptComplement =
-    /\bthe (?:[\w-]+ ){0,3}[\w-]+ (?:of|behind|between|to [a-z])/.test(q);
+    /\bthe (?:[\w-]+ ){0,3}[\w-]+ (?:of|behind|between)\b/.test(q)
+    || /\bthe (?:[\w-]+ ){0,3}[\w-]+ to (?:a|an|the|my|your|our|their|his|her|someone|anyone|everyone|people|users|customers|me|us|you|them|him|it)\b/.test(q)
+    || /\bthe (?:[\w-]+ ){0,3}[\w-]+ to (?:learn|scale|build|handle|improve|reduce|avoid|achieve|get|make|use|write|run|test|deploy|debug|fix|do|solve|design|implement|measure|manage|start|stop|prevent|migrate|convert|choose|decide|explain|compare|optimi[sz]e|approach|structure|set|configure|ship|grow|hire|sell|pitch|negotiate|answer|respond|deal|say|tell|think|know|find|keep|become|be|go|have|reach|win|close|open|store|cache|index|retrieve|rank|train|evaluate|describe|present|introduce|prepare|estimate|price|discount)\b/.test(q);
   // Grounding a definite lookup only makes sense where documents can hold the
   // value: document-first modes always qualify; an OPEN_KNOWLEDGE mode
   // qualifies only when this turn actually has documents (attachments or a
@@ -1047,6 +1096,16 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
   // "this problem" stays coding self-talk unless an attached file is named.
   if (modeHoldsDocuments && !isBareFollowUp(q)
       && (mentionsAttachedFile(q, input.attachedFileNames) || DOC_DEIXIS_RE.test(q) || namesTitledTask(q))) {
+    types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT');
+  }
+  // A REMINDER is a lookup in the material, whatever words it contains
+  // (2026-09-08, measured): "Remind me, failures 1 error, what was it?" went
+  // GENERAL_TECHNICAL because "error" is tech self-talk, retrieval never ran,
+  // and the model invented a test failure. "Remind me …", "… what was it
+  // (again)?", "… again?" ask for something ALREADY recorded — with documents
+  // attached that is the documents, and the evidence gate keeps the last word.
+  const reminderAsk = /^(?:(?:so|okay|ok|and|right|um|uh)[,\s]+)*remind (?:me|us)\b|\bwhat (?:was|is) (?:it|that|the \w+(?: \w+){0,3}) again\b|\bwhat was (?:it|that)\s*\??$/i.test(q);
+  if (modeHoldsDocuments && reminderAsk && !isBareFollowUp(q)) {
     types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT');
   }
   // An exhaustive request over the material (2026-09-07). "Find every place a
