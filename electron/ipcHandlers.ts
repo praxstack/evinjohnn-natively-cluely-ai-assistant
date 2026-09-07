@@ -784,13 +784,50 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Overlay renderer → main: the panel's LIVE right edge (px from the overlay
   // window's left edge), streamed during the width spring so the toggle aux
   // window rides the panel's top-right corner. Only the overlay may send.
-  safeHandle('overlay-toggle-anchor', async (event, payload: { panelRight?: number }) => {
-    const overlayWin = appState.getWindowHelper().getOverlayWindow();
-    if (!overlayWin || overlayWin.isDestroyed()) return;
-    if (overlayWin.webContents.id !== event.sender.id) return;
-    if (typeof payload?.panelRight !== 'number') return;
-    appState.getWindowHelper().setOverlayToggleAnchor(payload.panelRight);
-  });
+  // Overlay renderer → main: the smooth-resize envelope. 'begin' grows the
+  // window (origin fixed) so the drag renders in CSS with no native resizes;
+  // 'end' fits the result — or returns to the pre-drag size for a click.
+  // Resolves with the size actually applied. Only the overlay may drive it.
+  safeHandle(
+    'overlay-resize-envelope',
+    async (
+      event,
+      payload:
+        | { phase: 'begin'; drag?: { direction: string; startWidth: number; startHeight: number; minWidth: number; minHeight: number; panelLeft: number } }
+        | { phase: 'end'; final?: { width: number; height: number } },
+    ) => {
+      const helper = appState.getWindowHelper();
+      const overlayWin = helper.getOverlayWindow();
+      if (!overlayWin || overlayWin.isDestroyed()) return undefined;
+      if (overlayWin.webContents.id !== event.sender.id) return undefined;
+      if (payload?.phase === 'begin') return helper.beginOverlayResizeEnvelope(payload.drag);
+      if (payload?.phase === 'end') {
+        const f = payload.final;
+        const final =
+          f && Number.isFinite(f.width) && Number.isFinite(f.height) && f.width > 0 && f.height > 0
+            ? { width: Math.round(f.width), height: Math.round(f.height) }
+            : undefined;
+        return helper.endOverlayResizeEnvelope(final);
+      }
+      return undefined;
+    },
+  );
+
+  safeHandle(
+    'overlay-toggle-anchor',
+    async (event, payload: { panelRight?: number; panelLeft?: number }) => {
+      const overlayWin = appState.getWindowHelper().getOverlayWindow();
+      if (!overlayWin || overlayWin.isDestroyed()) return;
+      if (overlayWin.webContents.id !== event.sender.id) return;
+      if (typeof payload?.panelRight !== 'number') return;
+      appState
+        .getWindowHelper()
+        .setOverlayToggleAnchor(
+          payload.panelRight,
+          typeof payload.panelLeft === 'number' ? payload.panelLeft : undefined,
+        );
+    },
+  );
 
   // Overlay renderer → main: hover hit-test result — false while the pointer
   // is over the fixed window's transparent side margins (collapsed state), so
@@ -11140,6 +11177,22 @@ export function initializeIpcHandlers(appState: AppState): void {
                 {
                   model: candidate,
                   messages: [{ role: 'user', content: 'Hello' }],
+                  // Groq enforces output-tokens-per-minute, and with no cap it
+                  // reserves the MODEL's full completion budget up front: on the
+                  // on_demand tier that is 1113 expected output tokens against a
+                  // 1000 OTPM limit, so the test 413s before it ever reaches the
+                  // key — reported to the user as a failed connection.
+                  // Success here is only `status === 200`; the body is never
+                  // read, so ten tokens proves exactly as much as a thousand.
+                  // Matches the Claude and DeepSeek legs, which already cap at 10.
+                  //
+                  // A cap, NOT `reasoning_effort: 'none'`, even though the
+                  // preferred rung is a reasoning model that will spend these ten
+                  // tokens thinking: that param is HTTP 400 on openai/gpt-oss-120b
+                  // ("must be one of low, medium, high"), which is further down
+                  // this same ladder, and a 400 is not `isGroqModelGone`, so the
+                  // walk would stop dead on it.
+                  max_tokens: 10,
                 },
                 {
                   headers: { Authorization: `Bearer ${apiKey}` },
