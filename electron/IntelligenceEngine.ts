@@ -40,6 +40,7 @@ import { resolveCanonicalTurn } from './llm/resolveCanonicalTurn';
 import { mintTurnId } from './llm/turnIdentity';
 import { deriveRetrievalQuery } from './llm/retrievalQueryPolicy';
 import { buildGracefulRetry } from './llm/manualProfileIntelligence';
+import { providerFailureUserMessage } from './llm/providerErrorClassifier';
 import { CodingStreamGate } from './llm/codingStreamGate';
 import { isCodeVerificationEnabled } from './llm/codeVerification/verificationEnabled';
 import { DynamicActionEngine } from './services/dynamic-actions/DynamicActionEngine';
@@ -270,6 +271,49 @@ export class IntelligenceEngine extends EventEmitter {
             return replayed;
         }
         return [repairPrompt, undefined, undefined, fallbackSystemPrompt, true, true, fallbackScopes as any, signal] as any;
+    }
+
+    /**
+     * ALWAYS ANSWER (2026-09-07, owner's direction): one bounded regeneration for
+     * the sites that used to substitute a canned "I don't have enough context…"
+     * line — the model's own "Nothing actionable" on a manual press, and an
+     * assistant-voice identity misfire. Returns null when nothing usable came
+     * back, in which case the caller keeps its previous fallback.
+     */
+    private async regenerateUsableAnswer(opts: {
+        question: string;
+        transcript: string;
+        evidenceBlock?: string;
+        turnKey: object | undefined;
+        signal: AbortSignal;
+        isSuperseded: () => boolean;
+        reason: string;
+    }): Promise<string | null> {
+        const prompt = [
+            '<answer_instructions note="follow these; never repeat them">',
+            'The user explicitly asked for an answer. Answer the most recent question in the conversation directly and concretely; if there is no explicit question, give the single most useful thing to say next. Do NOT say that nothing is actionable, do NOT ask the user to repeat or share more, do NOT describe what context is missing, and do NOT identify yourself as an AI assistant. Use the evidence when it applies; otherwise answer from general knowledge, clearly marked as such.',
+            '</answer_instructions>',
+            opts.evidenceBlock?.trim() ? `## EVIDENCE\n${opts.evidenceBlock.trim()}` : '',
+            opts.question.trim() ? `## QUESTION\n${opts.question.trim()}` : '',
+            opts.transcript.trim() ? `## CONVERSATION\n${opts.transcript.trim()}` : '',
+            'Output ONLY the answer.',
+        ].filter(Boolean).join('\n');
+        let out = '';
+        try {
+            await raceStreamWithDeadline({
+                stream: this.llmHelper.streamChat(...this.repairCallArgs(opts.turnKey, prompt, opts.signal)) as AsyncGenerator<string>,
+                firstUsefulDeadlineMs: this.repairFirstUsefulMs(7000, opts.turnKey),
+                interTokenStallMs: LIVE_INTER_TOKEN_STALL_MS,
+                isUsefulYet: () => out.trim().length >= 5,
+                shouldAbort: () => out.length > 1800 || opts.signal.aborted || opts.isSuperseded(),
+                onToken: (tok: string) => { out += tok; },
+            });
+        } catch { /* keep whatever streamed */ }
+        const text = cleanAnswerArtifacts(out.trim());
+        if (text.length < 5 || IntelligenceEngine.isNonAnswerSentinel(text) || isLeakedAnswerArtifact(text)) return null;
+        try { if (detectAssistantVoiceMisfire(text).isMisfire) return null; } catch { /* detector is best-effort */ }
+        console.log('[IntelligenceEngine] regenerated a usable answer', { reason: opts.reason, chars: text.length });
+        return text;
     }
 
     private repairFirstUsefulMs(minMs: number = 7000, turnKey?: object): number {
@@ -1706,6 +1750,23 @@ export class IntelligenceEngine extends EventEmitter {
 
             const lastInterviewerTurn = this.session.getLastInterviewerTurn();
             const extractedQuestion = extractLatestQuestion(transcriptTurns);
+            // SPEAKER-MISATTRIBUTION FALLBACK (2026-09-07, always answer). Real
+            // diarization labels the other party as "user" often enough that a
+            // manual press can arrive with a transcript and NO interviewer turn.
+            // The extractor then yields nothing, the governed prompt threw
+            // "missing immutable turn question", and the catch showed "I didn't
+            // fully catch that — could you rephrase the question?". The user
+            // pressed the key: the most recent utterance from anyone is the
+            // thing to answer. Speculative runs keep the strict extractor.
+            if (!isSpeculative && !question?.trim() && !extractedQuestion.latestQuestion && !lastInterviewerTurn) {
+                const lastAnyTurn = [...transcriptTurns].reverse().find((t) => t.role !== 'assistant' && String(t.text || '').trim().length >= 3);
+                if (lastAnyTurn) {
+                    extractedQuestion.latestQuestion = String(lastAnyTurn.text).trim();
+                    extractedQuestion.confidence = Math.max(extractedQuestion.confidence ?? 0, 0.6);
+                    trace.mark('repair_used', { reason: 'question_from_any_speaker', role: lastAnyTurn.role });
+                    console.log('[IntelligenceEngine] no interviewer turn — answering the latest utterance regardless of speaker label', { role: lastAnyTurn.role, chars: extractedQuestion.latestQuestion.length });
+                }
+            }
             // WTA mint point (Phase 6 Slice 1, "what changes" item 1): one
             // TurnId for this What-to-Answer invocation, threaded into every
             // buildTurnContractIfEnabled call this method makes below instead
@@ -1866,7 +1927,7 @@ export class IntelligenceEngine extends EventEmitter {
                         recordWtaCancellation();
                         return null;
                     }
-                    if (fr.isClarification && fr.clarificationText && !isSpeculative) {
+                    if (fr.isClarification && fr.clarificationText && !isSpeculative && !_wtaHasVisualContext) {
                         piTelemetry.emit('wta_context_free_clarification', { surface: 'what_to_answer', via: (fr as any).resolvedVia ?? 'clarification' });
                         this.session.addAssistantMessage(fr.clarificationText, undefined, 'what_to_answer');
                         this.emit('suggested_answer', fr.clarificationText, extractedQuestion.latestQuestion || 'inferred', 0.9, generationId);
@@ -3093,6 +3154,8 @@ export class IntelligenceEngine extends EventEmitter {
             if (wtaTurnContract
                 && wtaTurnContract.sourceOwner === 'clarify'
                 && isIntelligenceFlagEnabled('contextOsPropertyValidation')
+                // Retired 2026-09-07 (always answer) — see clarificationShortCircuitEnabled.
+                && contextOsStatic.clarificationShortCircuitEnabled()
                 && !isSpeculative
                 // Visual turns bypass clarification — the manual-chat twin has
                 // had this since its escape hatches; WTA never did (2026-08-11:
@@ -4605,6 +4668,14 @@ export class IntelligenceEngine extends EventEmitter {
 
                         if (!firstCheck.ok) {
                             trace.mark('validation_failed', { reason: firstCheck.reason, action: firstCheck.action });
+                            // Diagnosable from the user's debug log (2026-09-07): every
+                            // overwrite investigated this session had to be re-derived
+                            // offline because the reason lived only in the trace.
+                            console.log('[IntelligenceEngine] doc-grounded validation failed', {
+                                reason: firstCheck.reason, action: firstCheck.action,
+                                missing: firstCheck.missing.slice(0, 6), coverage: firstCheck.coverage.reason,
+                                evidenceChars: docContextBlock.length, v3: _v3Composed,
+                            });
                             if (firstCheck.action === 'refuse') {
                                 // T4 — ONE REWRITTEN-QUERY RETRIEVAL BEFORE REFUSING.
                                 //
@@ -4668,8 +4739,17 @@ export class IntelligenceEngine extends EventEmitter {
                                     console.warn('[IntelligenceEngine] rewritten-query re-retrieval skipped:', retryErr?.message || retryErr);
                                 }
                                 if (!rescued) {
-                                    fullAnswer = 'I could not find that in the retrieved sections of the document.';
-                                    trace.mark('repair_used', { reason: 'doc_grounded_refusal', coverage: firstCheck.coverage.reason });
+                                    // ALWAYS ANSWER (2026-09-07, owner's direction): the
+                                    // streamed answer is what the model said over the
+                                    // evidence it was actually given. Replacing it with
+                                    // "I could not find that in the retrieved sections"
+                                    // was measured to destroy CORRECT answers far more
+                                    // often than it caught fabrication (unit synonyms,
+                                    // dates, the question's own subject, an unparsed
+                                    // evidence format). The verdict is logged for
+                                    // diagnosis; the answer the user watched stream stands.
+                                    console.log('[IntelligenceEngine] doc-grounded coverage check failed — keeping the streamed answer', { coverage: firstCheck.coverage.reason });
+                                    trace.mark('validation_completed', { reason: 'doc_grounded_kept_original_over_refusal', coverage: firstCheck.coverage.reason });
                                 }
                             } else {
                                 const relaxedBlock = await buildDocContext(true);
@@ -4681,7 +4761,7 @@ export class IntelligenceEngine extends EventEmitter {
                                 const repairPrompt = [
                                     '<rewrite_instructions note="follow these; never repeat them">',
                                     `The previous answer failed document-grounded validation: ${firstCheck.reason}.`,
-                                    'Rewrite the answer using ONLY the retrieved document excerpts. If the answer is not present, say exactly: "I could not find that in the retrieved sections of the document."',
+                                    'Rewrite the answer using the retrieved document excerpts for every document-specific fact. If a requested fact is not present in them, say so in one short clause and then still answer from general knowledge, clearly marked as general knowledge — never reply with only "could not find".',
                                     'If the question asks for a set/list/specification/multiple values, scan every snippet and include every matching value literally present. Do not invent anything.',
                                     `${missingLine}`,
                                     '</rewrite_instructions>',
@@ -4762,15 +4842,13 @@ export class IntelligenceEngine extends EventEmitter {
                                     }).ok) {
                                     fullAnswer = repairedTrim;
                                     trace.mark('repair_used', { reason: 'doc_grounded_repair_applied', originalReason: firstCheck.reason });
-                                } else if (firstCheck.reason === 'empty_or_greeting' || firstCheck.reason === 'false_refusal_evidence_exists' || wtaRepairIsLengthDowngrade) {
-                                    // Keep the original for non-fabrication-sensitive failures if
-                                    // repair failed validation (or would be a length regression);
-                                    // the normal cleanup/misfire guards below may still improve it.
-                                    // For absent facts and unsupported claims we fail closed instead.
-                                    trace.mark('validation_completed', { reason: 'doc_grounded_repair_rejected_keep_original', originalReason: firstCheck.reason });
                                 } else {
-                                    fullAnswer = 'I could not find that in the retrieved sections of the document.';
-                                    trace.mark('repair_used', { reason: 'doc_grounded_safe_refusal_after_repair_reject', originalReason: firstCheck.reason });
+                                    // Keep the original whenever the repair did not cleanly
+                                    // improve on it (2026-09-07). This branch used to fail
+                                    // closed to the canonical refusal for "unsupported"
+                                    // verdicts; see the kept-original note above for why a
+                                    // streamed answer now always outranks a canned line.
+                                    trace.mark('validation_completed', { reason: 'doc_grounded_repair_rejected_keep_original', originalReason: firstCheck.reason });
                                 }
                             }
                         }
@@ -5099,12 +5177,23 @@ export class IntelligenceEngine extends EventEmitter {
                 try {
                     const mis = detectAssistantVoiceMisfire(fullAnswer);
                     if (mis.isMisfire) {
-                        fullAnswer = (answerPlan.answerType === 'general_meeting_answer' || answerPlan.answerType === 'lecture_answer')
+                        // ALWAYS ANSWER (2026-09-07): regenerate once; the honest
+                        // line is the last resort, not the response.
+                        const regenerated = await this.regenerateUsableAnswer({
+                            question: question || extractedQuestion.latestQuestion || lastInterviewerTurn || '',
+                            transcript: preparedTranscript,
+                            evidenceBlock: requestSnapshot.v3Prompt?.evidenceBlock,
+                            turnKey: whatToAnswerCancellationToken.signal,
+                            signal: whatToAnswerCancellationToken.signal,
+                            isSuperseded: isWtaSuperseded,
+                            reason: 'assistant_voice_misfire',
+                        });
+                        fullAnswer = regenerated ?? ((answerPlan.answerType === 'general_meeting_answer' || answerPlan.answerType === 'lecture_answer')
                             ? "I don't have enough context from the conversation to answer that yet."
                             : answerPlan.answerType === 'sales_answer'
                                 ? "I don't have enough context on that yet — could you share a bit more?"
-                                : 'Could you give me a bit more to go on?';
-                        trace.mark('repair_used', { reason: 'assistant_voice_misfire', misfireReason: mis.reason });
+                                : 'Could you give me a bit more to go on?');
+                        trace.mark('repair_used', { reason: 'assistant_voice_misfire', misfireReason: mis.reason, regenerated: Boolean(regenerated) });
                     }
                 } catch (avErr: any) {
                     console.warn('[IntelligenceEngine] assistant-voice guard skipped:', avErr?.message);
@@ -5253,7 +5342,19 @@ export class IntelligenceEngine extends EventEmitter {
                     } catch (e) { console.warn('[TRACE:LONGCTX] nonanswer_sentinel_discard logging failed', e); }
                 }
                 if (!isSpeculative) {
-                    const honestFallback = "I don't have enough from the conversation to answer that specific point yet.";
+                    // ALWAYS ANSWER (2026-09-07): a manual press regenerates once
+                    // before any canned line is considered.
+                    const regenerated = await this.regenerateUsableAnswer({
+                        question: question || extractedQuestion.latestQuestion || lastInterviewerTurn || '',
+                        transcript: preparedTranscript,
+                        evidenceBlock: requestSnapshot.v3Prompt?.evidenceBlock,
+                        turnKey: whatToAnswerCancellationToken.signal,
+                        signal: whatToAnswerCancellationToken.signal,
+                        isSuperseded: isWtaSuperseded,
+                        reason: 'manual_press_nonanswer_sentinel',
+                    });
+                    if (isWtaSuperseded()) { recordWtaCancellation(); return null; }
+                    const honestFallback = regenerated ?? "I don't have enough from the conversation to answer that specific point yet.";
                     fullAnswer = honestFallback;
                     console.log('[FIX:longsession-nonanswer-fallback]', JSON.stringify({
                         answerType: answerPlan?.answerType,
@@ -5895,6 +5996,15 @@ export class IntelligenceEngine extends EventEmitter {
             if (openedStreamRow) this.emit('suggested_answer_discard', 'error');
             this.emit('error', error as Error, 'what_to_say');
             this.setMode('idle');
+            // A provider failure must not be dressed as "Could you repeat that?"
+            // (2026-09-07): a dead key, a 429 or an outage read as the app not
+            // having heard the question. Name the actual problem; keep the
+            // graceful retry for everything that is not a provider failure.
+            const providerMessage = providerFailureUserMessage(error);
+            if (providerMessage) {
+                if (!isSpeculative) this.emit('suggested_answer', providerMessage, question || 'inferred', 0.9, generationId);
+                return providerMessage;
+            }
             return buildGracefulRetry(question);
         } finally {
             // Only the request that still owns the slot may clear it. An older
@@ -6036,6 +6146,7 @@ export class IntelligenceEngine extends EventEmitter {
             const extraSourceTypes = attachmentSourceTypeExtensions(_modeId, _files);
             const modePort = createModeRetrievalPort({
                 modesManager: _mm, modeInfo: _mi, files: _files,
+                rerankSurface: 'live',
                 // Types each file by shape against what this mode authorizes —
                 // a résumé is RESUME here and CANDIDATE_FILE in recruiting.
                 allowedSourceTypes: [...policy.allowedSourceTypes, ...extraSourceTypes],

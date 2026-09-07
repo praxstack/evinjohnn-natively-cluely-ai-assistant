@@ -7073,7 +7073,10 @@ let isMultimodal = !!(imagePaths?.length);
           const { isIntelligenceFlagEnabled: _isFlagOn } = require('./intelligence/intelligenceFlags');
           if (_cogEarly && _cogEarly.govern && forceDocumentGrounding && _isFlagOn('contextOsEvidencePackEnabled')) {
             governedEvidenceResolutionStarted = true;
-            governedTurnQuestion = _cogEarly.turnQuestion?.trim() || null;
+            // The user's message is the turn question when the governance
+            // context carries none (2026-09-07): this used to throw, and the
+            // throw surfaced as "could you rephrase the question?".
+            governedTurnQuestion = _cogEarly.turnQuestion?.trim() || String(message || '').trim() || null;
             markH4Stage('resolver_enter', { hasTurnQuestion: Boolean(governedTurnQuestion) });
             if (!governedTurnQuestion) throw new Error('governed turn missing immutable turn question');
             if (_cogEarly.evidencePack) {
@@ -7628,7 +7631,8 @@ let isMultimodal = !!(imagePaths?.length);
       const referent = callerSuppliedContextForPriorResolution
         ? `\n\n## RECENT CONVERSATION (for pronoun resolution only — not a source of facts)\n${callerSuppliedContextForPriorResolution}`
         : '';
-      const governedQuestion = (routeOptions?.contextOsGeneration as import('./intelligence/context-os').ContextOsGenerationContext | undefined)?.turnQuestion?.trim();
+      const governedQuestion = (routeOptions?.contextOsGeneration as import('./intelligence/context-os').ContextOsGenerationContext | undefined)?.turnQuestion?.trim()
+        || String(message || '').trim();
       if (!governedQuestion) throw new Error('governed prompt missing immutable turn question');
       userContent = `QUESTION: ${governedQuestion}\n\n${contextOsGoverningBlock}${referent}\n\nNow answer this question using ONLY the evidence_pack above: ${governedQuestion}`;
       void contextOsGovernedPack; // referenced for clarity; pack surfaced via _cog
@@ -7842,7 +7846,24 @@ let isMultimodal = !!(imagePaths?.length);
     _stage(`provider dispatch START (sysPrompt=${finalSystemPrompt.length}c, userContent=${userContent.length}c, model=${this.currentModelId})`);
 
     if (!this.useOllama && !this.customProvider && !this.activeCurlProvider && this.isAntigravityModel(this.currentModelId)) {
-      yield* this.streamWithAntigravity(userContent, finalSystemPrompt, imagePaths, abortSignal);
+      // Selected-provider text turn (2026-09-07): this was the one remaining
+      // bare terminal rung. Measured on the live What-To-Answer path with
+      // Antigravity selected: intermittent stalls past the 8s first-token
+      // deadline ("AntigravityError: Google request cancelled"), a
+      // regeneration on the SAME stalled provider, and the user shown "I don't
+      // have enough context from the conversation to answer that yet" /
+      // "The model did not produce an answer in time" — a provider stall
+      // dressed as a missing-context refusal. The engine gives it a spare rung
+      // when one is keyed, or a parallel retry when none is; an image turn
+      // gets neither (the spares are text-only). streamWithAntigravity keeps
+      // its own local-only throw and assertOutboundScopes, so the rung is no
+      // wider a data path than before.
+      yield* this.streamSelectedProviderWithFailover({
+        id: 'antigravity', name: 'Google Antigravity',
+        open: (sig) => this.streamWithAntigravity(userContent, finalSystemPrompt, imagePaths, sig),
+        userContent, finalSystemPrompt, thinkingBudget, abortSignal,
+        hasImages: Boolean(imagePaths?.length),
+      });
       return;
     }
 

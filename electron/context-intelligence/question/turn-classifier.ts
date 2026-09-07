@@ -66,6 +66,9 @@ export interface Classification {
   path: RetrievalPath;
   shouldRetrieve: boolean;
   requiredSourceTypes: SourceType[];
+  /** The question asks for EVERY occurrence across the material — see
+   *  RetrievalPlan.exhaustive. */
+  exhaustive: boolean;
   /**
    * The question needs a source the ACTIVE MODE does not authorize.
    *
@@ -174,7 +177,11 @@ const PERSONAL_RE = /\b(your|your own|you have|have you|did you|do you|tell me a
 // you build a rate limiter?", "how do you test this?") and must keep their
 // general-knowledge route. The distinction is grammatical rather than a keyword
 // list, so it does not need maintaining as vocabulary drifts.
-const SECOND_PERSON_PAST_RE = /\byou (?:built|owned|designed|led|created|developed|implemented|shipped|wrote|architected|ran|managed|handled|delivered|deployed|migrated|debugged|tested|monitored|scaled|refactored|chose|picked|solved|fixed|added|removed|introduced|maintained|supported|integrated|automated|configured|launched|rolled out|worked on)\b/;
+// got/achieved/reached/hit/measured/reduced/improved/cut/saw/used added
+// 2026-09-07: "what was the latency you got on the FastAPI backend" carried
+// no second-person cue at all and planned document pools only, so the fact —
+// which lived in the profile résumé — was never retrieved.
+const SECOND_PERSON_PAST_RE = /\byou (?:built|owned|designed|led|created|developed|implemented|shipped|wrote|architected|ran|managed|handled|delivered|deployed|migrated|debugged|tested|monitored|scaled|refactored|chose|picked|solved|fixed|added|removed|introduced|maintained|supported|integrated|automated|configured|launched|rolled out|worked on|got|achieved|reached|hit|measured|reduced|improved|increased|cut|saw|used|optimi[sz]ed|did|done|dealt with|faced|encountered|experienced|troubleshot|investigated|diagnosed|resolved|contributed|participated|helped|spent|took|joined)\b/;
 // FIRST person is personal too (2026-07-31): manual chat is the USER asking
 // about THEMSELF — "Do I have Kubernetes experience?", "Which required
 // languages do I not list?" — and a second/third-person-only pattern classified
@@ -551,10 +558,24 @@ const RESPONSE_REQUEST_RE =
 // happens to pre-lower before calling while the orchestrator passes the raw
 // resolved question. The first external caller silently never matched "Why?" —
 // capital W — so the referent cap it guarded was dead on arrival.
+// Content-free imperative fragments (2026-09-07, always-answer): "explain",
+// "walk me through it", "elaborate", "summarize that". Measured: "explain" with
+// two files attached took GENERAL_TECH_RE ("explain") → GENERAL_TECHNICAL →
+// FAST → no retrieval, and "walk me through it" → AMBIGUOUS with retrieval
+// off; both surfaces then asked "what would you like me to explain?". A
+// fragment whose whole text is such a verb phrase has no subject of its own —
+// it is a follow-up, and the orchestrator lends it the attachments as subject.
+// Imperative generative asks are not lookups (2026-09-07 fragment rule).
+const GENERATIVE_ASK_RE = /^(?:please\s+)?(?:write|draft|generate|compose|create|make|craft|prepare|suggest|brainstorm|come up with|give me (?:a|an|some|three|five|\d+)|propose|outline|rewrite|rephrase|translate|improve|polish|shorten|expand on)\b/;
+
+const BARE_VERB_FRAGMENT_RE =
+  /^(?:(?:please|ok(?:ay)?|so|and|just),?\s+)*(?:explain|elaborate|expand|continue|go on|keep going|say more|more|tell me more|(?:more|further) details?|details?|next|walk (?:me|us) through (?:it|that|this)|break (?:it|that|this) down|summari[sz]e(?: (?:it|that|this))?|clarify(?: (?:it|that|this))?|show me|(?:can|could) you (?:explain|elaborate|expand|clarify)(?: (?:it|that|this))?)(?:\s+(?:please|again))?$/;
+
 export const isBareFollowUp = (raw: string): boolean => {
   const q = String(raw).toLowerCase();
   if (RESPONSE_REQUEST_RE.test(q)) return true;
   if (isContinuationFragment(q)) return true;
+  if (BARE_VERB_FRAGMENT_RE.test(q.replace(/[?!.,]+$/, '').trim())) return true;
   return FOLLOW_UP_RE.test(q) && q.split(/\s+/).filter(Boolean).length <= FOLLOW_UP_MAX_WORDS;
 };
 
@@ -577,7 +598,7 @@ export const isResponseRequest = (raw: string): boolean => RESPONSE_REQUEST_RE.t
 const splitClauses = (q: string): string[] =>
   q.split(/\band\b|\balso\b|[;.]/).map((c) => c.trim()).filter(Boolean);
 
-function detectTypes(q: string, input: ClassificationInput): { types: QuestionType[]; claims: ClaimType[]; clauses: Partial<Record<ClaimType, string>> } {
+function detectTypes(q: string, input: ClassificationInput): { types: QuestionType[]; claims: ClaimType[]; clauses: Partial<Record<ClaimType, string>>; exhaustive: boolean } {
   const types = new Set<QuestionType>();
   const claims = new Set<ClaimType>();
   const clauses: Partial<Record<ClaimType, string>> = {};
@@ -726,8 +747,16 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
     // exact catch-all is what planned the résumé for a fan question. Whole-
     // question signal, because the artifact and the ask usually sit in
     // different clauses.
+    // The tech-self-talk veto must not fire on the very verb that made the
+    // clause second person (2026-09-07, measured with a teleprompter mode
+    // prompt): "Tell me about a real production failure you debugged" is a
+    // story ask about the candidate's history, but "debugged" matched
+    // TECH_SELF_TALK_RE and the clause went GENERAL_TECHNICAL → FAST, so the
+    // model denied a project the résumé states. Self-talk is FIRST-person
+    // ("why do I get a segfault"); a lexical second-person verb is the
+    // interviewer asking what YOU did, and the tech noun is its object.
     if (personal && !namedAnAspect && !deviceTroubleshoot
-        && !codingTask && !SYSTEM_DESIGN_RE.test(clause) && !TECH_SELF_TALK_RE.test(clause)) {
+        && !codingTask && !SYSTEM_DESIGN_RE.test(clause) && (!TECH_SELF_TALK_RE.test(clause) || secondPersonPast)) {
       types.add('PERSONAL_EXPERIENCE'); noteClaim('USER_EMPLOYMENT', clause);
     }
 
@@ -934,6 +963,7 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
   // (2026-08-02): both are questions no private source can improve, and both
   // were measured reaching the primary-source fallback — the fan question via
   // "what should I check" and the discount exercise via its own digits.
+  let exhaustive = false; // set by the exhaustive-request rule below (RetrievalPlan.exhaustive)
   const techTask = TECH_SELF_TALK_RE.test(q) || CODING_TASK_RE.test(q)
     || (Boolean(input.hasScreenContext) && SCREEN_CODE_ASK_RE.test(q)) || SYSTEM_DESIGN_RE.test(q)
     || deviceTroubleshoot || selfContainedMath;
@@ -999,6 +1029,37 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
       && /\b(threshold\w*|frequenc\w*|rates?|formulas?|calculat\w*|weights?|coefficients?|detect\w*)\b/.test(q)) {
     types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT');
   }
+  // ── Attached-document deixis (2026-09-07) ─────────────────────────────────
+  //
+  // The question NAMES an attached file, or points at a document with a
+  // definite article ("in the error log", "the array problem", "the
+  // postmortem", "the attached spec"), while documents are attached. Measured
+  // in technical-interview with tech_error_log.txt attached: "Which function
+  // threw the uncaught exception in the error log?" — TECH_SELF_TALK_RE
+  // ("error", "exception") made it GENERAL_TECHNICAL → FAST → no retrieval, and
+  // the app answered "I cannot answer that without seeing the log" about a log
+  // it had indexed; on the manual surface it invented a function name.
+  //
+  // Runs BEFORE the claimless-techTask branch so a document-deictic question is
+  // a document question first: retrieval is cheap and the evidence gate still
+  // has the last word, whereas skipping retrieval here is unrecoverable. The
+  // generic-noun list is deliberately document-shaped (log/spec/notes/…); bare
+  // "this problem" stays coding self-talk unless an attached file is named.
+  if (modeHoldsDocuments && !isBareFollowUp(q)
+      && (mentionsAttachedFile(q, input.attachedFileNames) || DOC_DEIXIS_RE.test(q) || namesTitledTask(q))) {
+    types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT');
+  }
+  // An exhaustive request over the material (2026-09-07). "Find every place a
+  // latency number appears" listed 8 of ~20 values live: the plan capped
+  // evidence at 6 chunks and the reranker pool at the user's 15. The flag is
+  // only meaningful when there is material to scan; the orchestrator widens
+  // the plan and the ports/composer widen with it.
+  exhaustive = modeHoldsDocuments && !isBareFollowUp(q) && EXHAUSTIVE_RE.test(q);
+  // "Give me every metric for reranker A and B" with documents attached IS a
+  // question about the documents even without a pointer word: an enumeration
+  // over "everything" has nothing to enumerate but the material. Retrieval is
+  // cheap and the evidence gate keeps the last word.
+  if (exhaustive) { types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT'); }
   // A technical/computational turn that produced NO claim at all is a
   // general-knowledge turn, and must SAY so (2026-08-02). Left claimless it
   // classified AMBIGUOUS → grounded-without-retrieval → answerability NONE,
@@ -1062,6 +1123,26 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
       }
     }
   }
+  // ── STT fragment lookup (2026-09-07, always-answer) ──────────────────────
+  //
+  // Live transcripts hand the engine fragments with no question word: "l four
+  // base", "rate per hour and and the cap", "the sev". In a mode holding
+  // documents those are lookups — measured: both classified GENERAL_TECHNICAL,
+  // took the FAST path with no retrieval, and the answer was a market-rate
+  // guess ("typically $130k–$170k") or "the material does not specify". A short
+  // claimless fragment that is not coding/design self-talk, not arithmetic and
+  // not a bare follow-up retrieves against the documents; the composer's
+  // absence framing still answers from general knowledge when nothing matches.
+  // Runs AFTER the primary-source fallback so an entity question keeps its
+  // résumé claim, and skips generative asks ("write a cover letter").
+  if (modeHoldsDocuments && claims.size === 0 && !isBareFollowUp(q) && !techTask
+      && !GENERATIVE_ASK_RE.test(q)
+      && q.split(/\s+/).filter(Boolean).length <= 8
+      && !CODING_TASK_RE.test(q) && !SYSTEM_DESIGN_RE.test(q) && !TECH_SELF_TALK_RE.test(q)
+      && !deviceTroubleshoot && !/\d\s*(?:\+|−|-|\*|×|\/|÷|%)\s*\d/.test(q)
+      && !META_REQUEST_RE.test(input.resolvedQuestion)) {
+    types.add('DOCUMENT_FACT'); noteWholeQ('DOCUMENT_FACT');
+  }
   // LAST-RESORT document claim (deep-run 2, issue 1): a question-shaped input
   // that STILL produced zero claims in a mode holding documents ("How does a
   // heartbeat failure get detected?") previously became AMBIGUOUS → zero
@@ -1078,7 +1159,7 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
   // and needs no retrieval. Returning early keeps prompt-shaped document text
   // out of the candidate pool entirely.
   if (META_REQUEST_RE.test(input.resolvedQuestion)) {
-    return { types: ['META_REQUEST'], claims: [], clauses: {} };
+    return { types: ['META_REQUEST'], claims: [], clauses: {}, exhaustive: false };
   }
 
   // LAST-RESORT general-knowledge claim (2026-08-02). Every claim branch above
@@ -1115,7 +1196,7 @@ function detectTypes(q: string, input: ClassificationInput): { types: QuestionTy
   if (hasPrivate && hasGeneral) types.add('MIXED');
 
   if (types.size === 0) types.add('AMBIGUOUS');
-  return { types: [...types], claims: [...claims], clauses };
+  return { types: [...types], claims: [...claims], clauses, exhaustive };
 }
 
 /** Capitalised tokens that are ordinary technical vocabulary, not references to
@@ -1248,9 +1329,79 @@ const claimToSource = (claim: ClaimType, hasDocuments: boolean): SourceType[] =>
 // at the résumé/JD claim those sides explicitly (deictic side-claims above).
 const DOCUMENT_FACT_RETRIEVAL_SOURCES: SourceType[] = ['REFERENCE_FILE', 'PROJECT_FILE', 'CODING_SAMPLE'];
 
+// Document nouns a definite/possessive determiner turns into a pointer at an
+// attached file. "problem"/"question"/"policy"/"contract" are NOT here on
+// purpose: "this problem" is coding self-talk and "your retry policy" is a
+// question about the user's practice, not a pointer at a document. An attached
+// problem statement, policy or contract is reached by NAME below.
+const DOC_DEIXIS_RE = /\b(?:the|this|that|my|our|your|attached|uploaded)\s+(?:[\w-]+\s+){0,2}(?:logs?|error\s+logs?|documents?|docs?|files?|notes|spec(?:ification)?s?|briefs?|reports?|post-?mortems?|checklists?|playbooks?|battlecards?|syllabus|syllabi|handbooks?|agendas?|sow|pdfs?|decks?|slides?|stack\s*traces?|readme|attachments?|write-?ups?|memos?)\b/i;
+
+const FILE_NAME_STOP = new Set(['the', 'and', 'for', 'with', 'from', 'copy', 'final', 'draft', 'new', 'old', 'sample', 'file', 'doc', 'docs', 'notes', 'tech', 'test', 'v1', 'v2', 'v3']);
+
+// A TITLED task ("the debounce problem", "the two-sum question", "the LRU
+// exercise") is a pointer at an attached question bank even though "problem"
+// and "question" are kept out of DOC_DEIXIS_RE: bare "this problem" is coding
+// self-talk, but a problem that has a NAME is one the user expects the app to
+// look up. Measured 2026-09-07: "Implement the debounce problem and explain…"
+// went FAST with 01_coding_questions.md attached (CODING-ANCHOR-009 was the
+// debounce problem) — right answer, wrong path. Generic modifiers are excluded
+// so "the same problem" / "the main question" stay self-talk.
+const TITLED_TASK_RE = /\b(?:the|this|that)\s+([a-z][\w-]{2,})\s+(?:problem|question|exercise|task|scenario|challenge|puzzle|kata|prompt)s?\b/gi;
+const TITLED_TASK_STOP = new Set([
+  'same', 'main', 'only', 'real', 'first', 'next', 'last', 'other', 'biggest', 'core', 'root', 'whole', 'key',
+  'hard', 'easy', 'new', 'old', 'second', 'third', 'coding', 'technical', 'interview', 'design', 'current',
+  'above', 'below', 'previous', 'following', 'original', 'actual', 'bigger', 'smaller', 'general', 'exact',
+  'specific', 'right', 'wrong', 'entire', 'full', 'simple', 'basic', 'harder', 'easier', 'typical', 'common',
+  'usual', 'obvious', 'underlying', 'central', 'open', 'remaining', 'final', 'initial', 'related', 'broader',
+]);
+export function namesTitledTask(question: string): boolean {
+  TITLED_TASK_RE.lastIndex = 0;
+  for (const m of question.matchAll(TITLED_TASK_RE)) {
+    const mod = m[1].toLowerCase();
+    if (!TITLED_TASK_STOP.has(mod) && !/^\d+$/.test(mod)) return true;
+  }
+  return false;
+}
+
+// The question asks for EVERY occurrence, value or place — an enumeration over
+// the whole material rather than one fact from it. Deliberately narrow: an
+// ordinary "what are all the fallbacks?" matches ("all the … fallbacks"), but a
+// plain value lookup never does.
+const EXHAUSTIVE_RE = new RegExp([
+  '\\b(?:every|all|each)\\s+(?:the\\s+|of\\s+the\\s+)?(?:[\\w-]+\\s+){0,2}(?:places?|times?|occurrences?|instances?|mentions?|sections?|values?|numbers?|figures?|metrics?|items?|entries?|references?|files?|documents?|lines?|spots?|dates?|names?|steps?|milestones?|anchors?|scenarios?|questions?|fallbacks?|thresholds?|limits?|budgets?|timeouts?|rates?|latenc(?:y|ies)|scores?)\\b',
+  '\\b(?:list|find|show|give me|enumerate|collect|gather|extract|pull out|cite)\\s+(?:me\\s+)?(?:all|every|each|everything|everywhere)\\b',
+  '\\bexhaustive(?:ly)?\\b',
+  '\\bcomplete (?:list|inventory|set|table)\\b',
+  '\\beverywhere\\b',
+  '\\bhow many (?:places|times)\\b',
+  '\\bwherever\\b',
+].join('|'), 'i');
+
+/**
+ * Does the question name one of the attached files? A run of two consecutive
+ * filename words ("error log", "array problem", "launch checklist") or one
+ * distinctive word of six+ letters ("postmortem", "battlecard", "syllabus").
+ * Filenames are the user's own labels for what they attached, so a match is a
+ * deterministic routing signal — the same reasoning as the glossary/formula
+ * routing above, generalised. Names only, never content.
+ */
+export function mentionsAttachedFile(question: string, fileNames: readonly string[] | undefined): boolean {
+  if (!fileNames?.length) return false;
+  const q = ` ${question.toLowerCase().replace(/[^a-z0-9]+/g, ' ')} `;
+  for (const name of fileNames) {
+    const stem = String(name ?? '').toLowerCase().replace(/\.[a-z0-9]{1,5}$/i, '');
+    const words = stem.split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !FILE_NAME_STOP.has(w));
+    for (let i = 0; i < words.length; i++) {
+      if (words[i].length >= 6 && q.includes(` ${words[i]} `)) return true;
+      if (i + 1 < words.length && q.includes(` ${words[i]} ${words[i + 1]} `)) return true;
+    }
+  }
+  return false;
+}
+
 export function classifyTurn(input: ClassificationInput): Classification {
   const q = norm(input.resolvedQuestion);
-  const { types, claims, clauses } = detectTypes(q, input);
+  const { types, claims, clauses, exhaustive } = detectTypes(q, input);
 
   // Required sources = union of what the detected claims need, INTERSECTED with
   // what the mode authorizes. A mode never has sources forced into it.
@@ -1349,5 +1500,5 @@ export function classifyTurn(input: ClassificationInput): Classification {
     reason = 'mode disables retrieval';
   }
 
-  return { questionTypes: types, claimTypes: claims, claimClauses: clauses, path, shouldRetrieve, requiredSourceTypes, unsupportedInMode, reason };
+  return { questionTypes: types, claimTypes: claims, claimClauses: clauses, path, shouldRetrieve, requiredSourceTypes, exhaustive, unsupportedInMode, reason };
 }

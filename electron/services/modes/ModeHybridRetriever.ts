@@ -10,7 +10,8 @@ import Database from 'better-sqlite3';
 import { buildDocumentMap, resolveTargetSections, sectionAwareChunksFromMap, selectTableOfContentsEntries, sentenceAwareWindows, tabularChunks } from './DocumentMap';
 import { wordsOf } from './lexicalTokens';
 import { CHUNKER_VERSION, semanticChunks } from './semanticChunker';
-import { resolveRerankBudgetMs, type RerankSurface } from '../reranking/rerankBudget';
+import { resolveRerankBudgetMs, rerankBudgetFitsDeadline, type RerankSurface } from '../reranking/rerankBudget';
+import { buildRerankPool } from './rerankPool';
 // Round-8 (seminar-fix-2): use the SHARED 6-clause evidence rule so the hybrid
 // (live) path gives the model the SAME completeness + off-topic-redirect guidance
 // as the lexical path. Previously formatContext had a stale 1-sentence copy.
@@ -35,6 +36,19 @@ export interface ModeRetrievedChunk {
     ftsScore: number;
     vectorScore: number;
     trustLevel: 'untrusted_reference';
+    /**
+     * Cross-encoder score when this pool was reranked; absent otherwise.
+     *
+     * CARRIED THROUGH SINCE 2026-09-07. It was computed, used to SELECT the
+     * pool, and dropped at this boundary — so every consumer that sorts
+     * evidence (the V3 legacy port, the context packer) re-ordered the
+     * reranker's picks by the hybrid score, and the debug event reported
+     * `rerankScore: null` on a turn whose telemetry showed a billed, HTTP 200
+     * rerank. Measured on a 23-turn live session with Voyage rerank-2.5-lite.
+     */
+    rerankScore?: number;
+    /** Structural/property answerability boost, same story as above. */
+    answerabilityScore?: number;
 }
 
 /**
@@ -1085,6 +1099,16 @@ export class ModeHybridRetriever {
          * itself must never be handed the manual budget on a live turn.
          */
         rerankSurface?: RerankSurface;
+        /**
+         * The CALLER's own deadline for the whole retrieval, when it races
+         * retrieval against a timer (the legacy streamChat path: 1000ms, 2000ms
+         * doc-grounded). A rerank whose budget cannot fit inside it is not
+         * started — see rerankBudgetFitsDeadline for the measured waste.
+         */
+        rerankDeadlineMs?: number;
+        /** Exhaustive request: rerank pool = the user's candidateCount × this,
+         *  capped at 2×RERANK_CANDIDATE_POOL. Absent/1 = the setting exactly. */
+        rerankPoolMultiplier?: number;
     }): Promise<ModeRetrievedContext> {
         const {
             query,
@@ -1095,6 +1119,8 @@ export class ModeHybridRetriever {
             allowRerank = false,
             forceDocumentGrounding = false,
             rerankSurface,
+            rerankDeadlineMs,
+            rerankPoolMultiplier,
         } = params;
         // Unsearchable placeholder files (deep-run 2, issue 12): an image-only
         // PDF's "[Page 1] [Page 2]" extraction is not evidence — served as a
@@ -1196,6 +1222,18 @@ export class ModeHybridRetriever {
                 markH4HybridStage('perform_hybrid_enter', { candidateCount: allCandidates.length });
                 candidates = await this.performHybridRetrieval(allCandidates, queryWords, queryText, adaptiveThreshold, files);
                 markH4HybridStage('perform_hybrid_exit', { candidateCount: candidates.length });
+                // EMPTY-HYBRID FLOOR (2026-09-07, always answer). A paraphrased live
+                // question ("did we get paged or did a customer tell us") against a
+                // two-chunk mode scored every chunk under MIN_COMBINED_SCORE and the
+                // turn went to the model with NO evidence — while the answer sat in
+                // the only chunk that mentioned "pager". When the corpus has
+                // candidates and the threshold kept none, lexical retrieval at a zero
+                // threshold returns the best-overlapping chunks; downstream selection
+                // still caps them and the composer still judges answerability.
+                if (candidates.length === 0 && allCandidates.length > 0) {
+                    candidates = this.performLexicalRetrieval(allCandidates, queryWords, 0);
+                    markH4HybridStage('empty_hybrid_floor', { candidateCount: candidates.length, pool: allCandidates.length });
+                }
             } catch (error) {
                 markH4HybridStage('perform_hybrid_error', { message: error instanceof Error ? error.message : String(error) });
                 console.warn('[ModeHybridRetriever] Hybrid retrieval failed, falling back to lexical:', error);
@@ -1454,7 +1492,16 @@ export class ModeHybridRetriever {
                 lowConfidence, explicitlySelected, shouldRerank,
                 candidateCount: candidates.length, hasOverride: Boolean(this.rerankerOverride),
             });
-            if (shouldRerank) {
+            // The budget follows the CHOICE, not just the surface (rerankBudget.ts).
+            // Resolved BEFORE the gate below so a caller's deadline can be
+            // compared against it.
+            const RERANK_BUDGET_MS = resolveRerankBudgetMs({ explicitlySelected, surface: rerankSurface });
+            if (shouldRerank && !rerankBudgetFitsDeadline({ budgetMs: RERANK_BUDGET_MS, deadlineMs: rerankDeadlineMs })) {
+                // The caller will have stopped waiting before this rerank's own
+                // budget elapses. Starting it anyway bills a hosted reranker for
+                // a result nobody reads (measured: the recap hotkey, 2026-09-07).
+                markH4HybridStage('rerank_skipped_deadline', { budgetMs: RERANK_BUDGET_MS, deadlineMs: rerankDeadlineMs, candidateCount: candidates.length });
+            } else if (shouldRerank) {
                 // A manual-chat answer has a fixed first-useful deadline. The local
                 // cross-encoder is optional ranking refinement, so it must never
                 // consume that whole deadline and prevent a lexical/evidence-pack
@@ -1464,9 +1511,8 @@ export class ModeHybridRetriever {
                 // the user selected gets time to finish, while the bundled
                 // default keeps the 1200ms that protects a first-useful token.
                 // See rerankBudget.ts for the measured case this fixes.
-                const RERANK_BUDGET_MS = resolveRerankBudgetMs({ explicitlySelected, surface: rerankSurface });
                 markH4HybridStage('rerank_enter', { candidateCount: candidates.length, budgetMs: RERANK_BUDGET_MS });
-                const rerankPromise = this.maybeRerankCandidates(queryText, candidates);
+                const rerankPromise = this.maybeRerankCandidates(queryText, candidates, rerankPoolMultiplier);
                 let rerankTimer: NodeJS.Timeout | undefined;
                 const raced = await Promise.race([
                     rerankPromise.then((value) => ({ value, timedOut: false })),
@@ -1554,6 +1600,8 @@ export class ModeHybridRetriever {
                     score: this.reportedDocGroundedScore(c),
                     ftsScore: c.ftsScore,
                     vectorScore: c.vectorScore,
+                    ...(typeof c.rerankScore === 'number' ? { rerankScore: c.rerankScore } : {}),
+                    ...(typeof c.answerabilityScore === 'number' ? { answerabilityScore: c.answerabilityScore } : {}),
                     trustLevel: 'untrusted_reference',
                 })),
                 formattedContext: finalContext,
@@ -1572,6 +1620,8 @@ export class ModeHybridRetriever {
                 score: this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT),
                 ftsScore: c.ftsScore,
                 vectorScore: c.vectorScore,
+                ...(typeof c.rerankScore === 'number' ? { rerankScore: c.rerankScore } : {}),
+                ...(typeof c.answerabilityScore === 'number' ? { answerabilityScore: c.answerabilityScore } : {}),
                 trustLevel: 'untrusted_reference'
             })),
             formattedContext,
@@ -1597,6 +1647,7 @@ export class ModeHybridRetriever {
     private async maybeRerankCandidates(
         queryText: string,
         sorted: ChunkCandidate[],
+        poolMultiplier: number = 1,
     ): Promise<ChunkCandidate[] | null> {
         let enabled = false;
         try {
@@ -1670,8 +1721,14 @@ export class ModeHybridRetriever {
             // How many candidates the user chose to rerank. Until now this
             // setting was written by Settings > Reranker and read by nothing,
             // so the control looked live and did nothing.
-            const poolSize = resolveRerankPoolSize();
-            const pool = sorted.slice(0, poolSize);
+            // An exhaustive request (RetrievalPlan.exhaustive) widens the pool so
+            // the reranker can SEE the occurrences it is asked to surface; the
+            // 2× ceiling keeps the ONNX arena reasoning above intact.
+            const mult = Number.isFinite(poolMultiplier) && poolMultiplier > 1 ? Math.floor(poolMultiplier) : 1;
+            const poolSize = Math.min(2 * RERANK_CANDIDATE_POOL, resolveRerankPoolSize() * mult);
+            // Per-file floor before the global fill — see rerankPool.ts for the
+            // measured case (a padding file monopolised the whole pool).
+            const pool = buildRerankPool(sorted, poolSize, { balanced: mult > 1 });
             const poolTexts = pool.map((c: ChunkCandidate) => c.text);
             // Chunked inference — see RERANK_BATCH_SIZE for the crash-forensics
             // rationale. Each batch returns results with INDEXES RELATIVE TO THE
@@ -1757,9 +1814,11 @@ export class ModeHybridRetriever {
                 if (!used.has(i)) reordered.push({ ...pool[i] });
             }
             // Append the un-pooled tail unchanged so we never DROP candidates
-            // the budget step might still want.
-            for (let i = poolSize; i < sorted.length; i++) {
-                reordered.push(sorted[i]);
+            // the budget step might still want. The pool is no longer a prefix
+            // of `sorted` (per-file floor), so membership, not index, decides.
+            const pooled = new Set<ChunkCandidate>(pool);
+            for (const c of sorted) {
+                if (!pooled.has(c)) reordered.push(c);
             }
             return reordered;
         } catch (e) {
