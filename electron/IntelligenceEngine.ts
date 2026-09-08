@@ -37,6 +37,8 @@ import { HARD_SYSTEM_PROMPT } from './llm/prompts';
 import type { ActiveModeInfo } from './llm/modeProfiles';
 import type { WhatToAnswerRequestSnapshot } from './llm/whatToAnswerRequestSnapshot';
 import { resolveCanonicalTurn } from './llm/resolveCanonicalTurn';
+import { performanceHooks, applyAdaptiveTtft, secondaryStreamObserver, slowWorkloadAdvice } from './llm/performance/wiring';
+import { estimateTokens } from './llm/modelCapabilities';
 import { mintTurnId } from './llm/turnIdentity';
 import { deriveRetrievalQuery } from './llm/retrievalQueryPolicy';
 import { buildGracefulRetry } from './llm/manualProfileIntelligence';
@@ -301,6 +303,7 @@ export class IntelligenceEngine extends EventEmitter {
         let out = '';
         try {
             await raceStreamWithDeadline({
+                observe: secondaryStreamObserver('regeneration'),
                 stream: this.llmHelper.streamChat(...this.repairCallArgs(opts.turnKey, prompt, opts.signal)) as AsyncGenerator<string>,
                 firstUsefulDeadlineMs: this.repairFirstUsefulMs(7000, opts.turnKey),
                 interTokenStallMs: LIVE_INTER_TOKEN_STALL_MS,
@@ -455,6 +458,25 @@ export class IntelligenceEngine extends EventEmitter {
     // active meeting, so detectAndEmitDynamicActions becomes a no-op safely.
     private dynamicActionEngine: DynamicActionEngine | null = null;
     private currentSessionId: string | null = null;
+
+    /**
+     * THE conversation-ring key for every surface, computed in one place.
+     *
+     * Exposed because ipcHandlers has to WRITE the same ring this engine READS,
+     * and the two previously derived their key independently — typed chat off a
+     * webContents id, what-to-answer off the meeting id — so each surface built
+     * a history the other could not see. A public accessor is the cheapest way
+     * to make that class of drift impossible rather than merely fixed once.
+     */
+    public conversationSessionId(): string {
+        const meetingMarker = this.currentSessionId
+            ?? (this.session.getMeetingMetadata?.()?.calendarEventId)
+            ?? undefined;
+        const meetingId = (this.session as any)?.getMeetingMetadata?.()?.id ?? null;
+        const { resolveConversationSessionId } =
+            require('./context-intelligence/question/conversation-state-store');
+        return resolveConversationSessionId(meetingId ?? meetingMarker, meetingMarker);
+    }
     private currentDynamicActionModeId: string | null = null;
     private currentDynamicActionTemplateType: string | null = null;
     // Latency trace for the most recent live request (manual/WTA). Exposed via
@@ -1191,6 +1213,26 @@ export class IntelligenceEngine extends EventEmitter {
         this.session.addAssistantMessage(text, finished.writeDecision, 'what_to_answer');
         if (finished.writeDecision?.policy !== 'do_not_store') {
             this.session.pushUsage({ type: 'assist', timestamp: Date.now(), question: finished.question, answer: text });
+            // THE ADOPTED ANSWER'S ONLY RECORDING POINT.
+            //
+            // recordLiveTurn has exactly three call sites — the runWhatShouldISay,
+            // runAssistMode and runManualAnswer wrappers — and BOTH adoption
+            // branches in handleSuggestionTriggerInner `return` before reaching
+            // runWhatShouldISay. So the answer the user actually sees, on the most
+            // common Auto Answer path, never entered the conversation ring: the
+            // wrapper's "a draft the user never saw is not part of the
+            // conversation" reasoning is true for a DISCARDED prefetch and false
+            // for an adopted one.
+            //
+            // This method is where an adopted answer becomes user-visible (its
+            // only two callers are the two adoption paths), so it is the one
+            // place that cannot be bypassed. Gated on the same do_not_store
+            // decision as the session write directly above: a turn the session
+            // declined to store must not reach the ring either.
+            //
+            // No imagePaths: a speculative run is always started with
+            // `undefined` for them, so there is no screen to transcribe.
+            this.recordLiveTurn(text, undefined, finished.question, 0);
         } else {
             console.warn(`[IntelligenceEngine] Prefetched answer revealed but not stored (${finished.writeDecision.reason ?? 'do_not_store'})`);
         }
@@ -1317,6 +1359,20 @@ export class IntelligenceEngine extends EventEmitter {
      * Low-priority observational insights
      */
     async runAssistMode(): Promise<string | null> {
+        // 'assist' READS the ring (engine-bridge does so at its buildV3Prompt
+        // call below) but deliberately does not WRITE to it.
+        //
+        // An assist insight is unprompted — there is no question it answers. It
+        // was being appended under whatever question happened to be in
+        // previousQuestion, so the user's earlier question was recorded as
+        // having been answered by an insight they never asked for, and the next
+        // "explain that" resolved against it. A surface with no question has no
+        // exchange to contribute; it still reads the exchanges other surfaces
+        // record, which is what it needs.
+        return await this.runAssistModeInner();
+    }
+
+    private async runAssistModeInner(): Promise<string | null> {
         if (this.activeMode !== 'idle' && this.activeMode !== 'assist') {
             return null;
         }
@@ -1375,7 +1431,96 @@ export class IntelligenceEngine extends EventEmitter {
      * Manual trigger - uses clean transcript pipeline for question inference
      * NEVER returns null - always provides a usable response
      */
+    /**
+     * Records a completed live exchange into the V3 conversation ring.
+     *
+     * WHY THIS IS A WRAPPER, NOT A LINE AT THE END OF EACH METHOD
+     * runWhatShouldISay is ~3,300 lines with many terminal returns, and the
+     * callers that matter most do not go through the IPC layer at all: Auto
+     * Answer calls `this.runWhatShouldISay(...)` directly (three call sites
+     * above), so a writer placed in the `generate-what-to-say` handler only
+     * ever recorded a MANUAL button press. Every automatic answer — the common
+     * case in a live meeting — was missing from the history, and so was every
+     * screenshot attached to one. Wrapping is the only placement that cannot
+     * miss a caller or an exit path.
+     *
+     * Speculative pre-fetches are deliberately excluded: a draft the user never
+     * saw is not part of the conversation, and recording it would make the ring
+     * describe an exchange that did not happen.
+     */
+    private recordLiveTurn(
+        answer: string | null, screenContext?: unknown, question?: string,
+        /** How many screenshots the turn carried, INDEPENDENT of whether any of
+         *  them could be transcribed. See SCREEN_NOT_TRANSCRIBED. */
+        imageCount = 0,
+        /** The turn's attachments, transcribed for the record AFTER the answer. */
+        imagePaths?: readonly string[],
+    ): void {
+        if (!answer) return;
+        void (async () => {
+        try {
+            const { recordAnswerSummary } =
+                require('./context-intelligence/question/conversation-state-store');
+            const { SCREEN_NOT_TRANSCRIBED } = require('./services/screen/screenDescription');
+            // A DEDICATED transcription, not the answering call's output. The
+            // answering call is asked to answer concisely; measured live, its
+            // text for a build-failure screen was "Your build failed because
+            // you've run out of disk quota" — no error code, no ticket
+            // reference, which is precisely what the follow-up then asked for.
+            // Awaited here, not before the answer: the user already has their
+            // answer by this point, so this costs them nothing.
+            let screenText = '';
+            if (imagePaths?.length) {
+                const { transcribeScreenForMemory } = require('./services/screen/screenTranscription');
+                screenText = await transcribeScreenForMemory(imagePaths, question);
+            }
+            // FALLBACK to the caller's already-computed ScreenUnderstandingResult.
+            //
+            // `screenContext` was accepted and never read: the text came solely
+            // from imagePaths. Harmless only because every current caller that
+            // supplies one also supplies attachments — but a turn that answers
+            // from a periodic screen capture with no attachment would record
+            // neither screen text NOR the not-transcribed marker, silently
+            // losing a screen the model demonstrably saw. Its own answer is
+            // less faithful than a dedicated transcription, which is why it is
+            // the fallback rather than the source.
+            if (!screenText && screenContext) {
+                const { composeScreenDescription: compose } = require('./services/screen/screenDescription');
+                screenText = compose(screenContext as never) || '';
+            }
+            recordAnswerSummary(
+                this.conversationSessionId(),
+                answer,
+                // A failed transcription still records that a screen was THERE.
+                // Recording nothing is what let a follow-up deny the screenshot
+                // ever existed, which is a worse answer than "I can't read it".
+                // A screen was THERE whenever attachments or a ScreenUnderstanding
+                // result existed, whether or not either yielded text.
+                screenText || ((imageCount > 0 || screenContext) ? SCREEN_NOT_TRANSCRIBED : undefined),
+                // Seeds state for a turn that never reached orchestrate() (V3
+                // off, or a legacy route). runAssistMode deliberately passes
+                // nothing: an unprompted insight has no question, and a
+                // question-less turn is one appendTurn refuses anyway.
+                question,
+            );
+        } catch (error: any) {
+            // NEVER silent: a lost turn leaves the next follow-up with no
+            // antecedent, which is indistinguishable from a bad answer.
+            console.warn('[Intelligence] conversation ring write failed — this turn will not be in history:',
+                error?.message ?? error);
+        }
+        })();
+    }
+
     async runWhatShouldISay(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean }): Promise<string | null> {
+        const answer = await this.runWhatShouldISayInner(question, confidence, imagePaths, options);
+        if (!options?.speculative) {
+            this.recordLiveTurn(answer, options?.screenContext, question, imagePaths?.length ?? 0, imagePaths);
+        }
+        return answer;
+    }
+
+    private async runWhatShouldISayInner(question?: string, confidence: number = 0.8, imagePaths?: string[], options?: { speculative?: boolean; skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string; forceFresh?: boolean }): Promise<string | null> {
         const now = Date.now();
         // Intelligence OS observe-only trace (Phase 1). Zero-cost NO-OP unless
         // intelligence_trace_enabled is on. Committed at the primary final-answer emit
@@ -3410,7 +3555,11 @@ export class IntelligenceEngine extends EventEmitter {
                         // WTA turn across every meeting shared one key.
                         scope: {
                             meetingId: _ctx.meetingId ?? meetingMarker ?? undefined,
-                            sessionId: _ctx.meetingId ?? meetingMarker ?? undefined,
+                            // ONE key across surfaces (resolveConversationSessionId).
+                            // Typed chat keyed the same ring off its senderId, so
+                            // the two surfaces kept separate histories and neither
+                            // could read the other's screenshot descriptions.
+                            sessionId: this.conversationSessionId(),
                         },
                         requestId: trace.requestId,
                         requestSequence: generationId,
@@ -3771,13 +3920,28 @@ export class IntelligenceEngine extends EventEmitter {
                 && typeof (this.llmHelper as any).observedAnswerLatency === 'function'
                 ? (this.llmHelper as any).observedAnswerLatency()
                 : null;
-            const firstUsefulDeadline = totalHardTimeoutMs({
-                isLocal: usingLocalLlm,
-                isVisionTurn,
-                viaServerCascade,
-                isUserEndpoint,
-                observedUserEndpointLatency,
-            });
+            // The shipped route table decides first, and a POST-FILTER may then
+            // move it — never the other way round. Written this way so deleting
+            // the applyAdaptiveTtft call restores today's behaviour with no
+            // other edit, which is the rollback story the flag exists for.
+            //
+            // With `adaptiveTtft` off (its default) this is the identity
+            // function. With it on it only moves routes the table marks
+            // adaptive — today just user endpoints — and its value is backed by
+            // the PERSISTED profile, so a gateway measured last week no longer
+            // has to be re-learned from scratch after a restart. That is the
+            // one thing observedUserEndpointLatency above cannot do: its map
+            // dies with the process.
+            const firstUsefulDeadline = applyAdaptiveTtft(
+                totalHardTimeoutMs({
+                    isLocal: usingLocalLlm,
+                    isVisionTurn,
+                    viaServerCascade,
+                    isUserEndpoint,
+                    observedUserEndpointLatency,
+                }),
+                { llmHelper: this.llmHelper as any, hasImages: isVisionTurn, inputTokens: estimateTokens(`${preparedTranscript ?? ''}${candidateProfile ?? ''}`) },
+            );
             // Time-to-first-token for THIS turn, recorded only if it commits —
             // see LLMHelper.recordAnswerFirstToken for why an aborted turn must
             // not teach the budget.
@@ -3831,10 +3995,64 @@ export class IntelligenceEngine extends EventEmitter {
             // iterator.return()` blocks if the generator is stuck in an await, so
             // the driver fire-and-forgets cleanup. This is the no-10s-wait / no-134s
             // guarantee (Issue 1, P0).
+            // ── Provider Performance Profile ───────────────────────────────
+            // One call, spread into the driver below. With every flag at its
+            // default this changes nothing: `observe` only records, and
+            // `interTokenStallMs` returns LIVE_INTER_TOKEN_STALL_MS until the
+            // adaptiveStreamIdle flag is on AND the profile has enough healthy
+            // streams to move it. See electron/llm/performance/wiring.ts.
+            //
+            // `hasImages` must match the value that picked the deadline above
+            // (isVisionTurn) — passing a different one here would file a vision
+            // turn's evidence under the text route, and the route is the thing
+            // the whole table is keyed on.
+            // Phase 18: ask the profile whether this turn can land inside the
+            // moment. ADVISORY — it never shortens a deadline. On the live path
+            // an answer that takes 30s will very likely succeed and still be
+            // useless, so the right response is to send less, not to give up
+            // sooner; giving up sooner only converts a slow answer into none.
+            //
+            // Surfaced as a diagnostic here rather than wired into truncation:
+            // the retrieval and transcript budgets upstream have their own
+            // correctness contracts, and silently shrinking their input from a
+            // latency estimate would change what the model is asked without any
+            // of those contracts knowing. This makes the condition VISIBLE and
+            // leaves the reduction to the layers that own it.
+            try {
+                const _slow = slowWorkloadAdvice({
+                    llmHelper: this.llmHelper as any,
+                    hasImages: isVisionTurn,
+                    inputTokens: estimateTokens(`${preparedTranscript ?? ''}${candidateProfile ?? ''}`),
+                    streamRoute: 'wta_live',
+                });
+                // Logged, not traced: PiMilestone is a closed union owned by the
+                // latency tracer, and widening it for an advisory signal would
+                // put a performance hint into the milestone vocabulary that
+                // measures the answer pipeline itself.
+                if (_slow) console.log('[Perf] workload predicted too slow to be useful', _slow);
+            } catch { /* an advisory signal must never break a turn */ }
+            const perf = performanceHooks({
+                llmHelper: this.llmHelper as any,
+                hasImages: isVisionTurn,
+                // A proxy, not a count. The providers that report real usage do
+                // so only at the END of a stream, and this is needed at the
+                // start to pick a workload bucket. estimateTokens is the same
+                // estimator the context budgets already fit prompts with, so a
+                // bucket boundary here means what it means there.
+                inputTokens: estimateTokens(`${preparedTranscript ?? ''}${candidateProfile ?? ''}`),
+                isUserCancelled: () => whatToAnswerCancellationToken.signal.aborted || isWtaSuperseded(),
+                onDiagnostics: (record) => {
+                    if (record.terminationReason === 'done') return;
+                    // Only the failures are logged. A line per healthy turn would
+                    // bury the one case this record exists to explain.
+                    console.log('[Perf] wta turn ended early', record);
+                },
+            });
             const raceOutcome = await raceStreamWithDeadline({
                 stream: stream as AsyncGenerator<string>,
                 firstUsefulDeadlineMs: firstUsefulDeadline,
-                interTokenStallMs: LIVE_INTER_TOKEN_STALL_MS,
+                interTokenStallMs: perf.interTokenStallMs,
+                observe: perf.observe,
                 isSpeculative,
                 // "Useful" = the provider has actually delivered real content (raw
                 // arrival), NOT the gate's emit threshold — otherwise a coding
@@ -4023,6 +4241,7 @@ export class IntelligenceEngine extends EventEmitter {
                             pendingFirstTokenMs = null;
                             try {
                                 await raceStreamWithDeadline({
+                                    observe: secondaryStreamObserver('regeneration'),
                                     stream: this.llmHelper.streamChat(...(retryArgs as Parameters<LLMHelper['streamChat']>)) as AsyncGenerator<string>,
                                     firstUsefulDeadlineMs: regenBudget,
                                     interTokenStallMs: LIVE_INTER_TOKEN_STALL_MS,
@@ -4534,6 +4753,7 @@ export class IntelligenceEngine extends EventEmitter {
                     let scaffoldRepaired = '';
                     try {
                         await raceStreamWithDeadline({
+                            observe: secondaryStreamObserver('repair'),
                             stream: this.llmHelper.streamChat(
                                 ...this.repairCallArgs(
                                     whatToAnswerCancellationToken.signal,
@@ -4852,6 +5072,7 @@ export class IntelligenceEngine extends EventEmitter {
                                 let repaired = '';
                                 try {
                                     await raceStreamWithDeadline({
+                                        observe: secondaryStreamObserver('repair'),
                                         stream: this.llmHelper.streamChat(
                                             ...this.repairCallArgs(
                                                 whatToAnswerCancellationToken.signal,
@@ -5068,6 +5289,7 @@ export class IntelligenceEngine extends EventEmitter {
                         // `await iterator.return()` anti-pattern.
                         try {
                             await raceStreamWithDeadline({
+                                observe: secondaryStreamObserver('regeneration'),
                                 stream: this.llmHelper.streamChat(
                                     ...this.repairCallArgs(
                                         whatToAnswerCancellationToken.signal,
@@ -5499,6 +5721,7 @@ export class IntelligenceEngine extends EventEmitter {
                         let clauseAddition = '';
                         try {
                             await raceStreamWithDeadline({
+                                observe: secondaryStreamObserver('repair'),
                                 stream: this.llmHelper.streamChat(
                                     ...this.repairCallArgs(
                                         whatToAnswerCancellationToken.signal,
@@ -5712,6 +5935,7 @@ export class IntelligenceEngine extends EventEmitter {
                             let repaired = '';
                             try {
                                 await raceStreamWithDeadline({
+                                    observe: secondaryStreamObserver('repair'),
                                     stream: this.llmHelper.streamChat(
                                         ...this.repairCallArgs(
                                             whatToAnswerCancellationToken.signal,
@@ -6117,6 +6341,7 @@ export class IntelligenceEngine extends EventEmitter {
                     // 6s) clears MiniMax's 4-6s first-token when it's the fallback.
                     let fixed = '';
                     await raceStreamWithDeadline({
+                        observe: secondaryStreamObserver('verification'),
                         stream: this.llmHelper.streamChat(
                             ...this.repairCallArgs(
                                 abortSignal,
@@ -6363,7 +6588,10 @@ export class IntelligenceEngine extends EventEmitter {
                 resolvedProfileSources: ctx.resolvedProfileSources,
                 extraAllowedSourceTypes: ctx.extraAllowedSourceTypes as never[],
                 requestSequence: this.currentGenerationId,
-                scope: { meetingId: ctx.meetingId ?? undefined, sessionId: ctx.meetingId ?? undefined },
+                scope: {
+                    meetingId: ctx.meetingId ?? undefined,
+                    sessionId: this.conversationSessionId(),
+                },
                 // This question came out of live speech via question-resolver,
                 // not from the user's keyboard, so it must not be stamped
                 // manual/1.0. The resolver's own confidence is already gated at
@@ -6762,6 +6990,15 @@ export class IntelligenceEngine extends EventEmitter {
      * Explicit bypass when auto-detection fails
      */
     async runManualAnswer(question: string): Promise<string | null> {
+        // The FOURTH V3 surface ('manual-chat' via pathTag 'engine'). It reads
+        // the ring at the buildV3Prompt call below and, like the other two live
+        // surfaces, had no writer — so its own answers never became history.
+        const manualAnswer = await this.runManualAnswerInner(question);
+        this.recordLiveTurn(manualAnswer, undefined, question);
+        return manualAnswer;
+    }
+
+    private async runManualAnswerInner(question: string): Promise<string | null> {
         this.emit('manual_answer_started');
         this.setMode('manual');
 
@@ -6841,7 +7078,16 @@ export class IntelligenceEngine extends EventEmitter {
                         // 'engine', so every session on this surface shared one
                         // continuity slot -- one user's activeTopic resolving another
                         // turn's "that project". A one-line omission, not a design.
-                        scope: { meetingId: _ctx.meetingId ?? undefined, sessionId: _ctx.meetingId ?? undefined },
+                        scope: {
+                            meetingId: _ctx.meetingId ?? undefined,
+                            // THE resolver, like every other surface. This read the
+                            // BARE meeting id while its own writer (recordLiveTurn ->
+                            // conversationSessionId) stored under `m:<id>`, so with a
+                            // meeting active manual-chat wrote a bucket it never read.
+                            // Invisible without a meeting, where both collapse to
+                            // 'engine' — which is why the parity test passed.
+                            sessionId: this.conversationSessionId(),
+                        },
                         retrieval: _ctx.port as any,
                     });
                 } catch { return null; }

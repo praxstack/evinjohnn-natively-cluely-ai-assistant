@@ -22,6 +22,7 @@ import {
 } from "./llm/tinyPrompts"
 import { getModelCapabilities, selectPromptTier, estimateTokens, truncateTranscriptToFit, getOpenAiMaxOutput, getOpenAiReasoningEffort, type OpenAiReasoningEffort, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
 import { GeminiPromptCache } from "./llm/GeminiPromptCache"
+import { filterOllamaGenerationModels } from "./llm/ollamaGenerationModels"
 import {
   runStreamingVisionFallback,
   orderVisionByHealth,
@@ -72,9 +73,11 @@ import { AntigravityService } from './services/AntigravityService';
 import { GROQ_PRIMARY_MODEL, groqFallbackFor, isGroqModelGone, groqReasoningParams } from './llm/groqModels';
 import { DirectAssistError } from './direct-assist/errors';
 import { DIRECT_ASSIST_CURRENT_TURN_SPEECH_MARKER } from './direct-assist/requestBuilder';
+import { DIRECT_ASSIST_LADDER_INELIGIBLE_PROVIDERS } from './direct-assist/types';
 import type {
   DirectAssistDispatchRequest,
   DirectAssistProvider,
+  DirectAssistRung,
   DirectAssistSelection,
 } from './direct-assist/types';
 const execAsync = promisify(exec);
@@ -174,6 +177,23 @@ const CLAUDE_MAX_OUTPUT_TOKENS = 64000
 // tail. The TTFT race (textStreamFallback) handles the separate case of a fast
 // connect that then prefills slowly. Override per-call for non-interactive use.
 const INTERACTIVE_CONNECT_TIMEOUT_MS = 4_000;
+
+// Direct Assist connect budgets. The 4s ceiling above is calibrated for the
+// LIVE path, where a connect that stalls is HANDED OFF — the ladder tries the
+// next provider. Direct Assist has no retry, no model ladder and no
+// cross-provider failover by design, so a deadline that fires there is a
+// user-visible hard failure with nothing behind it.
+//
+// Measured on the shipping default (`natively`, auto-selected by
+// CredentialsManager.setNativelyApiKey for anyone who has not deliberately
+// picked another model): text time-to-first-byte 1.2-2.0s, but a vision
+// request carrying a compressed screenshot lands at 2.1-4.0s — straddling the
+// 4s line, so screenshot answers failed intermittently with CONNECT_TIMEOUT
+// (one measured success cleared it by 6ms). These budgets stay inside
+// DEFAULT_DIRECT_ASSIST_STREAM_IDLE_TIMEOUT_MS (45s) so a genuinely dead
+// connection still ends promptly with a specific error.
+const DIRECT_ASSIST_CONNECT_TIMEOUT_MS = 15_000;
+const DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS = 30_000;
 
 // First-useful-token budget for the Natively gateway on the TEXT path. Larger than
 // the shared 2.5s text default because the gateway's server-side fallback chain can
@@ -2474,7 +2494,10 @@ export class LLMHelper {
     // user asked not to have.
     if (this.isProviderDisabled('ollama')) return { ok: false };
     try {
-      const availableModels = await this.getOllamaModels();
+      // Generation-capable only: a machine holding just the bootstrapped
+      // nomic-embed-text has no local text model, and answering ok:true here
+      // would route a turn to a model that cannot answer it.
+      const availableModels = await this.getOllamaGenerationModels();
       if (availableModels.length === 0) return { ok: false };
       const model = (this.ollamaModel && availableModels.includes(this.ollamaModel))
         ? this.ollamaModel
@@ -2525,9 +2548,16 @@ export class LLMHelper {
 
   private async initializeOllamaModel(): Promise<void> {
     try {
-      const availableModels = await this.getOllamaModels()
+      const availableModels = await this.getOllamaGenerationModels()
       if (availableModels.length === 0) {
-        const msg = `No Ollama models installed. Run "ollama pull <model>" (e.g. ollama pull qwen2.5:4b) and restart.`;
+        // Two different situations, two different instructions. Natively pulls
+        // nomic-embed-text itself for retrieval, so "you have models, none of
+        // them can chat" is a state a fresh install lands in — telling that user
+        // nothing is installed sends them to fix something that is not broken.
+        const installed = await this.getOllamaModels();
+        const msg = installed.length > 0
+          ? `Ollama has ${installed.length} model(s) installed, but none can generate text (embedding models such as nomic-embed-text cannot). Run "ollama pull <model>" (e.g. ollama pull qwen2.5:4b) and restart.`
+          : `No Ollama models installed. Run "ollama pull <model>" (e.g. ollama pull qwen2.5:4b) and restart.`;
         console.warn(`[LLMHelper] ${msg}`);
         this.notifyRendererOllamaError(msg);
         return
@@ -2556,7 +2586,7 @@ export class LLMHelper {
     } catch (error: any) {
       console.error(`[LLMHelper] Failed to initialize Ollama model: ${error?.message}`);
       try {
-        const models = await this.getOllamaModels()
+        const models = await this.getOllamaGenerationModels()
         if (models.length > 0) {
           this.ollamaModel = models[0]
           console.log(`[LLMHelper] Fallback to first installed model: ${this.ollamaModel}`)
@@ -4814,7 +4844,7 @@ let isMultimodal = !!(imagePaths?.length);
     if (imagePath) {
       try {
         const optimized = await getImageOptimizer().optimize(imagePath, {
-          profile: 'balanced',
+          profile: this.imageProfileFor('balanced', userMessage?.length ?? 0),
           provider: 'custom',
           cacheKey: imagePath,
         });
@@ -5046,7 +5076,7 @@ let isMultimodal = !!(imagePaths?.length);
     if (imagePath) {
       try {
         const optimized = await getImageOptimizer().optimize(imagePath, {
-          profile: 'balanced',
+          profile: this.imageProfileFor('balanced', rawUserMessage?.length ?? 0),
           provider: 'custom',
           cacheKey: imagePath,
         });
@@ -8574,6 +8604,18 @@ let isMultimodal = !!(imagePaths?.length);
       if (images.length) body.images = images;
     }
 
+    // WIDEN-ONLY. Returns `connectTimeoutMs` unchanged unless this network has
+    // been measured to need longer — a 4s connect timer has already killed a
+    // working vision request in this app by a 6ms margin, so evidence may only
+    // ever buy a slow network more room, never less.
+    const effectiveConnectTimeoutMs = (() => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { applyAdaptiveConnectTimeout } = require('./llm/performance/wiring');
+        return applyAdaptiveConnectTimeout(connectTimeoutMs, { llmHelper: this });
+      } catch { return connectTimeoutMs; }
+    })();
+
     const endpointUrl = `${NATIVELY_API_URL}/v1/chat`;
     const requestId = makeRequestId('nat_stream');
     const streamStartedAt = nowMs();
@@ -8623,8 +8665,8 @@ let isMultimodal = !!(imagePaths?.length);
     // connect timeout to the connect phase only.
     const streamController = new AbortController();
     let connectTimer: NodeJS.Timeout | null = setTimeout(
-      () => streamController.abort(new Error(`Natively API connect timeout (${Math.round(connectTimeoutMs / 1000)}s)`)),
-      connectTimeoutMs,
+      () => streamController.abort(new Error(`Natively API connect timeout (${Math.round(effectiveConnectTimeoutMs / 1000)}s)`)),
+      effectiveConnectTimeoutMs,
     );
     const onCallerAbort = () => {
       try { streamController.abort(abortSignal?.reason); } catch { /* already aborted */ }
@@ -8652,8 +8694,17 @@ let isMultimodal = !!(imagePaths?.length);
         e?.cause?.code === 'ENOTFOUND' || e?.cause?.code === 'EAI_AGAIN';
 
       let lastErr: unknown;
+      // The connect measurement is per-ATTEMPT, not since the loop began.
+      // `streamStartedAt` is captured once above, so folding
+      // `responseStartedAt - streamStartedAt` into the connect estimate would
+      // charge a failed attempt-0 DNS lookup plus its backoff to the attempt
+      // that actually succeeded — which is not "request start → response
+      // headers" as the field claims, and pushes connect.maxMs toward its
+      // ceiling on exactly the flaky resolvers the retry exists to survive.
+      let attemptStartedAt = streamStartedAt;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (streamController.signal.aborted) break;
+        attemptStartedAt = nowMs();
         try {
           const serializedBody = JSON.stringify(body);
           if (!directMode) {
@@ -8671,6 +8722,16 @@ let isMultimodal = !!(imagePaths?.length);
             signal: streamController.signal,
           });
           responseStartedAt = nowMs();
+          // The CONNECT phase, measured: request start → response headers. This
+          // is the one provider path that exposes it; every other adapter hands
+          // us a generator and nothing about the socket underneath, which is
+          // why the adaptive connect timeout is deliberately narrow rather than
+          // a number invented for all of them.
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { recordConnectLatency } = require('./llm/performance/wiring');
+            recordConnectLatency({ llmHelper: this, ms: responseStartedAt - attemptStartedAt });
+          } catch { /* measurement must never break a request */ }
           responseStatus = response.status;
           serverRequestId = response.headers.get('x-request-id');
           lastErr = undefined;
@@ -8686,7 +8747,7 @@ let isMultimodal = !!(imagePaths?.length);
               stage: streamController.signal.aborted ? 'connect_timeout_or_abort' : 'pre_response',
               model: this.currentModelId,
               provider: 'natively',
-              connectTimeoutMs,
+              connectTimeoutMs: effectiveConnectTimeoutMs,
               durationMs,
               error: directMode ? '[omitted for Direct Assist]' : summarizeFetchError(fetchErr),
               aborted: streamController.signal.aborted,
@@ -8703,9 +8764,18 @@ let isMultimodal = !!(imagePaths?.length);
               }
               throw new DirectAssistError('PROVIDER_ERROR', 'The selected provider could not start the stream.', true);
             }
-            throw new Error(`Natively API stream request failed before response requestId=${requestId} endpoint=${endpointUrl} method=POST timeoutMs=${connectTimeoutMs} durationMs=${durationMs} ${formatFetchError(fetchErr)}`);
+            throw new Error(`Natively API stream request failed before response requestId=${requestId} endpoint=${endpointUrl} method=POST timeoutMs=${effectiveConnectTimeoutMs} durationMs=${durationMs} ${formatFetchError(fetchErr)}`);
           }
           console.warn(`[streamWithNatively] DNS failure req=${requestId} (${fetchErr.cause?.code ?? fetchErr.code}), retry ${attempt + 1}/2 in 500ms`);
+          // Bank the retry for the profile. A provider that always succeeds on
+          // attempt three looks perfect by its success rate and feels slow —
+          // this counter is the only thing that makes that visible.
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { noteTransportRetry } = require('./llm/performance/recorder');
+            const _pid = this.performanceIdentity(false);
+            noteTransportRetry(_pid.providerId, _pid.modelId);
+          } catch { /* a diagnostic counter must never break a retry */ }
           await new Promise<void>(r => setTimeout(r, 500));
         }
       }
@@ -8737,7 +8807,7 @@ let isMultimodal = !!(imagePaths?.length);
         statusText: directMode ? undefined : response.statusText,
         model: this.currentModelId,
         provider: 'natively',
-        connectTimeoutMs,
+        connectTimeoutMs: effectiveConnectTimeoutMs,
         durationMs: Math.round(nowMs() - streamStartedAt),
         responseBody: directMode ? '[omitted for Direct Assist]' : errText.slice(0, 1000),
       });
@@ -8803,7 +8873,7 @@ let isMultimodal = !!(imagePaths?.length);
               model: this.currentModelId,
               provider: 'natively',
               serverModel: providerModel,
-              connectTimeoutMs,
+              connectTimeoutMs: effectiveConnectTimeoutMs,
               tfftMs: firstTokenAt ? Math.round(firstTokenAt - streamStartedAt) : null,
               durationMs: Math.round(nowMs() - streamStartedAt),
               error: directMode ? '[omitted for Direct Assist]' : chunk.error,
@@ -8837,7 +8907,7 @@ let isMultimodal = !!(imagePaths?.length);
         model: this.currentModelId,
         provider: 'natively',
         serverModel: providerModel,
-        connectTimeoutMs,
+        connectTimeoutMs: effectiveConnectTimeoutMs,
         tfftMs: firstTokenAt ? Math.round(firstTokenAt - streamStartedAt) : null,
         durationMs: Math.round(nowMs() - streamStartedAt),
         tokens: tokenCount,
@@ -8869,7 +8939,7 @@ let isMultimodal = !!(imagePaths?.length);
           provider: 'natively',
           serverModel: providerModel,
           fallbackUsed: false,
-          connectTimeoutMs,
+          connectTimeoutMs: effectiveConnectTimeoutMs,
           responseHeaderMs: responseStartedAt ? Math.round(responseStartedAt - streamStartedAt) : null,
           tfftMs: firstTokenAt ? Math.round(firstTokenAt - streamStartedAt) : null,
           totalStreamMs: Math.round(totalMs),
@@ -9818,7 +9888,7 @@ let isMultimodal = !!(imagePaths?.length);
         // wire payload stays under the 10 MB Anthropic per-image limit.
         // Use the first image for custom providers (they typically only support one).
         const optimized = await getImageOptimizer().optimize(sourcePath, {
-          profile: 'balanced',
+          profile: this.imageProfileFor('balanced', 0),
           provider: 'custom',
           cacheKey: sourcePath,
         });
@@ -9907,6 +9977,13 @@ let isMultimodal = !!(imagePaths?.length);
       clearTimeout(streamTimeout);
       return;
     }
+    // The connect phase of the USER-ENDPOINT route — the one route whose
+    // deadlines actually adapt, so the one where a measured handshake is worth
+    // most. Same measurement streamWithNatively takes: request issued → response
+    // headers. (For an SSE response that is also the first body byte, so Phase
+    // 6's "first byte" and this are the same instant; TTFT, measured by the
+    // deadline driver, is the first PARSED event and is a separate number.)
+    const customConnectStartedAt = Date.now();
     try {
       const response = await fetch(url, {
         method: requestConfig.method || 'POST',
@@ -9920,6 +9997,11 @@ let isMultimodal = !!(imagePaths?.length);
         redirect: 'manual',
       });
       clearTimeout(streamTimeout);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { recordConnectLatency } = require('./llm/performance/wiring');
+        recordConnectLatency({ llmHelper: this, ms: Date.now() - customConnectStartedAt });
+      } catch { /* measurement must never break a request */ }
 
       if (!response.ok) {
         // strictErrors callers keep main's exact early throw, message shape and
@@ -10210,6 +10292,100 @@ let isMultimodal = !!(imagePaths?.length);
     return this.isLiteLLMModel(this.currentModelId) || this.isNvidiaNimModel(this.currentModelId);
   }
 
+  /**
+   * The image-optimisation preset this vision turn should use.
+   *
+   * Normally the caller's own choice, verbatim. Downgraded to `fast` only when
+   * the Provider Performance Profile predicts this turn will blow its urgency
+   * budget — Phase 18's "the profile says this workload is likely to be too slow
+   * and an EXISTING mechanism responds". The mechanism is ImageOptimizer's
+   * preset table, which already ships and which every vision call site already
+   * passes a value from.
+   *
+   * Fails open to the requested preset on any error: a latency hint must never
+   * be able to stop an image being sent.
+   */
+  private imageProfileFor(
+    requested: 'fast' | 'balanced' | 'technical' | 'best',
+    approxInputChars: number,
+  ): 'fast' | 'balanced' | 'technical' | 'best' {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { imageProfileForTurn } = require('./llm/performance/wiring');
+      return imageProfileForTurn(requested, {
+        llmHelper: this,
+        inputTokens: Math.ceil(Math.max(0, approxInputChars) / 4),
+        // These three sites serve both live and manual turns and cannot tell
+        // which from here. `manual_chat_stream` is the CONSERVATIVE label: its
+        // 20s budget is twice the live one, so a turn is only ever downgraded
+        // when it would blow the more generous of the two.
+        streamRoute: 'manual_chat_stream',
+      });
+    } catch {
+      return requested;
+    }
+  }
+
+  /**
+   * Who is answering this turn, for the Provider Performance Profile.
+   *
+   * ADDITIVE AND READ-ONLY. It touches no instance state and changes no
+   * decision — it exists so the deadline driver's `observe` hook can label a
+   * measurement without every call site re-deriving the route from four
+   * predicates (which is how WTA and manual chat came to disagree about the
+   * same turn before the route table existed).
+   *
+   * The route is resolved in the SAME ORDER as `totalHardTimeoutMs`'s table,
+   * and that ordering is load-bearing rather than stylistic: local first so a
+   * local rung is never reclassified by another flag, then vision, then the
+   * server cascade as an explicit branch rather than a fallthrough. A profile
+   * keyed by a route resolved in a different order would file one route's
+   * evidence under another's name, which is the exact failure the route table
+   * was introduced to end.
+   *
+   * `providerId` is the coarse transport (`getCurrentProvider()`), NOT the
+   * endpoint URL: the profile's network dimension already separates two
+   * gateways, and putting a base URL in a profile key would put a user-supplied
+   * address in a persisted file for no gain.
+   */
+  public performanceIdentity(hasImages: boolean = false): {
+    providerId: string;
+    modelId: string;
+    route: 'local' | 'vision' | 'server_cascade' | 'user_endpoint' | 'default_provider';
+    /**
+     * Reported SEPARATELY from `route`, because the two are not the same
+     * question. `route === 'local'` covers Ollama AND Codex CLI, while
+     * `getModelCapabilities(id, isOllama)` needs to know specifically whether
+     * this is an Ollama model — passing `false` for one returns the wrong
+     * context window and the wrong vision answer. Inferring one from the other
+     * is exactly the conflation that made a LiteLLM model report
+     * `supportsImages: false`.
+     */
+    isOllama: boolean;
+  } {
+    // A Custom Provider's model is NOT `currentModelId`. That field holds the
+    // selected-model id, which for a custom provider is whatever was selected
+    // before/alongside it — measured live, a provider actually calling
+    // `mistralai/mistral-nemo` was profiled under `gemini-3.8-flash`, so every
+    // sample landed on a model that was never called. The model lives on the
+    // provider record; fall back to its id, then to the selected id.
+    const custom: any = this.customProvider ?? this.activeCurlProvider;
+    const modelId = (custom
+      ? (custom.model || custom.id || this.currentModelId)
+      : this.currentModelId) || 'unknown';
+    const providerId = (() => {
+      try { return this.getCurrentProvider(); } catch { return 'unknown'; }
+    })();
+    const route = (() => {
+      if (this.isUsingOllama() || this.isUsingCodexCli()) return 'local' as const;
+      if (hasImages && !this.isUsingNativelyServerCascade()) return 'vision' as const;
+      if (this.isUsingNativelyServerCascade()) return 'server_cascade' as const;
+      if (this.isUsingUserEndpoint()) return 'user_endpoint' as const;
+      return 'default_provider' as const;
+    })();
+    return { providerId, modelId, route, isOllama: this.isUsingOllama() };
+  }
+
   public async getOllamaModels(): Promise<string[]> {
     const baseUrl = (this.ollamaUrl || "http://127.0.0.1:11434").replace('localhost', '127.0.0.1');
 
@@ -10235,6 +10411,27 @@ let isMultimodal = !!(imagePaths?.length);
       // Connection refused/timeout — OllamaManager logs startup status.
       return [];
     }
+  }
+
+  /**
+   * Installed models that can actually GENERATE — getOllamaModels() minus the
+   * embedding-only ones.
+   *
+   * Kept separate rather than folded into getOllamaModels() on purpose. That
+   * method's empty array already carries two meanings ("daemon down" and "daemon
+   * up, nothing pulled"), and callers of the destructive restart path key off
+   * them (see the comment below and forceRestartOllama's guard). Filtering in
+   * place would add a THIRD meaning — "daemon up, models pulled, none can
+   * generate" — to the same value, which is exactly the collapse that comment
+   * exists to prevent: on a machine holding only the bootstrapped
+   * nomic-embed-text, a healthy user-visible daemon would have read as missing.
+   *
+   * So: this is for callers PICKING a model to generate with. Liveness and
+   * "is anything installed" keep asking getOllamaModels().
+   */
+  public async getOllamaGenerationModels(): Promise<string[]> {
+    const baseUrl = (this.ollamaUrl || "http://127.0.0.1:11434").replace('localhost', '127.0.0.1');
+    return filterOllamaGenerationModels(baseUrl, await this.getOllamaModels());
   }
 
   /**
@@ -10490,6 +10687,145 @@ let isMultimodal = !!(imagePaths?.length);
   }
 
   /**
+   * Plan the Direct Assist ladder.
+   *
+   * Every credential, capability and privacy boundary is applied HERE, as a
+   * filter. A provider that fails one is absent from the returned list — it is
+   * never opened and then refused at dispatch, because a rung that is going to
+   * throw still costs an attempt, a backoff and a circuit-breaker mark.
+   *
+   * The adapters keep their own assertOutboundScopes call. This is not a
+   * replacement for that backstop; it is the reason the backstop should never
+   * fire on this path.
+   */
+  public listDirectAssistRungs(request: DirectAssistDispatchRequest): readonly DirectAssistRung[] {
+    const selected = request.selection;
+    const hasImages = (request.imagePaths?.length ?? 0) > 0;
+    const selectedRung: DirectAssistRung = {
+      provider: selected.provider,
+      model: selected.model,
+      priority: 0,
+      isFallback: false,
+    };
+
+    // A blocking, non-streaming selection has no commit point: it gets no
+    // ladder and no retry, exactly as before this feature existed.
+    if (DIRECT_ASSIST_LADDER_INELIGIBLE_PROVIDERS.includes(selected.provider)) {
+      return Object.freeze([selectedRung]);
+    }
+    if (!this.directAssistFallbackEnabled()) return Object.freeze([selectedRung]);
+
+    const eligible = (provider: DirectAssistProvider, model: string): boolean => {
+      if (DIRECT_ASSIST_LADDER_INELIGIBLE_PROVIDERS.includes(provider)) return false;
+      if (provider === selected.provider) return false; // already rung 0
+      const family = LLMHelper.PROVIDER_LABEL_FAMILY[provider] ?? provider;
+      if (this.isProviderDisabled(family)) return false;
+      if (!this.directProviderHasCredential(provider)) return false;
+      // Third arg is `CurlProvider | null`, NOT optional — pass null, not
+      // undefined. `custom`/`curl` are never fallback candidates, so neither
+      // provider argument can matter here.
+      if (hasImages && !this.directSelectionSupportsImages({ provider, model }, null, null)) {
+        return false;
+      }
+      // Privacy boundaries, evaluated rather than caught. Both throw on
+      // refusal, which is the contract they were written for.
+      try {
+        this.assertOutboundImagesAllowed(provider, hasImages);
+      } catch {
+        return false;
+      }
+      if (this.isLocalOnlyMode && !isLocalVisionProvider(provider, {
+        customProviderIsLocal: customProviderIsLocal(this.customProvider),
+      })) {
+        return false;
+      }
+      // Outbound scopes: mirror the dispatcher's TWO HARD-FAIL branches only.
+      // `getDeniedOutboundScopes` takes no provider, so calling it bare would
+      // filter every rung identically — and worse, most denied scopes are
+      // handled by STRIPPING the block and proceeding, not by refusing. Only
+      // these two end a request, so only these two disqualify a rung:
+      //   • `screenshots` denied while the request carries images
+      //   • `transcript` denied while the prompt carries the current turn's
+      //     speech (that IS the question; answering without it answers a
+      //     different, incomplete one)
+      // A LOCAL rung is exempt, exactly as directProviderIsLocal makes it
+      // exempt in the dispatcher.
+      const rungIsLocal = provider === 'ollama'
+        || (provider === 'custom' && customProviderIsLocal(this.customProvider));
+      if (!rungIsLocal) {
+        const denied = this.getDeniedOutboundScopes(
+          request.userPrompt,
+          [...(request.imagePaths ?? [])],
+          this.inferEmbeddedMessageScopes(request.userPrompt),
+        );
+        if (hasImages && denied.includes('screenshots')) return false;
+        if (denied.includes('transcript')
+          && request.userPrompt.includes(DIRECT_ASSIST_CURRENT_TURN_SPEECH_MARKER)) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const rungs: DirectAssistRung[] = [selectedRung];
+    let priority = 1;
+    for (const { provider, model } of this.directFallbackCandidates()) {
+      if (!eligible(provider, model)) continue;
+      rungs.push({ provider, model, priority: priority++, isFallback: true });
+    }
+    return Object.freeze(rungs);
+  }
+
+  /**
+   * Fallback preference order, mirroring the live cloud chain's priorities.
+   * Every id is the module constant this file already uses for that family —
+   * do NOT introduce new default-model accessors, and do not hardcode strings.
+   */
+  private directFallbackCandidates(): { provider: DirectAssistProvider; model: string }[] {
+    const candidates: { provider: DirectAssistProvider; model: string }[] = [
+      { provider: 'natively', model: 'natively' },
+      { provider: 'gemini', model: GEMINI_FLASH_MODEL },
+      { provider: 'openai', model: OPENAI_MODEL },
+      { provider: 'claude', model: CLAUDE_MODEL },
+      { provider: 'groq', model: GROQ_MODEL },
+      { provider: 'antigravity', model: this.antigravityFallbackModel() || '' },
+      // Instance field, empty when Ollama is on auto-detect — the filter below
+      // then drops the rung rather than dispatching to a nameless model. Read
+      // defensively: a bare-prototype caller (see the ladder test harness)
+      // never ran the constructor, so the field initializer never set this.
+      { provider: 'ollama', model: this.ollamaModel ?? '' },
+    ];
+    return candidates.filter((c) => c.model.length > 0);
+  }
+
+  private directProviderHasCredential(provider: DirectAssistProvider): boolean {
+    switch (provider) {
+      case 'natively': return this.hasNatively();
+      case 'gemini': return !!this.client;
+      case 'openai': return !!this.openaiClient;
+      case 'claude': return !!this.claudeClient;
+      case 'groq': return !!this.groqClient;
+      case 'deepseek': return !!this.deepseekClient;
+      case 'nvidia_nim': return !!this.nvidiaNimClient;
+      case 'litellm': return !!this.litellmClient;
+      case 'ollama': return this.useOllama;
+      case 'antigravity': return !!this.antigravityFallbackModel();
+      default: return false;
+    }
+  }
+
+  private directAssistFallbackEnabled(): boolean {
+    try {
+      const { SettingsManager } = require('./services/SettingsManager');
+      return SettingsManager.getInstance().getDirectAssistFallbackEnabled();
+    } catch {
+      // A settings store that cannot be read must not silently disable
+      // recovery — default to the shipped behaviour, which is ON.
+      return true;
+    }
+  }
+
+  /**
    * Direct Assist provider boundary. The request is copied synchronously so a
    * later Settings/model change cannot alter an in-flight dispatch. The
    * returned generator invokes exactly one adapter and contains no fallback.
@@ -10497,6 +10833,7 @@ let isMultimodal = !!(imagePaths?.length);
   public streamDirectAssist(
     request: DirectAssistDispatchRequest,
     abortSignal?: AbortSignal,
+    rung?: DirectAssistRung,
   ): AsyncGenerator<string, void, unknown> {
     if (!request?.selection?.provider || !request.selection.model) {
       throw new DirectAssistError('NO_PROVIDER_CONFIGURED', 'Direct Assist requires a selected provider and model.');
@@ -10512,14 +10849,19 @@ let isMultimodal = !!(imagePaths?.length);
       userPrompt: request.userPrompt,
       imagePaths: Object.freeze([...request.imagePaths]),
     });
-    const custom = request.selection.provider === 'custom'
-      ? this.snapshotDirectCustomProvider(request.selection.model)
+    // The ladder decides WHO answers; request.selection stays the record of who
+    // the user picked (the `done` event and the terminal outcome still report
+    // the rung that actually answered, supplied by the caller).
+    const provider = rung?.provider ?? request.selection.provider;
+    const model = rung?.model ?? request.selection.model;
+    const custom = provider === 'custom'
+      ? this.snapshotDirectCustomProvider(model)
       : null;
-    const curl = request.selection.provider === 'curl' && this.activeCurlProvider?.id === request.selection.model
+    const curl = provider === 'curl' && this.activeCurlProvider?.id === model
       ? Object.freeze({ ...this.activeCurlProvider })
       : null;
 
-    return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal);
+    return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal, rung);
   }
 
   private snapshotDirectCustomProvider(modelId: string): CustomProvider | null {
@@ -10566,10 +10908,15 @@ let isMultimodal = !!(imagePaths?.length);
     custom: CustomProvider | null,
     curl: CurlProvider | null,
     abortSignal?: AbortSignal,
+    rung?: DirectAssistRung,
   ): AsyncGenerator<string, void, unknown> {
     if (abortSignal?.aborted) return;
 
-    const { provider, model } = request.selection;
+    // The ladder decides WHO answers; request.selection stays the record of who
+    // the user picked (the `done` event and the terminal outcome still report
+    // the rung that actually answered, supplied by the caller).
+    const provider = rung?.provider ?? request.selection.provider;
+    const model = rung?.model ?? request.selection.model;
     const imagePaths = [...request.imagePaths];
     for (const imagePath of imagePaths) {
       try {
@@ -10578,6 +10925,20 @@ let isMultimodal = !!(imagePaths?.length);
         throw new DirectAssistError('INVALID_ATTACHMENT', 'An image attachment is no longer available.');
       }
     }
+    // Screenshots re-attached from earlier turns are optional context, so every
+    // check below DROPS them where the current turn's own attachments would
+    // hard-fail. The alternative — one evicted file, an image-less model or a
+    // privacy setting failing an ordinary typed question that merely happens to
+    // follow a screenshot — would make follow-up questions worse than the
+    // no-memory behaviour this replaces. The <recent_transcript> breadcrumb
+    // still tells the model a screenshot existed and is not in this request.
+    let carriedImagePaths = [...(request.historyImagePaths ?? [])].filter((imagePath) => {
+      try {
+        return fs.statSync(imagePath).isFile();
+      } catch {
+        return false;
+      }
+    });
     const disabledFamily = provider === 'codex-cli'
       ? 'codex-cli'
       : provider === 'curl' || provider === 'custom'
@@ -10586,17 +10947,30 @@ let isMultimodal = !!(imagePaths?.length);
     if (this.isProviderDisabled(disabledFamily)) {
       throw new ProviderDisabledError(provider);
     }
-    if (imagePaths.length && !this.directSelectionSupportsImages(request.selection, custom, curl)) {
-      throw new DirectAssistError(
-        'MODEL_DOES_NOT_SUPPORT_IMAGES',
-        `The selected ${model} model does not support image input.`,
-      );
+    if (!this.directSelectionSupportsImages({ provider, model }, custom, curl)) {
+      // Cleared BEFORE the throw below so a text-only turn on a text-only model
+      // still answers instead of failing on an image the user did not attach.
+      carriedImagePaths = [];
+      if (imagePaths.length) {
+        // The capability CHECK stays on `model` — the rung actually about to
+        // be dispatched, fallback or not. The message names
+        // request.selection.model instead: on a fallback rung `model` is a
+        // provider the user never picked, and telling them THAT model
+        // rejected their image would name something they never selected.
+        throw new DirectAssistError(
+          'MODEL_DOES_NOT_SUPPORT_IMAGES',
+          `The selected ${request.selection.model} model does not support image input.`,
+        );
+      }
     }
-    if ((provider === 'custom' || provider === 'curl') && imagePaths.length > 1) {
-      throw new DirectAssistError(
-        'INVALID_ATTACHMENT',
-        'The selected custom provider accepts at most one image per request.',
-      );
+    if (provider === 'custom' || provider === 'curl') {
+      if (imagePaths.length > 1) {
+        throw new DirectAssistError(
+          'INVALID_ATTACHMENT',
+          'The selected custom provider accepts at most one image per request.',
+        );
+      }
+      carriedImagePaths = carriedImagePaths.slice(0, Math.max(0, 1 - imagePaths.length));
     }
 
     // Direct Assist bypasses the legacy context assembler, so enforce the
@@ -10652,6 +11026,46 @@ let isMultimodal = !!(imagePaths?.length);
         'Transcript data is disabled for cloud providers, so this request was not sent.',
       );
     }
+    if (carriedImagePaths.length) {
+      // 'transcript' strips <recent_transcript>, and that block holds the ONLY
+      // text binding each carried screenshot to the turn it came from. Sending
+      // the images without it hands the model unexplained pictures of a screen
+      // from several turns ago, which it will answer from with confidence —
+      // strictly worse than sending nothing.
+      if (deniedScopes.includes('transcript')) {
+        carriedImagePaths = [];
+      } else if (!directProviderIsLocal) {
+        // RE-EVALUATE WITH THE CARRIED IMAGES IN THE SET.
+        //
+        // `deniedScopes` above was computed from `imagePaths`, and
+        // scopesForPayload only tags 'screenshots' when that array is non-empty.
+        // On a text-only follow-up carrying earlier screenshots it is empty, so
+        // 'screenshots' was never in deniedScopes and this guard passed on a
+        // decision made about a payload that did not contain the images.
+        // Measured with the scope denied: [] with the current-turn set, and
+        // ['screenshots'] once a carried image is included.
+        //
+        // The images were then pushed, and the per-streamer
+        // assertOutboundScopes saw them and THREW — turning an ordinary typed
+        // question into a hard failure, the opposite of the drop-never-fail
+        // contract this block documents.
+        const deniedWithCarried = this.getDeniedOutboundScopes(
+          request.userPrompt, [...imagePaths, ...carriedImagePaths], directScopes,
+        );
+        if (deniedWithCarried.includes('screenshots')) {
+          carriedImagePaths = [];
+        } else {
+        // The current turn's images already passed this above; this covers a
+        // turn that carries earlier ones and attaches none of its own.
+          try {
+            this.assertOutboundImagesAllowed(provider, true);
+          } catch {
+            carriedImagePaths = [];
+          }
+        }
+      }
+    }
+    if (carriedImagePaths.length) imagePaths.push(...carriedImagePaths);
     const directUserPrompt = deniedScopes.length
       ? this.stripDeniedScopedBlocksFromMessage(request.userPrompt, deniedScopes)
       : request.userPrompt;
@@ -10680,7 +11094,9 @@ let isMultimodal = !!(imagePaths?.length);
           request.systemPrompt,
           imagePaths,
           abortSignal,
-          INTERACTIVE_CONNECT_TIMEOUT_MS,
+          imagePaths.length
+            ? DIRECT_ASSIST_VISION_CONNECT_TIMEOUT_MS
+            : DIRECT_ASSIST_CONNECT_TIMEOUT_MS,
           true,
         );
         return;
