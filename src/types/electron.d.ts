@@ -715,8 +715,9 @@ export interface ElectronAPI {
   codexCliLogout: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
   codexCliLogin: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
   codexCliDoctor: (config?: any) => Promise<{ success: boolean; action: string; output?: string; error?: string; resolvedPath?: string; config?: any }>;
+  getCodexCliModels: () => Promise<{ source: 'codex-cli' | 'unavailable'; models: { id: string; name: string }[]; fetchedAt?: string; clientVersion?: string }>;
   // ChatGPT OAuth (PKCE) — replaces the old `codex login` CLI subprocess.
-  codexLoginStatus: () => Promise<{ success: boolean; signedIn: boolean; email?: string; expiresAt?: number; error?: string }>;
+  codexLoginStatus: () => Promise<{ success: boolean; signedIn: boolean; source?: 'natively' | 'codex-cli' | null; cliLogin?: 'ok' | 'expired' | 'missing' | 'api-key' | 'invalid'; email?: string; expiresAt?: number; error?: string }>;
   antigravityStatus: () => Promise<{ signedIn: boolean; inProgress: boolean; expiresAt?: number; projectId?: string; error?: string }>;
   antigravityStartLogin: () => Promise<{ success: boolean; error?: string }>;
   antigravityCancelLogin: () => Promise<void>;
@@ -901,6 +902,12 @@ export interface ElectronAPI {
   getVerboseLogging: () => Promise<boolean>;
   setVerboseLogging: (enabled: boolean) => Promise<{ success: boolean }>;
   exportDebugLogs: () => Promise<{ success: boolean; path?: string; files?: string[]; error?: string }>;
+
+  // Windows shortcut guard — the always-on WH_KEYBOARD_LL hook that swallows
+  // and self-dispatches Natively's own chords. Default on; an explicit false is
+  // the opt-out for EDR/AV-sensitive setups. No-op off Windows.
+  getStealthShortcutGuard: () => Promise<boolean>;
+  setStealthShortcutGuard: (enabled: boolean) => Promise<{ success: boolean }>;
 
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => Promise<boolean>;

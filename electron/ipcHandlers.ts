@@ -12,7 +12,7 @@ import * as path from 'path';
 import { AudioDevices } from './audio/AudioDevices';
 import { DatabaseManager } from './db/DatabaseManager'; // Import Database Manager
 import { AppState } from './main';
-import { CodexCliService, isCodexAuthError } from './services/CodexCliService';
+import { CodexCliService, getCodexAuthStatus, isCodexAuthError } from './services/CodexCliService';
 import { describeServiceAccountRejection } from './services/googleServiceAccount';
 import { PhoneMirrorService } from './services/PhoneMirrorService';
 import { sanitizeContextEnvelope } from './services/browser-context/sanitize';
@@ -317,8 +317,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       const codexConfig = llmHelper.getCodexCliConfig();
       let codexSignedIn = false;
       try {
-        const { CodexOAuthService } = require('./services/CodexOAuthService');
-        codexSignedIn = CodexOAuthService.getInstance().getStatus().signedIn === true;
+        // Natively's own ChatGPT sign-in OR the Codex CLI's `codex login`.
+        codexSignedIn = getCodexAuthStatus().signedIn;
       } catch { /* optional */ }
 
       const has = (value?: string) => !!(value && value.trim().length > 0);
@@ -1098,7 +1098,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   safeHandle('finalize-mic-stt', async () => {
-    appState.finalizeMicSTT();
+    return appState.finalizeMicSTT();
   });
 
   // IPC handler for analyzing image from file path
@@ -1207,6 +1207,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // against the prior turn instead. Same-session only (no Hindsight). Bounded per session.
   const { ConversationMemoryService } = require('./intelligence/ConversationMemoryService') as typeof import('./intelligence/ConversationMemoryService');
   const _manualConversationMemory = new ConversationMemoryService();
+
   // Coding thread state (spoken-answer-quality sprint 2026-06-15): tracks original vs
   // current problem across a multi-turn coding session so "what was the ORIGINAL problem?"
   // resolves to the first problem, and complexity/dry-run/optimize follow-ups resolve to
@@ -1252,6 +1253,15 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
         myController = new AbortController();
         _chatStreamsBySender.set(senderId, { streamId: myStreamId, controller: myController });
+
+        // Issue #558: Codex is the selected model but there is no usable
+        // ChatGPT sign-in. Say so, instead of answering from another provider
+        // while the model chip still says Codex.
+        const codexAuthError = llmHelper.getCodexSelectionAuthError();
+        if (codexAuthError) {
+          event.sender.send('gemini-stream-error', codexAuthError, { streamId: myStreamId });
+          return null;
+        }
 
         // Skill invocation parsed EARLY (PR #429 Bug 003). It used to live ~35k
         // characters below, after the Context Intelligence V3 short-circuit had
@@ -1374,7 +1384,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             // security-relevant construction is how the tokenizer copies
             // drifted, and this one decides what evidence a turn may see.
             const { createModeRetrievalPort, attachmentSourceTypeExtensions } = require('./context-intelligence/retrieval/mode-retrieval-port');
-            const { createMeetingRetrievalPort, combineRetrievalPorts } = require('./context-intelligence/retrieval/meeting-retrieval-port');
+            const { combineRetrievalPorts } = require('./context-intelligence/retrieval/meeting-retrieval-port');
             // Custom/general modes gain the source types their OWN attachments
             // evidence (deep-test D10): a candidate résumé + JD attached to an
             // "Untitled" custom mode planned [] for every job question because
@@ -1415,21 +1425,31 @@ export function initializeIpcHandlers(appState: AppState): void {
               userId: V3_USER_ID,
             });
 
-            // Meeting evidence, when this turn happens inside a meeting and the
-            // mode authorizes transcripts. Without it a MEETING_STATEMENT
-            // question composed an honest but useless no-evidence disclosure
-            // even when the answer had been said out loud a minute earlier.
-            //
-            // Cross-meeting isolation is NOT re-implemented here: the port
-            // declares each chunk's scope as its own meeting, so the adapter's
-            // existing scope containment rejects a foreign meeting OUT_OF_SCOPE
-            // — one filter, already measured, rather than a second copy of the
-            // rule (06 §4).
-            const v3MeetingId = (appState.getIntelligenceManager?.() as any)
-              ?.getSessionTracker?.()?.getMeetingMetadata?.()?.id ?? null;
-            const ragForV3 = appState.getRAGManager?.();
-            const wantsMeeting = policy.allowedSourceTypes.includes('MEETING_TRANSCRIPT')
-              && Boolean(v3MeetingId) && Boolean(ragForV3?.getRetriever);
+            // Meeting evidence (issue #552): the JIT semantic port scoped to the
+            // LIVE index id plus the BM25 port over raw speech, from the same
+            // resolver what-to-answer uses. This block used to read the meeting
+            // id through an accessor for IntelligenceManager's PRIVATE
+            // `SessionTracker` that was never exposed publicly — `as any` +
+            // optional chaining made that silently return undefined, so the
+            // meeting-port gate was always false and the meeting port below
+            // was never built. Even a real accessor would not have helped: no
+            // normal meeting sets a metadata id, and JIT chunks live under the
+            // live index id anyway. The RAG pre-flight in the renderer was the
+            // only transcript grounding typed chat had, and it carried no
+            // conversation history. Cross-meeting isolation is still the scope
+            // filter's job (06 §4) — the resolver returns the id the turn's
+            // scope must carry for that filter to admit the JIT chunks.
+            const { resolveMeetingEvidence } = require('./context-intelligence/retrieval/meeting-evidence') as
+              typeof import('./context-intelligence/retrieval/meeting-evidence');
+            const v3ConversationKey = v3ConversationSessionId(appState, senderId);
+            const v3MeetingEvidence = resolveMeetingEvidence({
+              rag: appState.getRAGManager?.() ?? null,
+              segments: appState.getIntelligenceManager?.()?.getCurrentMeetingTranscript?.() ?? [],
+              allowedSourceTypes: policy.allowedSourceTypes,
+              userId: V3_USER_ID,
+              sessionId: v3ConversationKey,
+              tokenBudget: policy.contextBudget.evidenceTokens,
+            });
 
             // Profile Intelligence hydration (2026-07-31 source-routing fix).
             // The user's active résumé/target JD, uploaded ONCE in Profile
@@ -1558,7 +1578,14 @@ export function initializeIpcHandlers(appState: AppState): void {
                   .createScreenRetrievalPort({
                     description: v3ScreenDescription,
                     userId: V3_USER_ID,
-                    sessionId: String(senderId),
+                    // The SAME key the request scope carries below (2026-09-11).
+                    // This was String(senderId) while the request scope moved to
+                    // v3ConversationSessionId, so every screen chunk the port
+                    // produced was rejected OUT_OF_SCOPE at the scope gate —
+                    // measured on a manual "fix" with a stack trace on screen:
+                    // 7 screen candidates, 7 rejected, and the answer came from
+                    // an attached error-log fixture instead of the screenshot.
+                    sessionId: v3ConversationKey,
                   })
               : null;
 
@@ -1566,12 +1593,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               modePort,
               ...(v3ScreenPort ? [v3ScreenPort] : []),
               ...(v3ProfilePort ? [v3ProfilePort] : []),
-              ...(wantsMeeting ? [createMeetingRetrievalPort({
-                retriever: ragForV3!.getRetriever(),
-                currentMeetingId: v3MeetingId,
-                userId: V3_USER_ID,
-                tokenBudget: policy.contextBudget.evidenceTokens,
-              })] : []),
+              ...v3MeetingEvidence.ports,
             ];
             const port = v3Ports.length > 1 ? combineRetrievalPorts(v3Ports as never[]) : modePort;
 
@@ -1592,6 +1614,13 @@ export function initializeIpcHandlers(appState: AppState): void {
               // as authoritative evidence. Manual chat has no periodic-capture OCR
               // object at all, so imagePaths is the only screen signal here.
               hasScreenContext: (imagePaths?.length ?? 0) > 0,
+              // Live meeting with transcript evidence available (issue #552,
+              // task 7b) — true only when resolveMeetingEvidence() actually
+              // built a port above, not merely "the mode allows it". Lets the
+              // classifier claim MEETING_TRANSCRIPT as an alternative for an
+              // unclassified factual question in General (see
+              // ClassificationInput.inLiveMeeting).
+              inLiveMeeting: v3MeetingEvidence.inLiveMeeting,
               // Settings > Intelligence > Memory > "Chat history". Read HERE, not
               // in the bridge: context-intelligence has no dependency on the flag
               // registry (see contracts/retrieval-flags.ts for what the first one
@@ -1637,8 +1666,11 @@ export function initializeIpcHandlers(appState: AppState): void {
                 // This was String(senderId) while what-to-answer read the ring
                 // under the meeting id, so the two surfaces kept separate
                 // histories and neither could see the other's screenshots.
-                sessionId: v3ConversationSessionId(appState, senderId),
-                ...(v3MeetingId ? { meetingId: v3MeetingId } : {}),
+                sessionId: v3ConversationKey,
+                // The live index id when JIT chunks are queryable — the meeting
+                // port declares its chunks under that id, and scopeAdmits
+                // rejects anything the turn does not carry (issue #552).
+                ...(v3MeetingEvidence.scopeMeetingId ? { meetingId: v3MeetingEvidence.scopeMeetingId } : {}),
               },
               retrieval: port,
               // Natively persona + typed-chat layout for the V3-owned surface
@@ -1680,11 +1712,12 @@ export function initializeIpcHandlers(appState: AppState): void {
                 if (isBareCodeRequest(v3Question) || isCodingContinuation(v3Question)) {
                   try {
                     // IntelligenceManager exposes getLastAssistantMessage()
-                    // directly (it owns a PRIVATE SessionTracker and has no
-                    // getSessionTracker accessor) — the old chained form was a
-                    // phantom method that `as any` + optional chaining made
-                    // silently return undefined, so this whole guard was dead
-                    // code and every continuation was answered context-free.
+                    // directly (its session tracker is PRIVATE with no public
+                    // accessor) — the old chained form reached for a method
+                    // that did not exist, and `as any` + optional chaining
+                    // made that silently return undefined, so this whole guard
+                    // was dead code and every continuation was answered
+                    // context-free.
                     // No surface argument: "anywhere" is the point, so an
                     // overlay answer can ground a chat follow-up.
                     const lastAnywhere = appState.getIntelligenceManager?.()?.getLastAssistantMessage?.();
@@ -2112,14 +2145,27 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Capture rolling context BEFORE adding the new user message — otherwise the
         // 100s window would echo back the user's just-typed message as both context and
         // question, confusing small models (the "20-char context" log line was just an echo).
+        //
+        // Issue #552 (final review pass, I4): this used to run ONLY when `context`
+        // was absent, because on the legacy path a non-empty `context` meant a
+        // caller-composed prompt that had no need for the rolling window. That
+        // stopped being true once typed chat started sending its own conversation
+        // history as `context` from the second turn on — the deleted renderer
+        // pre-flight (`ragQueryLive`) used to be the only live-transcript
+        // grounding that surface had. With the old `if (!context)` gate,
+        // `autoContextSnapshot` stayed permanently undefined for every typed
+        // follow-up during a meeting, so the merge a few hundred lines below
+        // (the `context && autoContextSnapshot` sibling of the pre-existing
+        // `!context && autoContextSnapshot` branch) could never fire — the
+        // legacy path (V3's rollback lever) silently lost meeting grounding.
+        // Always capturing here is what makes that merge possible; it is a
+        // cheap in-memory read regardless of whether `context` is set.
         let autoContextSnapshot: string | undefined;
-        if (!context) {
-          try {
-            const snap = intelligenceManager.getFormattedContext(100);
-            if (snap && snap.trim().length > 0) autoContextSnapshot = snap;
-          } catch (ctxErr) {
-            console.warn('[IPC] Failed to capture pre-turn context:', ctxErr);
-          }
+        try {
+          const snap = intelligenceManager.getFormattedContext(100);
+          if (snap && snap.trim().length > 0) autoContextSnapshot = snap;
+        } catch (ctxErr) {
+          console.warn('[IPC] Failed to capture pre-turn context:', ctxErr);
         }
 
         // Now add USER message to IntelligenceManager (after context snapshot)
@@ -2506,9 +2552,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (isBareCodeRequest(message) || isCodingContinuation(message)) {
           try {
             // Phantom-method fix (code review 2026-08-19): IntelligenceManager
-            // exposes getLastAssistantMessage() directly; getSessionTracker()
-            // does not exist, so the old chained form silently returned
-            // undefined and this guard never ran. See the V3 twin above.
+            // exposes getLastAssistantMessage() directly; the old chained form
+            // reached for a session-tracker accessor that does not exist, so
+            // it silently returned undefined and this guard never ran. See
+            // the V3 twin above.
             const lastAnywhere = appState.getIntelligenceManager?.()?.getLastAssistantMessage?.();
             const bare = isBareCodeRequest(message);
             if (typeof lastAnywhere === 'string' && lastAnywhere.trim().length > 40
@@ -3306,6 +3353,24 @@ export function initializeIpcHandlers(appState: AppState): void {
               `[IPC] Auto-injected 100s context for gemini-chat-stream (${context.length} chars${snapshotForContext !== autoContextSnapshot ? ', prior-assistant turns stripped for document-grounded mode' : ''})`,
             );
           }
+        } else if (context && autoContextSnapshot) {
+          // Issue #552 (final review pass, I4): the sibling branch above is
+          // the ONLY place this rolling live-transcript snapshot reaches the
+          // prompt, and it requires an ABSENT `context`. Typed chat sends its
+          // own non-empty `context` (conversation history) from the second
+          // turn on, so on the legacy path (V3 off) that branch never fired
+          // past the first turn — the deleted renderer pre-flight used to be
+          // the only meeting-transcript grounding a typed question had, and
+          // turning V3 off (the intended rollback lever) silently dropped it.
+          // Merge rather than replace: the renderer's own history is still
+          // what a bare follow-up's pronoun resolution needs, so it stays
+          // LAST — same idiom as every other additive block in this handler
+          // (`context = context ? \`${block}\n\n${context}\` : block`), just
+          // with `context` known truthy here so the ternary collapses.
+          context = `${autoContextSnapshot}\n\n${context}`;
+          console.log(
+            `[IPC] Merged 100s live-transcript snapshot alongside existing chat context for gemini-chat-stream (${autoContextSnapshot.length} chars, issue #552)`,
+          );
         }
         // MANUAL REGRESSION FIX (release 2026-06-08): for ANY profile-required
         // candidate answer type (jd_fit / skill / behavioral / project / experience /
@@ -5336,6 +5401,14 @@ export function initializeIpcHandlers(appState: AppState): void {
                     && (isIntelligenceFlagEnabled('contextOsPropertyValidation')
                         || manualActiveMode?.documentGroundedCustomModeActive === true)
                     && docContextBlock
+                    // A provider stall is not an absence of evidence. Measured
+                    // 2026-09-10 with the hosted route timing out: the deadline
+                    // fallback text ("The model did not produce an answer in
+                    // time…") was then judged unable to prove the property and
+                    // REPLACED by "This is not directly mentioned in the
+                    // uploaded material." — a transport failure reported to the
+                    // user as a fact about their document, with zero model tokens.
+                    && finalGenerationMode !== 'provider_error_no_answer'
                     && trimmed.length >= 8) {
                   const answerIsRefusal = isAssistantRefusal(trimmed) || /^\s*(?:there is |there's )?no (?:information|mention|data)\b/i.test(trimmed);
                   if (!answerIsRefusal) {
@@ -11804,6 +11877,14 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // The installed Codex CLI's model catalogue, for the model pickers. Reads the
+  // CLI's models_cache.json only — never its credentials. 'unavailable' (no CLI)
+  // tells the renderer to use its built-in presets.
+  safeHandle('codex-cli:models', async () => {
+    const { readCodexModelCatalog } = require('./services/CodexModelCatalog') as typeof import('./services/CodexModelCatalog');
+    return readCodexModelCatalog();
+  });
+
   safeHandle('set-codex-cli-config', (_, config: any) => {
     try {
       const normalized = CodexCliService.normalizeConfig(config || {});
@@ -11839,8 +11920,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // working without an error state.
       const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
       const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
-      const { CodexOAuthService } = require('./services/CodexOAuthService');
-      const status = CodexOAuthService.getInstance().getStatus();
+      const status = getCodexAuthStatus();
       return {
         success: true,
         resolvedPath: normalized.path, // legacy field; ignored
@@ -11864,11 +11944,13 @@ export function initializeIpcHandlers(appState: AppState): void {
       const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
       const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
       if (action === 'status') {
-        const status = oauth.getStatus();
+        const status = getCodexAuthStatus();
         return {
           success: status.signedIn,
           action,
-          output: status.signedIn ? `Logged in with ChatGPT account (${status.email || 'unknown'})` : 'Not signed in',
+          output: status.signedIn
+            ? `Logged in with ChatGPT account (${status.email || 'unknown'})${status.source === 'codex-cli' ? ' via your Codex CLI login' : ''}`
+            : 'Not signed in',
           config: normalized,
         };
       }
@@ -11894,13 +11976,15 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
       }
       if (action === 'doctor') {
-        const status = oauth.getStatus();
+        const status = getCodexAuthStatus();
         return {
           success: true,
           action,
           output: status.signedIn
-            ? `Codex doctor OK — signed in as ${status.email || 'unknown'}`
-            : 'Codex doctor OK — not signed in (run `codex:start-login`)',
+            ? `Codex doctor OK — signed in as ${status.email || 'unknown'}${status.source === 'codex-cli' ? ' (Codex CLI login)' : ''}`
+            : status.cliLogin === 'expired'
+              ? 'Codex doctor — your Codex CLI login has expired; run any `codex` command to refresh it, or sign in from Settings → AI Providers → OpenAI Codex'
+              : 'Codex doctor OK — not signed in (Settings → AI Providers → OpenAI Codex, or `codex login` in a terminal)',
           config: normalized,
         };
       }
@@ -11967,7 +12051,9 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('codex:login-status', () => {
     try {
-      return { success: true, ...codexOAuth.getStatus() };
+      // Unified status — Natively's own sign-in or the Codex CLI's login.
+      // getCodexAuthStatus() never carries a token.
+      return { success: true, ...getCodexAuthStatus() };
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -12180,6 +12266,17 @@ export function initializeIpcHandlers(appState: AppState): void {
   // stay truthful end-to-end. isMemoryEligibleSegment treats 'test' as eligible
   // only under the same env gate, so meeting memory/summary/RAG behave as they
   // would for real speech in a test run while production remains airtight.
+  //
+  // A1 (final review pass on #552): also feeds RAGManager.feedLiveTranscript,
+  // the same call the real STT handler makes for every final segment
+  // (main.ts's `if (segment.isFinal && this.ragManager)` block). Without this,
+  // im.addTranscript() alone put injected speech into the session transcript
+  // and meeting memory but NEVER into the JIT live indexer — no test run
+  // could ever produce embedded chunks, so the JIT meeting port half of
+  // resolveMeetingEvidence (the semantic port, as opposed to the BM25
+  // live-transcript port) was permanently unexercisable outside a real
+  // microphone session. Still unreachable in packaged builds (same two gates
+  // above cover this call too).
   safeHandle('debug-inject-transcript', async (_event, segments: unknown) => {
     const { app } = require('electron');
     if (process.env.NATIVELY_TEST_TRANSCRIPT_INJECTION !== '1' || app.isPackaged) {
@@ -12195,16 +12292,24 @@ export function initializeIpcHandlers(appState: AppState): void {
       const s = raw as { speaker?: unknown; text?: unknown; timestamp?: unknown; confidence?: unknown };
       const text = String(s?.text ?? '').slice(0, 4000).trim();
       if (!text) continue;
+      const speaker = String(s?.speaker ?? 'Speaker');
+      const timestamp = typeof s?.timestamp === 'number' ? s.timestamp : Date.now();
       im.addTranscript({
-        speaker: String(s?.speaker ?? 'Speaker'),
+        speaker,
         text,
-        timestamp: typeof s?.timestamp === 'number' ? s.timestamp : Date.now(),
+        timestamp,
         final: true,
         // Real STT confidence is always < 1; injected segments mimic that so
         // legacy consumers behave identically, but origin is what gates them.
         confidence: typeof s?.confidence === 'number' ? s.confidence : 0.95,
         origin: 'test',
       }, true);
+      // Parity with the STT path (main.ts's `if (segment.isFinal && this.ragManager)`
+      // block) — every injected segment here is final, so every one feeds the
+      // JIT indexer too. Feeding must never fail the injection itself.
+      try {
+        appState.getRAGManager?.()?.feedLiveTranscript([{ speaker, text, timestamp }]);
+      } catch { /* JIT feed only — injection still counts */ }
       injected++;
     }
     console.log(`[TestInjection] Injected ${injected} transcript segment(s) with origin 'test'.`);
@@ -13601,6 +13706,107 @@ export function initializeIpcHandlers(appState: AppState): void {
     },
   );
 
+  /**
+   * Write a RAG-answered live turn to the same sinks the V3 manual-chat path
+   * writes (issue #552), so a later typed turn can resolve a follow-up against
+   * it and Meeting Notes lists it. Mirrors the V3 site's split: the USER turn
+   * is always recorded; the ANSWER-side sinks are skipped when the stream was
+   * truncated (RAGManager appends RAG_STREAM_INCOMPLETE_CODA) or when the
+   * active mode changed mid-stream, because a partial or wrong-mode answer
+   * must never become the antecedent of the next question. Every sink is
+   * best-effort — recording must not fail the answer.
+   *
+   * BUG-MODE-BLEEDING (final review pass on #552): this helper used to write
+   * straight into `_manualConversationMemory` and the conversation ring with
+   * NO mode check, unlike the V3 site above which has carried this guard
+   * since the original mode-bleeding fix. `modes:set-active` clears
+   * `_manualConversationMemory` and the ring for the OUTGOING mode but does
+   * NOT abort an in-flight `rag:query-live` stream, so a mode switch
+   * mid-stream let this helper re-populate both with the OLD mode's Q/A pair
+   * right after the switch had cleared them for the NEW one. `manualActiveMode`
+   * is the mode captured by the caller before the stream started;
+   * `liveModeIdAtRecord` reads it again here, and a mismatch skips the
+   * answer-side sinks exactly like the V3 guard does.
+   *
+   * Deliberate divergences from the V3 site (M9, review): no `mode` field on
+   * the `_manualConversationMemory.record()` call — this surface has no
+   * per-mode prompt to tag the way V3's `modeInfo.templateType` does — and
+   * `logUsage('rag_live', …)` stores `type: 'rag_live'`, not `'chat'`.
+   * SessionTracker.logUsage therefore records `source: 'external'`, but more
+   * to the point `getRecentManualTurn` filters on `entry.type !== 'chat'`
+   * FIRST, before it ever looks at `source` — a `rag_live` entry can never
+   * be read back as the "previous manual turn" a later prompt injects as
+   * `<previous_assistant_answer_excerpt>`. A truncated V3 `chat` entry needs
+   * `pushUsage({ synthetic: true })` to close that replay door; a truncated
+   * `rag_live` entry is already outside it, so this helper doesn't need the
+   * synthetic-usage counterpart.
+   */
+  function recordLiveRagTurn(
+    senderId: number,
+    query: string,
+    answer: string,
+    manualActiveMode: import('./services/ModesManager').Mode | null,
+  ): void {
+    const ragLiveAnswer = answer.trim();
+    if (!query.trim() || !ragLiveAnswer) return;
+    const { RAG_STREAM_INCOMPLETE_CODA } = require('./rag/RAGManager') as typeof import('./rag/RAGManager');
+    const ragLiveTruncated = ragLiveAnswer.trimEnd().endsWith(RAG_STREAM_INCOMPLETE_CODA.trim());
+    const im = appState.getIntelligenceManager?.();
+    try {
+      im?.addTranscript?.({ text: query, speaker: 'user', timestamp: Date.now(), final: true, origin: 'manual_chat' }, true);
+    } catch { /* continuity only */ }
+    try {
+      im?.logUsage?.('rag_live', query, ragLiveAnswer);
+    } catch { /* usage only */ }
+    if (ragLiveTruncated) {
+      console.warn('[RAG] truncated live answer — recording the user turn but skipping answer-side history sinks');
+      return;
+    }
+    // BUG-MODE-BLEEDING guard, mirroring the V3 manual-chat site's record
+    // guard (see this function's docblock for why a switch mid-stream needs
+    // checking again here rather than trusting the caller's snapshot).
+    const { ModesManager } = require('./services/ModesManager');
+    const mm = ModesManager.getInstance();
+    let liveModeIdAtRecord: string | null = null;
+    try { liveModeIdAtRecord = mm.getActiveMode()?.id ?? null; } catch { /* record-guard only */ }
+    if (liveModeIdAtRecord !== (manualActiveMode?.id ?? null)) {
+      console.warn('[RAG] mode changed mid-stream — skipping answer-side history sinks for the live RAG turn', {
+        requestMode: manualActiveMode?.id ?? null,
+        liveMode: liveModeIdAtRecord,
+      });
+      return;
+    }
+    try {
+      const { recordAnswerSummary } = require('./context-intelligence/question/conversation-state-store');
+      recordAnswerSummary(
+        v3ConversationSessionId(appState, senderId),
+        ragLiveAnswer,
+        undefined,
+        // Seeds state for a turn that never went through orchestrate(); see
+        // recordAnswerSummary's `question` docblock.
+        query,
+        // This turn completed synchronously and is certainly the newest —
+        // unlike the deferred what-to-answer writer, it cannot land after a
+        // later turn has already advanced the state. Anchoring moves
+        // `previousQuestion` so the NEXT typed follow-up ("expand on that")
+        // resolves against THIS voice turn instead of whatever typed question
+        // preceded it (task 7b, issue #552, live-verified).
+        { anchor: true },
+      );
+    } catch { /* continuity only */ }
+    try {
+      _manualConversationMemory.record({
+        sessionId: String(senderId),
+        userMessage: query,
+        assistantAnswer: ragLiveAnswer,
+        timestamp: Date.now(),
+      });
+    } catch { /* memory only */ }
+    try {
+      im?.addAssistantMessage?.(ragLiveAnswer, undefined, 'manual_chat');
+    } catch { /* continuity only */ }
+  }
+
   // Query live meeting with JIT RAG
   safeHandle('rag:query-live', async (event, { query }: { query: string }) => {
     const ragManager = appState.getRAGManager();
@@ -13609,12 +13815,13 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { fallback: true };
     }
 
-    // Check if JIT indexing is active AND has at least one embedded chunk.
-    // isLiveIndexingActive() only tells us the indexer is running — it may have
-    // received segments but not yet produced queryable embeddings. Calling
-    // queryMeeting() with zero chunks throws NO_MEETING_EMBEDDINGS, adding
-    // ~300ms of wasted try/catch overhead before the fallback fires.
-    if (!ragManager.isLiveIndexingActive('live-meeting-current') || !ragManager.hasLiveChunks()) {
+    // Gate on QUERYABLE chunks, not on "the indexer is running": calling
+    // queryMeeting() with zero embedded chunks throws NO_MEETING_EMBEDDINGS
+    // after ~300ms of wasted work. getLiveMeetingId() answers both questions
+    // and owns the live id, so this handler no longer repeats the literal
+    // that main.ts passes to startLiveIndexing (issue #552).
+    const liveMeetingId = ragManager.getLiveMeetingId();
+    if (!liveMeetingId) {
       return { fallback: true };
     }
 
@@ -13636,11 +13843,30 @@ export function initializeIpcHandlers(appState: AppState): void {
     const queryKey = `live-${crypto.randomUUID()}`;
     activeRAGQueries.set(queryKey, abortController);
 
-    try {
-      const stream = ragManager.queryMeeting('live-meeting-current', query, abortController.signal);
+    // Captured BEFORE the stream starts (BUG-MODE-BLEEDING, final review pass
+    // on #552): recordLiveRagTurn below compares this against the mode that
+    // is active when the stream actually finishes. A `modes:set-active` mid-
+    // stream clears `_manualConversationMemory`/the ring for the OUTGOING
+    // mode but does not abort this stream, so without the comparison the
+    // recorder would re-populate both with the OLD mode's turn right after
+    // the switch cleared them for the NEW one. Same idiom as the V3
+    // manual-chat site above (`const mm = ModesManager.getInstance()`).
+    const { ModesManager } = require('./services/ModesManager');
+    const manualActiveMode = ModesManager.getInstance().getActiveMode();
 
+    try {
+      const stream = ragManager.queryMeeting(liveMeetingId, query, abortController.signal);
+
+      // Accumulated so the turn can be RECORDED (issue #552). A RAG-answered
+      // turn used to leave no trace in main: not in the conversation ring V3
+      // reads for follow-ups, not in conversation memory, not in the session
+      // transcript, not in the usage log. The renderer's bubble history looked
+      // complete, but the next turn to reach V3 had no antecedent — "do via
+      // stack" after a RAG-answered "lc 573" had nothing to refer to.
+      let ragLiveAnswer = '';
       for await (const chunk of stream) {
         if (abortController.signal.aborted) break;
+        ragLiveAnswer += chunk;
         event.sender.send('rag:stream-chunk', { live: true, chunk });
       }
 
@@ -13649,6 +13875,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // the NEW placeholder as done before its first real chunk arrives.
       if (!abortController.signal.aborted) {
         event.sender.send('rag:stream-complete', { live: true });
+        recordLiveRagTurn(event.sender.id, query, ragLiveAnswer, manualActiveMode);
       }
       return { success: true };
     } catch (error: any) {
@@ -15324,7 +15551,9 @@ export function initializeIpcHandlers(appState: AppState): void {
       const result: any = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
-          { name: 'Text & Documents', extensions: ['txt', 'md', 'markdown', 'json', 'csv', 'tsv', 'xml', 'html', 'htm', 'log', 'pdf', 'docx'] },
+          // One source of truth with the extractor: a hand-copied list here
+          // refused every source/config file the extractor accepts (2026-09-10).
+          { name: 'Text, Documents & Code', extensions: [...SAFE_DOCUMENT_EXTENSIONS].map(extension => extension.slice(1)) },
           { name: 'All Files', extensions: ['*'] },
         ],
       });
@@ -16965,9 +17194,40 @@ export function initializeIpcHandlers(appState: AppState): void {
         // with skipCooldown/forceFresh and optional screenshot paths — so the
         // harness can exercise the surface users actually report on, not only
         // the planner-routed auto-answer path.
+        // Mirror the real hotkey handler (generate-what-to-say): a screenshot
+        // goes through ScreenUnderstandingService FIRST and its result rides
+        // along as `screenContext`, so the V3 screen port has a description to
+        // retrieve from. Without this the harness sent the raw image only, the
+        // screen port had nothing, and two "screenshot gaps" measured on
+        // 2026-09-11 were the harness bypassing the product path.
+        const e2eScreenContext = (async () => {
+          if (!params.hotkey || !params.imagePaths?.length) return undefined;
+          try {
+            const { getScreenUnderstandingService } = require('./services/screen/ScreenUnderstandingService');
+            const { SettingsManager: SM2 } = require('./services/SettingsManager');
+            const { CredentialsManager: CM2 } = require('./services/CredentialsManager');
+            const settings2 = SM2.getInstance(); const credentials2 = CM2.getInstance();
+            const providerScopes = settings2.get('providerDataScopes') || {};
+            const localVisionAvailable = credentials2.anyLocalVisionProviderConfigured?.() ?? false;
+            const sur = await getScreenUnderstandingService().understand({
+              modeId: 'what-to-say', transcript: params.question, userAction: 'what_to_say', qualityMode: 'balanced',
+              imagePaths: params.imagePaths,
+              screenUnderstandingMode: settings2.getScreenUnderstandingMode(),
+              technicalInterviewVisionFirst: settings2.getTechnicalInterviewVisionFirst(),
+              providerPolicy: {
+                localOnly: settings2.getScreenUnderstandingMode() === 'private_vision',
+                allowScreenshots: providerScopes.screenshots !== false,
+                visionAvailable: credentials2.anyVisionProviderConfigured?.() ?? true,
+                localVisionAvailable,
+              },
+            });
+            console.log('[E2E] screen understanding', { status: sur?.status, chars: String(sur?.extractedText ?? sur?.visibleSummary ?? '').length, provider: sur?.providerUsed, failureReason: sur?.failureReason, warnings: sur?.warnings });
+            return sur?.status === 'available' ? sur : undefined;
+          } catch (e: any) { console.warn('[E2E] screen understanding threw', e?.message); return undefined; }
+        })();
         Promise.resolve(
           params.hotkey
-            ? im.runWhatShouldISay(params.question, 0.9, params.imagePaths, { skipCooldown: true, forceFresh: true })
+            ? e2eScreenContext.then((screenContext) => im.runWhatShouldISay(params.question, 0.9, params.imagePaths, { skipCooldown: true, forceFresh: true, ...(screenContext ? { screenContext } : {}) }))
             : im.handleSuggestionTrigger({
               context: builtContext,
               lastQuestion: params.question,

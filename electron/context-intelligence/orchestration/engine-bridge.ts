@@ -61,6 +61,10 @@ export interface BridgeInput {
    *  formula sheet, deep-run 2 issue 9). Always populated by call sites;
    *  never gated on debug level (routing must not depend on logging). */
   attachedFileNames?: readonly string[];
+  /** The screen-understanding description for THIS turn, when a screenshot
+   *  was attached — lends its question/terms to retrieval when the spoken
+   *  question only points at the screen ("what he is asking", "this"). */
+  screenText?: string;
   /** How many Profile Intelligence sources hydrated this turn's retrieval
    *  (active résumé / target JD). Composer wording + telemetry — a zero-
    *  attachment turn with a live profile must NOT claim nothing was searched. */
@@ -81,6 +85,9 @@ export interface BridgeInput {
   requestSequence?: number;
   isFollowUp?: boolean;
   hasScreenContext?: boolean;
+  /** The turn is inside a live meeting with transcript evidence available
+   *  (issue #552, task 7b) — see ClassificationInput.inLiveMeeting. */
+  inLiveMeeting?: boolean;
   /**
    * Where `question` came from. Defaults to 'manual' — correct for the manual
    * chat and typed-question call sites, which is what every caller was before
@@ -254,10 +261,12 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       userAnswerPolicy,
       isFollowUp: input.isFollowUp,
       hasScreenContext: input.hasScreenContext,
+      inLiveMeeting: input.inLiveMeeting,
       // Definite value lookups ground only where documents exist (deep-test D2).
       hasAttachedDocuments: (input.attachedSourceCount ?? 0) > 0
         || (input.profileSourceCount ?? 0) > 0,
       attachedFileNames: input.attachedFileNames,
+      screenText: input.screenText,
       extraAllowedSourceTypes: input.extraAllowedSourceTypes,
     };
 

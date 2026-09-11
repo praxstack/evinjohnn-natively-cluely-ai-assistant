@@ -68,7 +68,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
 import { createProviderRateLimiters, RateLimiter } from './services/RateLimiter';
-import { CodexCliConfig, CodexCliService, DEFAULT_CODEX_CLI_CONFIG } from './services/CodexCliService';
+import { chatGptCompatibleModel, CodexCliConfig, CodexCliService, codexSignedOutMessage, DEFAULT_CODEX_CLI_CONFIG, getCodexAuthStatus } from './services/CodexCliService';
 import { AntigravityService } from './services/AntigravityService';
 import { GROQ_PRIMARY_MODEL, groqFallbackFor, isGroqModelGone, groqReasoningParams } from './llm/groqModels';
 import { DirectAssistError } from './direct-assist/errors';
@@ -1031,13 +1031,26 @@ export class LLMHelper {
   /** Live, fail-OPEN: a credential-store failure must not start refusing turns
    *  that would otherwise have been answered. */
   private anyVisionProviderAvailable(): boolean {
-    if (!this.isProviderDisabled('antigravity') && AntigravityService.getInstance().getStatus().signedIn) return true;
+    if (!this.isProviderDisabled('antigravity') && this.antigravitySignedIn()) return true;
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
       return cm.anyVisionProviderConfigured?.() ?? true;
     } catch {
       return true;
+    }
+  }
+
+  /** Antigravity's status reads its tokens from the credential store. If that
+   *  throws, Antigravity is unusable, which says nothing about the other
+   *  providers: answer false and let anyVisionProviderAvailable's own
+   *  credential check (fail-open by itself) decide. Throwing skipped that check
+   *  and failed the whole turn; returning true would skip it too. */
+  private antigravitySignedIn(): boolean {
+    try {
+      return AntigravityService.getInstance().getStatus().signedIn;
+    } catch {
+      return false;
     }
   }
 
@@ -1871,10 +1884,30 @@ export class LLMHelper {
     if (this.isProviderDisabled('codex-cli')) return false;
     if (!this.codexCliConfig.enabled) return false;
     try {
-      const { CodexOAuthService } = require('./services/CodexOAuthService');
-      return CodexOAuthService.getInstance().getStatus().signedIn === true;
+      // Natively's own ChatGPT sign-in OR the Codex CLI's `codex login`.
+      return getCodexAuthStatus().signedIn;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * The sign-in message when the user has explicitly selected a Codex model
+   * that cannot run because there is no usable ChatGPT sign-in; null otherwise
+   * (including when the user switched Codex off — that is not an auth problem).
+   *
+   * Manual chat fails with this instead of answering from another provider
+   * while the model chip still says Codex (issue #558). The auto-answer path
+   * keeps its fallback — a mid-meeting error has nobody to read it.
+   */
+  public getCodexSelectionAuthError(): string | null {
+    if (!this.isCodexCliModel(this.currentModelId)) return null;
+    if (this.isProviderDisabled('codex-cli') || !this.codexCliConfig.enabled) return null;
+    try {
+      const status = getCodexAuthStatus();
+      return status.signedIn ? null : codexSignedOutMessage(status);
+    } catch {
+      return null;
     }
   }
   // ---------------------------
@@ -2235,7 +2268,10 @@ export class LLMHelper {
   private getSelectedCodexCliModel(fastMode: boolean): string {
     if (fastMode) return this.codexCliConfig.fastModel;
     if (this.currentModelId.startsWith("codex-cli:")) {
-      return this.currentModelId.slice("codex-cli:".length) || this.codexCliConfig.model;
+      // A selection persisted from an earlier build's presets (gpt-5.4,
+      // gpt-5.3-codex, spark) is rejected for a ChatGPT account on every turn;
+      // run the configured model instead.
+      return chatGptCompatibleModel(this.currentModelId.slice("codex-cli:".length), this.codexCliConfig.model);
     }
     return this.codexCliConfig.model;
   }
@@ -8030,6 +8066,11 @@ let isMultimodal = !!(imagePaths?.length);
       yield* this.streamWithCodexCli(userContent, finalSystemPrompt, false, imagePaths, abortSignal);
       return;
     }
+    if (this.getCodexSelectionAuthError()) {
+      // Manual chat is stopped before it gets here (ipcHandlers); this is the
+      // auto-answer path, which answers from the next provider instead.
+      console.warn('[LLMHelper] Codex is selected but has no usable ChatGPT sign-in — answering from fallback routing.');
+    }
 
     // 2a. CustomProvider (switchToCustom path) — full SSE-capable streaming
     if (this.customProvider) {
@@ -8327,6 +8368,30 @@ let isMultimodal = !!(imagePaths?.length);
         // the outer finally below. The race is bounded — install/restore is a
         // synchronous span, no concurrent streams see the temporary install.
         const raceCustomRestore = this.installConfiguredCustomForRace(textProviders, message, context, finalSystemPrompt, isMultimodal, imagePaths);
+
+        // Let a configured spare actually land when the gateway stalls
+        // (2026-09-10). Measured with api.natively.software flapping and a
+        // working Gemini key on file: the natively rung timed out at its 4 s
+        // connect budget, was retried (cfg.maxAttempts 2) for another 4 s, and
+        // the Gemini spare then opened with ~5 s left under the 13 s live
+        // ceiling but only the shared 2.5 s ttft budget — "Gemini Flash attempt
+        // 1/2: timeout | 2/2: timeout" on every turn, regeneration repeated the
+        // same order, and the user saw "The model did not produce an answer in
+        // time". Real telemetry puts Gemini Flash's first token at p50 1.5 s /
+        // p90 9.6 s, so 2.5 s was never a budget the spare could meet.
+        //   • natively: ONE attempt when a spare exists. A connect timeout is a
+        //     gateway that is not answering; the second attempt cost 4 s and
+        //     landed on none of the measured turns. A single-provider user keeps
+        //     both attempts (nothing behind natively is worth the time).
+        //   • spares: the same 8 s first-token budget the natively rung gets;
+        //     the outer live ceiling (raceStreamWithDeadline) still bounds the
+        //     whole turn, so this cannot extend a turn past 13 s.
+        if (textProviders.length > 1) {
+          for (const rung of textProviders) {
+            if (rung.id === 'natively') rung.maxAttempts = 1;
+            else if (rung.ttftTimeoutMs == null) rung.ttftTimeoutMs = NATIVELY_TEXT_TTFT_MS;
+          }
+        }
 
         if (textProviders.length > 0) {
           const ordered = orderTextByHealth(textProviders, this.textHealth, Date.now());
@@ -11161,7 +11226,7 @@ let isMultimodal = !!(imagePaths?.length);
         yield* this.streamWithOllama(directUserPrompt, undefined, request.systemPrompt, imagePaths, abortSignal, model, true);
         return;
       case 'codex-cli':
-        if (!this.isCodexAvailable()) throw new Error('Codex CLI provider not configured');
+        if (!this.isCodexAvailable()) throw new Error(this.getCodexSelectionAuthError() || 'Codex CLI provider not configured');
         yield* this.streamWithCodexCli(directUserPrompt, request.systemPrompt, false, imagePaths, abortSignal, model);
         return;
       case 'antigravity':

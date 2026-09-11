@@ -54,13 +54,18 @@ export class IntelligenceManager extends EventEmitter {
     }
 
     /**
-     * Give the engine lazy access to the meeting-RAG retriever.
+     * Give the engine lazy access to the RAG manager, for live-meeting
+     * evidence (issue #552's resolveMeetingEvidence — the JIT semantic port
+     * plus the BM25 live-transcript port).
      *
-     * Called from main.ts AFTER RAGManager exists — this manager is constructed
-     * first, so a provider is passed rather than the instance.
+     * Called from main.ts AFTER RAGManager exists — this manager is
+     * constructed first, so a provider closure is passed rather than the
+     * instance. `RAGManager` satisfies `MeetingRagLike` structurally
+     * (getRetriever/getLiveMeetingId); the engine keeps no RAG import of its
+     * own, so it is typed here instead.
      */
-    setRagRetrieverProvider(provider: (() => unknown) | null): void {
-        this.engine.setRagRetrieverProvider(provider);
+    setMeetingRagProvider(provider: (() => import('./context-intelligence/retrieval/meeting-evidence').MeetingRagLike | null) | null): void {
+        this.engine.setMeetingRagProvider(provider);
     }
 
     /**
@@ -413,5 +418,15 @@ export class IntelligenceManager extends EventEmitter {
         this.session.reset();
         this.engine.reset();
         this.engine.clearWtaDiversityHistory();
+        // V3 conversation state (referents, active topic, previous source ids)
+        // outlived every reset: it is keyed by meeting id, and outside a
+        // meeting that key is a constant, so an ad-hoc session accumulated
+        // referents across unrelated questions until the next mode switch.
+        // Measured 2026-09-10: "Why do you want this role?" resolved to
+        // "(referring to: PYQ)" from a past-paper question asked before the
+        // reset. A reset is the session boundary; the referents go with it.
+        try {
+            require('./context-intelligence/question/conversation-state-store').clearConversationState();
+        } catch { /* non-fatal — the store is process-global and optional */ }
     }
 }

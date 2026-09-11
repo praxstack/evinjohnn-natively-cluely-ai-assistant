@@ -358,7 +358,8 @@ export class IntelligenceEngine extends EventEmitter {
      * forever and a later re-init would never be picked up. The engine keeps no
      * RAG import — it only calls what it is handed.
      */
-    private ragRetrieverProvider: (() => unknown) | null = null;
+    /** The RAG manager (structurally: MeetingRagLike), injected by IntelligenceManager once the RAG stack is up. */
+    private meetingRagProvider: (() => import('./context-intelligence/retrieval/meeting-evidence').MeetingRagLike | null) | null = null;
 
     private lastTranscriptTime: number = 0;
     private lastTriggerTime: number = 0;
@@ -1929,6 +1930,34 @@ export class IntelligenceEngine extends EventEmitter {
                     console.log('[IntelligenceEngine] no interviewer turn — answering the latest utterance regardless of speaker label', { role: lastAnyTurn.role, chars: extractedQuestion.latestQuestion.length });
                 }
             }
+            // THE USER ASKED SOMETHING AFTER THE OTHER PARTY DID (2026-09-10,
+            // measured in a recruiting simulation): the candidate asked "how
+            // many rounds are there", the recruiter then said "let me check the
+            // scorecard, what are we actually scoring on and what weights" and
+            // pressed the key — and the app answered the candidate's older
+            // question, because the extractor only ever looks at interviewer
+            // turns. On a manual press the user's OWN newer, question-shaped
+            // utterance is the thing they want looked up. A clarification
+            // thrown back at the other party ("what do you mean by that?") and
+            // a plain statement keep the extractor's choice.
+            if (!isSpeculative && !question?.trim()) {
+                const lastIdx = (role: 'user' | 'interviewer') => { for (let i = transcriptTurns.length - 1; i >= 0; i--) if (transcriptTurns[i].role === role && String(transcriptTurns[i].text || '').trim()) return i; return -1; };
+                const ui = lastIdx('user'), ii = lastIdx('interviewer');
+                const userText = ui >= 0 ? String(transcriptTurns[ui].text).trim() : '';
+                const userAskedLast = ui > ii && userText.length >= 12
+                    // Auxiliary-first questions too (2026-09-11, team-meet
+                    // simulation): "did anyone mention the elasticsearch window"
+                    // matched nothing here, so the extractor kept the other
+                    // party's "thanks, bye" and retrieval ran on THAT.
+                    && /\b(?:what|which|how (?:many|much|long|often)|who|whom|when|where|remind (?:me|us)|do we (?:know|have)|does (?:it|the \w+) say|what'?s|(?:did|does|do|has|have|had|is|are|was|were|will|can|could|should|would)\s+(?:anyone|anybody|someone|somebody|we|they|he|she|it|you|i|the\s+\w+|that|this|there))\b/i.test(userText)
+                    && !/\b(?:what do you mean|could you (?:repeat|clarify|rephrase)|say (?:that )?again|sorry,? (?:what|i (?:didn'?t|did not) (?:catch|get)))\b/i.test(userText);
+                if (userAskedLast && extractedQuestion.latestQuestion !== userText) {
+                    extractedQuestion.latestQuestion = userText;
+                    extractedQuestion.confidence = Math.max(extractedQuestion.confidence ?? 0, 0.75);
+                    trace.mark('repair_used', { reason: 'question_from_user_utterance' });
+                    console.log('[IntelligenceEngine] the user asked after the other party — answering the user\'s own question', { chars: userText.length });
+                }
+            }
             // WTA mint point (Phase 6 Slice 1, "what changes" item 1): one
             // TurnId for this What-to-Answer invocation, threaded into every
             // buildTurnContractIfEnabled call this method makes below instead
@@ -2274,7 +2303,7 @@ export class IntelligenceEngine extends EventEmitter {
             const wtaPrefetchDecision = deriveRetrievalQuery({
                 extractedQuestion: wtaResolvedQuestionForKicks,
                 transcriptWindow: preparedTranscript,
-                capturedScreenText: [options?.domContext, options?.screenContext?.ocrText]
+                capturedScreenText: [options?.domContext, (options?.screenContext?.ocrText || (options?.screenContext as any)?.extractedText || (options?.screenContext as any)?.visibleSummary)]
                     .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
                     .join('\n\n'),
             });
@@ -3443,7 +3472,7 @@ export class IntelligenceEngine extends EventEmitter {
             const wtaPromotedScreenCoding = (() => {
                 try {
                     const { isPromotedScreenCodingTurn } = require('./llm/codingPromptSignals') as typeof import('./llm/codingPromptSignals');
-                    const _screenTextForPromotion = [options?.domContext, options?.screenContext?.ocrText]
+                    const _screenTextForPromotion = [options?.domContext, (options?.screenContext?.ocrText || (options?.screenContext as any)?.extractedText || (options?.screenContext as any)?.visibleSummary)]
                         .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
                         .join('\n\n');
                     return isPromotedScreenCodingTurn({
@@ -3518,10 +3547,22 @@ export class IntelligenceEngine extends EventEmitter {
             const wtaV3Prompt = await (async () => {
                 try {
                     const { buildV3Prompt } = require('./context-intelligence/orchestration/engine-bridge');
-                    const _ctx = this.v3ModeRetrievalContext();
+                    // The screen-understanding result (hotkey pre-pass) composed into
+                    // the same description the manual surface retrieves from.
+                    const _screenDescription = (() => {
+                        try {
+                            const sc: any = options?.screenContext;
+                            if (!sc) return undefined;
+                            const { composeScreenDescription } = require('./services/screen/screenDescription');
+                            const d = composeScreenDescription(sc);
+                            return typeof d === 'string' && d.trim() ? d : undefined;
+                        } catch { return undefined; }
+                    })();
+                    const _ctx = this.v3ModeRetrievalContext(_screenDescription);
                     if (!_ctx) return undefined;
                     const _v3 = await buildV3Prompt({
                         surface: 'what-to-answer',
+                        screenText: _screenDescription,
                         // The chat-history rollback must reach THIS surface too.
                         // ipcHandlers was the only call site passing it, so the
                         // Settings toggle rolled back typed chat while live
@@ -3550,6 +3591,11 @@ export class IntelligenceEngine extends EventEmitter {
                         profileSourceCount: _ctx.profileSourceCount,
                         resolvedProfileSources: _ctx.resolvedProfileSources,
                         extraAllowedSourceTypes: _ctx.extraAllowedSourceTypes as never[],
+                        // See ClassificationInput.inLiveMeeting (task 7b, issue
+                        // #552): true only when resolveMeetingEvidence() built a
+                        // meeting port for this turn — every buildV3Prompt call
+                        // built from v3ModeRetrievalContext() passes this through.
+                        inLiveMeeting: _ctx.inLiveMeeting,
                         // sessionId scopes the V3 conversation-state store. Left
                         // unset it fell back to the literal 'engine', so every
                         // WTA turn across every meeting shared one key.
@@ -3668,7 +3714,7 @@ export class IntelligenceEngine extends EventEmitter {
                                 // Read the UNION, never one transport (live repro
                                 // 2026-08-18: DOM capture succeeded, imageCount was 0,
                                 // and everything keyed on images went dark).
-                                const _screenText = [options?.domContext, options?.screenContext?.ocrText]
+                                const _screenText = [options?.domContext, (options?.screenContext?.ocrText || (options?.screenContext as any)?.extractedText || (options?.screenContext as any)?.visibleSummary)]
                                     .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
                                     .join('\n\n');
                                 const codingSignals = resolveCodingPromptSignals({
@@ -6397,8 +6443,8 @@ export class IntelligenceEngine extends EventEmitter {
      * Modify the last assistant message
      */
     /** Injected by IntelligenceManager once the RAG stack is up. */
-    setRagRetrieverProvider(provider: (() => unknown) | null): void {
-        this.ragRetrieverProvider = provider;
+    setMeetingRagProvider(provider: (() => import('./context-intelligence/retrieval/meeting-evidence').MeetingRagLike | null) | null): void {
+        this.meetingRagProvider = provider;
     }
 
     // ── CONTEXT INTELLIGENCE V3 — shared adoption plumbing (Phase 6) ─────────
@@ -6407,13 +6453,17 @@ export class IntelligenceEngine extends EventEmitter {
     // the active mode. WTA and runManualAnswer previously each carried a copy of
     // this block; a third copy for the proactive surfaces is where drift starts,
     // so all of them now call this.
-    private v3ModeRetrievalContext(): {
+    private v3ModeRetrievalContext(screenDescription?: string): {
         raw: string; modeUniqueId: string | null; modeName: string | null; meetingId: string | null;
         attachedSourceCount: number;
         attachedFileNames: string[];
         profileSourceCount: number;
         resolvedProfileSources: Array<{ role: string; id: string }>;
         extraAllowedSourceTypes: string[];
+        /** From resolveMeetingEvidence() — see ClassificationInput.inLiveMeeting
+         *  (task 7b, issue #552). False when the try block below failed, same
+         *  as every other meeting-evidence field this context exposes. */
+        inLiveMeeting: boolean;
         port: unknown; conversationWindow: (sec: number) => string;
     } | null {
         try {
@@ -6472,24 +6522,55 @@ export class IntelligenceEngine extends EventEmitter {
                 console.warn('[V3] profile hydration failed — continuing with mode attachments only:', (profErr as Error)?.message ?? profErr);
             }
 
-            // Meeting evidence, when this turn is INSIDE a meeting and the mode
-            // authorizes transcripts. Without it a live meeting question found
-            // only reference files and disclosed a gap for something that had
-            // just been said aloud. Cross-meeting isolation is the scope
-            // filter's job, not this call site's (06 §4).
+            // Meeting evidence (issue #552). One resolver, shared with the
+            // manual-chat site: the JIT semantic port scoped to the LIVE index
+            // id plus the BM25 port over raw speech. The old block scoped the
+            // meeting port by getMeetingMetadata().id, which no normal meeting
+            // sets — so the JIT embeddings were never evidence here — and only
+            // built the live port when that id was absent. Cross-meeting
+            // isolation is still the scope filter's job (06 §4): the resolver
+            // returns the id the turn's scope must carry for that filter to
+            // admit the JIT chunks.
             const meetingId = (this.session as any)?.getMeetingMetadata?.()?.id ?? null;
             let port: unknown = modePort;
+            let scopeMeetingId: string | null = null;
+            // False when the try block below fails, exactly like scopeMeetingId
+            // (task 7b, issue #552) — an additive failure here must degrade to
+            // the mode's ordinary primary-source routing, never to "in a live
+            // meeting" by default.
+            let inLiveMeeting = false;
             try {
                 const { combineRetrievalPorts } = require('./context-intelligence/retrieval/meeting-retrieval-port');
+                const { resolveMeetingEvidence } = require('./context-intelligence/retrieval/meeting-evidence');
                 const ports: unknown[] = [modePort, ...(profilePort ? [profilePort] : [])];
-                const retriever = this.ragRetrieverProvider?.();
-                if (retriever && meetingId && policy.allowedSourceTypes.includes('MEETING_TRANSCRIPT')) {
-                    const { createMeetingRetrievalPort } =
-                        require('./context-intelligence/retrieval/meeting-retrieval-port');
-                    ports.push(createMeetingRetrievalPort({
-                        retriever, currentMeetingId: meetingId, userId: 'local',
-                        tokenBudget: policy.contextBudget.evidenceTokens,
-                    }));
+                const meeting = resolveMeetingEvidence({
+                    rag: this.meetingRagProvider?.() ?? null,
+                    segments: (this.session as any)?.getFullTranscript?.() ?? [],
+                    allowedSourceTypes: policy.allowedSourceTypes,
+                    userId: 'local',
+                    sessionId: this.conversationSessionId(),
+                    tokenBudget: policy.contextBudget.evidenceTokens,
+                    roleOf: (sp: string) => this.session.mapSpeakerToRole(sp),
+                });
+                ports.push(...meeting.ports);
+                scopeMeetingId = meeting.scopeMeetingId;
+                inLiveMeeting = meeting.inLiveMeeting;
+                // The user's SCREEN, as evidence (2026-09-11). Manual chat has built a
+                // screen port from the understanding pre-pass since Phase 6; the live
+                // surface only ever passed `hasScreenContext`, so SCREEN_CONTEXT was
+                // PLANNED with no port behind it — zero candidates every turn.
+                // Measured in looking-for-work with a JD on screen: "what are they
+                // paying for this role" answered from the PROFILE's JD ("no salary
+                // range is listed") while ₹95L–₹1.3Cr sat on the screen. Same
+                // factory, same fail-closed scope as the manual-chat site.
+                if (screenDescription && screenDescription.trim()) {
+                    const { createScreenRetrievalPort } = require('./context-intelligence/retrieval/screen-retrieval-port');
+                    const screenPort = createScreenRetrievalPort({
+                        description: screenDescription,
+                        userId: 'local',
+                        sessionId: this.conversationSessionId(),
+                    });
+                    if (screenPort) ports.push(screenPort);
                 }
                 if (ports.length > 1) port = combineRetrievalPorts(ports as never[]);
             } catch { /* meeting/profile combination is additive — mode port alone still answers */ }
@@ -6498,12 +6579,15 @@ export class IntelligenceEngine extends EventEmitter {
                 raw,
                 modeUniqueId: (_mi as any)?.id ?? null,
                 modeName: (_mi as any)?.name ?? null,
-                meetingId,
+                // The scope id the evidence needs, falling back to the metadata
+                // id for a meeting that carries one but has no JIT chunks yet.
+                meetingId: scopeMeetingId ?? meetingId,
                 attachedSourceCount: _files.length,
                 attachedFileNames: (_files as Array<{ fileName?: string }>).map((f) => f.fileName ?? '').filter(Boolean),
                 profileSourceCount,
                 resolvedProfileSources,
                 extraAllowedSourceTypes: extraSourceTypes,
+                inLiveMeeting,
                 port,
                 // Bounded live-transcript window for the composer's labelled
                 // "Conversation so far" section. This is NOT the §32.16 raw-blob
@@ -6587,6 +6671,10 @@ export class IntelligenceEngine extends EventEmitter {
                 profileSourceCount: ctx.profileSourceCount,
                 resolvedProfileSources: ctx.resolvedProfileSources,
                 extraAllowedSourceTypes: ctx.extraAllowedSourceTypes as never[],
+                // See ClassificationInput.inLiveMeeting (task 7b, issue #552):
+                // true only when resolveMeetingEvidence() actually built a
+                // meeting port for this turn.
+                inLiveMeeting: ctx.inLiveMeeting,
                 requestSequence: this.currentGenerationId,
                 scope: {
                     meetingId: ctx.meetingId ?? undefined,
@@ -7070,6 +7158,10 @@ export class IntelligenceEngine extends EventEmitter {
                         attachedSourceCount: _ctx.attachedSourceCount,
                         profileSourceCount: _ctx.profileSourceCount,
                         resolvedProfileSources: _ctx.resolvedProfileSources,
+                        // See ClassificationInput.inLiveMeeting (task 7b, issue
+                        // #552) — every buildV3Prompt call built from
+                        // v3ModeRetrievalContext() passes this through.
+                        inLiveMeeting: _ctx.inLiveMeeting,
                         requestSequence: this.currentGenerationId,
                         // T7 (2026-08-28): `sessionId` was MISSING here while both
                         // sibling call sites (:5517 and the WTA snapshot) set it
