@@ -27,6 +27,7 @@ import {
     AI_PROVIDER_MARK_IMAGES,
 } from '../ui/aiProviderMarks';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
+import { LiquidGlassBadge } from '../../ui-components/LiquidGlassBadge';
 
 /* ═══════════════════════════════════════════════════════════════════════════
    AI Providers design system — a locally-scoped token block, PI-style.
@@ -91,6 +92,23 @@ import { useResolvedTheme } from '../../hooks/useResolvedTheme';
    — Settings mounts one panel at a time, so a consumer on another tab has to
    bring the sheet with it or every .aip-* class silently resolves to nothing.
    Duplicate <style> elements are harmless: identical rules, same cascade. */
+/**
+ * The container class for an "Active <thing>" model selector — the control on
+ * the right of a hero card.
+ *
+ * Defined ONCE because it has to be identical across panels: Retrieval stacks
+ * Active Embedding Model directly above Active Reranker, and the two had
+ * drifted to 179px and 192px, so their left edges did not line up. The wider
+ * of the two is kept — reranker labels ("Voyage Rerank 2.5 Lite") and embedding
+ * ids ("lfm-2.5-embedding-350m:free") are both long enough that narrowing would
+ * start truncating names that fit today.
+ *
+ * A selector holding a VALUE rather than a name (the embedding width picker,
+ * "3072d") overrides this with its own narrow width — this is the default for
+ * the model selectors only.
+ */
+export const AIP_ACTIVE_SELECT_CONTAINER = 'relative min-w-[150px] max-w-[240px] w-full sm:w-48';
+
 export const AIP_CSS = `
 .aip-root {
     --aip-accent:            var(--accent-primary);
@@ -2450,12 +2468,6 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     const [directAssistEnabled, setDirectAssistEnabled] = useState(false);
     const [directAssistBusy, setDirectAssistBusy] = useState(false);
     const [directAssistError, setDirectAssistError] = useState('');
-    // Persisted default is ON (see SettingsManager.getDirectAssistFallbackEnabled),
-    // so the local state starts true too — a slow/failed initial IPC read must
-    // not flash the toggle into an "off" state it does not actually have.
-    const [directAssistFallbackEnabled, setDirectAssistFallbackEnabled] = useState(true);
-    const [directAssistFallbackBusy, setDirectAssistFallbackBusy] = useState(false);
-    const [directAssistFallbackError, setDirectAssistFallbackError] = useState('');
     const [fastResponseMode, setFastResponseMode] = useState(false);
     const [credentialsLoaded, setCredentialsLoaded] = useState(false);
     const canUseFastMode = !!(hasStoredKey.groq || hasStoredKey.natively || (codexCliConfig.enabled && codexOauthStatus.signedIn));
@@ -2655,9 +2667,6 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                 const directEnabled = await window.electronAPI?.getDirectAssistEnabled?.();
                 setDirectAssistEnabled(directEnabled === true);
 
-                const directFallbackEnabled = await window.electronAPI?.getDirectAssistFallbackEnabled?.();
-                setDirectAssistFallbackEnabled(directFallbackEnabled !== false);
-
                 // Check Ollama
                 checkOllama();
 
@@ -2686,12 +2695,6 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             unsubs.push(window.electronAPI.onDirectAssistEnabledChanged((enabled: boolean) => {
                 setDirectAssistEnabled(enabled === true);
                 setDirectAssistError('');
-            }));
-        }
-        if (window.electronAPI?.onDirectAssistFallbackEnabledChanged) {
-            unsubs.push(window.electronAPI.onDirectAssistFallbackEnabledChanged((enabled: boolean) => {
-                setDirectAssistFallbackEnabled(enabled !== false);
-                setDirectAssistFallbackError('');
             }));
         }
         if (window.electronAPI?.onCredentialsChanged) {
@@ -3838,10 +3841,24 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                             <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Direct Assist')}</label>
-                            <AipBadge tone="info" label={t('Beta')} />
+                            {/* The Liquid Glass material rather than .aip-badge:
+                                a tag qualifies the title beside it, and this one
+                                carries no status, so it also drops the status dot
+                                that primitive leads with.
+
+                                `sky` is a LIGHT fill, which inverts the material's
+                                lighting model — specular on the top face only, plus
+                                a contact shadow — so it is the one variant that
+                                looks the same in both themes without a per-theme
+                                block. Its white label is 2.81:1, below the AA floor
+                                for text this size; design.md records that as a
+                                deliberate choice for this variant, and it is one
+                                here too. A navy label on the same fill reaches
+                                5.31:1 if that ever needs to change. */}
+                            <LiquidGlassBadge variant="sky">{t('Beta')}</LiquidGlassBadge>
                         </div>
                         <p className="text-[10px] aip-muted mt-0.5">
-                            {t('Sends your current typed, spoken, screenshot, and page input straight to the active model without meeting retrieval or answer rewriting.')}
+                            {t('Sends your typed, spoken, screenshot, and page input straight to the model, unprocessed.')}
                         </p>
                         {directAssistError && (
                             <p className="text-[10px] aip-danger-fg mt-1" role="alert">{directAssistError}</p>
@@ -3871,48 +3888,6 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                                 );
                             } finally {
                                 setDirectAssistBusy(false);
-                            }
-                        }}
-                    />
-                </div>
-
-            <div
-                    className={`aip-card p-5 flex items-center justify-between gap-4 ${!directAssistEnabled ? 'opacity-50 grayscale' : ''}`}
-                    title={!directAssistEnabled ? t('Requires Direct Assist to be enabled') : ''}
-                >
-                    <div className="flex-1 min-w-0">
-                        <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Fall back to another provider')}</label>
-                        <p className="text-[10px] aip-muted mt-0.5">
-                            {t('If a Direct Assist provider fails, automatically retry with another configured provider instead of showing an error. Every switch is shown in the UI.')}
-                        </p>
-                        {directAssistFallbackError && (
-                            <p className="text-[10px] aip-danger-fg mt-1" role="alert">{directAssistFallbackError}</p>
-                        )}
-                    </div>
-                    <AipSwitch
-                        checked={directAssistFallbackEnabled}
-                        disabled={directAssistFallbackBusy || !directAssistEnabled}
-                        label={t('Fall back to another provider')}
-                        onChange={async () => {
-                            if (directAssistFallbackBusy || !directAssistEnabled) return;
-                            const previous = directAssistFallbackEnabled;
-                            const next = !previous;
-                            setDirectAssistFallbackBusy(true);
-                            setDirectAssistFallbackError('');
-                            setDirectAssistFallbackEnabled(next);
-                            try {
-                                const result = await window.electronAPI?.setDirectAssistFallbackEnabled?.(next);
-                                if (!result?.success) {
-                                    setDirectAssistFallbackEnabled(previous);
-                                    setDirectAssistFallbackError(result?.error || t('Could not update Direct Assist fallback.'));
-                                }
-                            } catch (error) {
-                                setDirectAssistFallbackEnabled(previous);
-                                setDirectAssistFallbackError(
-                                    error instanceof Error ? error.message : t('Could not update Direct Assist fallback.'),
-                                );
-                            } finally {
-                                setDirectAssistFallbackBusy(false);
                             }
                         }}
                     />
