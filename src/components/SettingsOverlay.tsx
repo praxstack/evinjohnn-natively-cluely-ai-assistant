@@ -13,6 +13,7 @@ import { AutoAnswerIcon } from './AutoAnswerIcon';
 import { HiCreditCard } from 'react-icons/hi2';
 import { analytics } from '../lib/analytics/analytics.service';
 import { AboutSection } from './AboutSection';
+import { ErrorBoundary } from './ErrorBoundary';
 import { HelpSettings } from './settings/HelpSettings';
 import { AIProvidersSettings } from './settings/AIProvidersSettings';
 import { PlansSettings } from './settings/PlansSettings';
@@ -40,6 +41,7 @@ import { Disclosure, DisclosureChevron } from './ui/AccordionSection';
 import { ProfileVisualizer, PremiumUpgradeModal } from '../premium';
 import GlassEffectLayer from './ui/GlassEffectLayer';
 import { BrandMark, BrandMonogram } from './ui/BrandMark';
+import { LiquidGlassBadge } from '../ui-components/LiquidGlassBadge';
 import icon from './icon.png';
 // Shared with the main process so the picker cannot offer a model the ipc
 // validator rejects. Pure data module — no node/electron imports.
@@ -188,9 +190,14 @@ interface CustomSelectProps {
     /** Greys the control out and blocks the dropdown — used when the active
      *  local STT model doesn't accept this setting (see modelLanguageSupport). */
     disabled?: boolean;
+    /** Optional right-aligned tag per option, keyed by deviceId. Used to mark
+     *  Apple Speech languages as already installed vs downloaded on first use,
+     *  so the wait is visible BEFORE a meeting starts rather than as a silent
+     *  pause afterwards. Kept out of `label` because the label span truncates. */
+    badges?: Record<string, string>;
 }
 
-const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options, onChange, placeholder = "Select device", disabled = false }) => {
+const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options, onChange, placeholder = "Select device", disabled = false, badges }) => {
     const t = useT();
     const [isOpen, setIsOpen] = useState(false);
     const containerRef = React.useRef<HTMLDivElement>(null);
@@ -240,7 +247,14 @@ const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options
                                     className={`w-full text-left px-3 py-2 text-sm rounded-md flex items-center justify-between group transition-colors ${value === device.deviceId ? 'bg-bg-input hover:bg-bg-elevated text-text-primary' : 'text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}
                                 >
                                     <span className="truncate">{device.label || `Device ${device.deviceId.slice(0, 5)}...`}</span>
-                                    {value === device.deviceId && <Check size={14} className="text-accent-primary" />}
+                                    <span className="flex items-center gap-2 shrink-0 pl-2">
+                                        {badges?.[device.deviceId] && (
+                                            <span className="text-[10px] uppercase tracking-wide text-text-secondary/80 whitespace-nowrap">
+                                                {badges[device.deviceId]}
+                                            </span>
+                                        )}
+                                        {value === device.deviceId && <Check size={14} className="text-accent-primary" />}
+                                    </span>
                                 </button>
                             ))}
                             {options.length === 0 && (
@@ -432,6 +446,12 @@ interface SettingsOverlayProps {
     isOpen: boolean;
     onClose: () => void;
     initialTab?: string;
+    /**
+     * Bumped by App on every open request, including a repeat of the tab that
+     * is already active. It is what makes the sync effect below re-assert
+     * instead of bailing on an unchanged `initialTab`.
+     */
+    initialTabSeq?: number;
     initialIsPremium?: boolean | null;
     initialHasNativelyKey?: boolean;
 }
@@ -462,6 +482,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     isOpen,
     onClose,
     initialTab = 'general',
+    initialTabSeq = 0,
     initialIsPremium = null,
     initialHasNativelyKey = false,
 }) => {
@@ -544,6 +565,17 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         />
     );
 
+    /* The retrieval sub-tab a deep link is asking for, captured as ONE value.
+     *
+     * It must not be derived from `activeTab` at render time. `activeTab` and
+     * the nav sequence update on DIFFERENT renders, and reading them as two
+     * independent props let a stale pair through: bumping the sequence for a
+     * plain 'retrieval' request re-applied the PREVIOUS request's 'embedding'
+     * one render before activeTab caught up, throwing away the user's sub-tab.
+     * Caught by a regression guard on 2026-09-15. Target and sequence are now
+     * written together, from `initialTab`, which is the request itself. */
+    const [retrievalRequest, setRetrievalRequest] = useState<{ tab?: 'embedding' | 'reranker'; seq: number }>({ seq: 0 });
+
     // Sync active tab when modal opens
     useEffect(() => {
         if (isOpen && initialTab) {
@@ -556,10 +588,21 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                user's first real tab click. */
             if (initialTab !== activeTab) suppressPanelAnimRef.current = true;
             setActiveTab(initialTab);
+            setRetrievalRequest({
+                tab: initialTab === 'reranker' ? 'reranker'
+                    : initialTab === 'embedding' ? 'embedding'
+                        : undefined,
+                seq: initialTabSeq,
+            });
 
 
         }
-    }, [isOpen, initialTab]);
+        /* `initialTabSeq` is in the deps on purpose: a repeat request for the
+           tab that is ALREADY active must still re-assert, because the panel
+           below it may own state of its own (Retrieval's Embedding/Reranker
+           sub-tab) that the deep link is trying to reach. Without it the second
+           click of a deep link did nothing at all. */
+    }, [isOpen, initialTab, initialTabSeq]);
 
     const { shortcuts, updateShortcut, resetShortcuts, conflicts } = useShortcuts();
     // Small badge shown next to a shortcut row when globalShortcut.register()
@@ -737,6 +780,22 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         support: { languageSelectable: boolean; accentSelectable: boolean; allowedLanguageKeys: string[] };
     }> | null>(null);
     const [localWhisperConfig, setLocalWhisperConfig] = useState<LocalWhisperChannelConfig | null>(null);
+
+    // Apple Speech locale availability (macOS 26+). Apple transcribes 45
+    // locales, but only 14 of Natively's 30 language entries map to one — the
+    // other 20 fail at meeting start with "does not support language X". This
+    // restricts the list to what Apple can actually do and marks the rest as a
+    // first-use download, so the wait is visible before a meeting rather than
+    // as an unexplained pause during one.
+    const [appleSpeechLocales, setAppleSpeechLocales] = useState<{
+        available: boolean; supported: string[]; installed: string[]; reserved: string[]; maxReserved: number;
+    } | null>(null);
+    const [appleReleasing, setAppleReleasing] = useState<string>('');
+    // Live asset download started from Settings. Apple reports a 0..1 fraction
+    // and no transfer size, so the bar is a percentage — there is no MB figure
+    // to show (Progress.totalUnitCount is 1, not bytes).
+    const [appleInstall, setAppleInstall] = useState<{ locale: string; fraction: number } | null>(null);
+    const [appleInstallError, setAppleInstallError] = useState<string>('');
 
     // AI Response Language
     const [aiResponseLanguage, setAiResponseLanguage] = useState('English');
@@ -1070,6 +1129,134 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         }
     };
 
+    useEffect(() => {
+        const off = window.electronAPI?.onAppleSpeechInstallProgress?.((d) => {
+            setAppleInstall((cur) => (cur && cur.locale === d.locale ? { ...cur, fraction: d.fraction } : cur));
+        });
+        return () => { off?.(); };
+    }, []);
+
+    useEffect(() => {
+        if (sttProvider !== 'apple-speech') return;
+        let cancelled = false;
+        window.electronAPI?.getAppleSpeechLocales?.()
+            .then((r) => { if (!cancelled) setAppleSpeechLocales(r); })
+            .catch(() => { if (!cancelled) setAppleSpeechLocales(null); });
+        return () => { cancelled = true; };
+    }, [sttProvider]);
+
+    /** bcp47 -> lower-case, so es-ES and es-es compare equal. */
+    const appleLocaleSets = useMemo(() => {
+        if (sttProvider !== 'apple-speech' || !appleSpeechLocales?.available) return null;
+        return {
+            supported: new Set(appleSpeechLocales.supported.map((l) => l.toLowerCase())),
+            installed: new Set(appleSpeechLocales.installed.map((l) => l.toLowerCase())),
+        };
+    }, [sttProvider, appleSpeechLocales]);
+
+    // Feeds the same allowedLanguageKeySet the local/NVIDIA gates use, so the
+    // unsupported entries disappear from both selects with no new plumbing.
+    const appleLanguageCapability = useMemo(() => {
+        if (!appleLocaleSets) return null;
+        const keys = new Set<string>(['auto']);
+        for (const [key, l] of Object.entries(availableLanguages) as [string, any][]) {
+            const bcp = String(l?.bcp47 ?? '');
+            if (bcp && bcp !== 'auto' && appleLocaleSets.supported.has(bcp.toLowerCase())) keys.add(key);
+        }
+        return keys;
+    }, [appleLocaleSets, availableLanguages]);
+
+    /** bcp47 of the currently selected recognition language, if resolvable. */
+    const selectedAppleLocale = useMemo(() => {
+        if (!appleLocaleSets) return null;
+        // recognitionLanguage, not displayedRecognitionLanguage: the display
+        // fallback only fires for a locked local model, which cannot be active
+        // while Apple Speech is the provider, and it is declared further down.
+        const bcp = String((availableLanguages as any)[recognitionLanguage]?.bcp47 ?? '');
+        if (!bcp || bcp === 'auto') return null;
+        return appleLocaleSets.supported.has(bcp.toLowerCase()) ? bcp : null;
+    }, [appleLocaleSets, availableLanguages, recognitionLanguage]);
+
+    const selectedAppleNeedsDownload = !!selectedAppleLocale
+        && !!appleLocaleSets && !appleLocaleSets.installed.has(selectedAppleLocale.toLowerCase());
+
+    const startAppleDownload = async () => {
+        if (!selectedAppleLocale) return;
+        setAppleInstallError('');
+        setAppleInstall({ locale: selectedAppleLocale, fraction: 0 });
+        try {
+            const r = await window.electronAPI.installAppleSpeechLocale(selectedAppleLocale);
+            if (!r?.ok) setAppleInstallError(r?.error || 'The language download did not finish.');
+            const fresh = await window.electronAPI.getAppleSpeechLocales();
+            setAppleSpeechLocales(fresh);
+        } catch (e: any) {
+            setAppleInstallError(e?.message || 'The language download did not finish.');
+        } finally {
+            setAppleInstall(null);
+        }
+    };
+
+    /**
+     * Apple allocates at most `maxReserved` (5) locales per app and an install
+     * takes a slot permanently, so a sixth download fails with "Too many
+     * allocated locales, 5 maximum". Releasing is the only way back and it
+     * PURGES the asset, so the user is shown the limit and picks what to give
+     * up rather than having a language deleted silently to make room.
+     */
+    const appleSlots = useMemo(() => {
+        if (sttProvider !== 'apple-speech' || !appleSpeechLocales?.available) return null;
+        const max = appleSpeechLocales.maxReserved || 0;
+        if (!max) return null;
+        const label = (bcp: string) => {
+            const hit = Object.values(availableLanguages).find(
+                (l: any) => String(l?.bcp47 ?? '').toLowerCase() === bcp.toLowerCase(),
+            ) as any;
+            return hit?.label ? `${hit.group}${hit.label !== hit.group ? ` (${hit.label})` : ''}` : bcp;
+        };
+        return {
+            max,
+            used: appleSpeechLocales.reserved.length,
+            full: appleSpeechLocales.reserved.length >= max,
+            entries: appleSpeechLocales.reserved.map((bcp) => ({ bcp, label: label(bcp) })),
+        };
+    }, [sttProvider, appleSpeechLocales, availableLanguages]);
+
+    const releaseAppleLanguage = async (bcp: string) => {
+        setAppleReleasing(bcp);
+        setAppleInstallError('');
+        try {
+            const r = await window.electronAPI.releaseAppleSpeechLocale(bcp);
+            if (!r?.ok) setAppleInstallError(r?.error || 'Could not remove the language.');
+            setAppleSpeechLocales(await window.electronAPI.getAppleSpeechLocales());
+        } catch (e: any) {
+            setAppleInstallError(e?.message || 'Could not remove the language.');
+        } finally {
+            setAppleReleasing('');
+        }
+    };
+
+    /** Per-variant and per-group install badges for the two language selects. */
+    const appleLanguageBadges = useMemo(() => {
+        if (!appleLocaleSets) return undefined;
+        const variant: Record<string, string> = {};
+        const groupInstalled = new Map<string, boolean>();
+        for (const [key, l] of Object.entries(availableLanguages) as [string, any][]) {
+            const bcp = String(l?.bcp47 ?? '');
+            if (!bcp || bcp === 'auto') continue;
+            if (!appleLocaleSets.supported.has(bcp.toLowerCase())) continue;
+            const installed = appleLocaleSets.installed.has(bcp.toLowerCase());
+            variant[key] = installed ? t('Installed') : t('Download');
+            // A group counts as installed once any of its regions is on disk —
+            // picking that group lands on an installed region by default.
+            groupInstalled.set(l.group, (groupInstalled.get(l.group) ?? false) || installed);
+        }
+        const group: Record<string, string> = {};
+        for (const [name, installed] of groupInstalled) {
+            group[name] = installed ? t('Installed') : t('Download');
+        }
+        return { variant, group };
+    }, [appleLocaleSets, availableLanguages, t]);
+
     // NVIDIA speech models are per-language deployments: the Vietnamese build
     // serves vi-VN and nothing else, and the streaming English ones serve en-US
     // only. Offering the full language list under them would let a user pick a
@@ -1083,7 +1270,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
 
     // Language keys the active STT backend accepts. Unrestricted for cloud
     // providers; for local-whisper this is the active model's documented set.
-    const allowedLanguageKeySet = localLanguageCapability?.allowedKeys ?? nvidiaLanguageCapability ?? null;
+    const allowedLanguageKeySet = localLanguageCapability?.allowedKeys ?? nvidiaLanguageCapability ?? appleLanguageCapability ?? null;
     const isLanguageEntryAllowed = (key: string) => !allowedLanguageKeySet || allowedLanguageKeySet.has(key);
 
     // Helper to get unique groups (restricted to what the active model accepts)
@@ -2032,6 +2219,18 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                     ? { duration: 0 }
                                     : { duration: 0.22, ease: [0.23, 1, 0.32, 1] }}
                             >
+                            {/* A render error in ANY settings section used to destroy the
+                                whole launcher window. SettingsOverlay sits inside App's
+                                <ErrorBoundary context="Launcher">, so the throw bubbled all
+                                the way up and replaced the launcher with "Launcher crashed" —
+                                measured 2026-09-15 by injecting a throw into a panel.
+
+                                This boundary keeps the blast radius at the section. It needs
+                                no `key` of its own: the motion.div above is keyed on
+                                panelKey, so switching sections remounts this subtree and
+                                clears a latched error — without that, one bad section would
+                                show its fallback on every other tab too. */}
+                            <ErrorBoundary context={`Settings · ${panelKey}`}>
                             {activeTab === 'general' && (
                                 <div className="space-y-6 animated fadeIn">
                                     <div className="space-y-3.5">
@@ -2039,7 +2238,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                             <h3 className="text-lg font-bold text-text-primary mb-1">{t('General settings')}</h3>
                                             <p className="text-xs text-text-secondary mb-2">{t('Customize how Natively works for you')}</p>
 
-                                            <div className={`rounded-xl border ${isLight ? 'bg-bg-card border-border-subtle divide-y divide-border-subtle' : 'bg-transparent border-transparent divide-y divide-border-subtle/20'}`}>
+                                            <div className="rounded-xl border bg-transparent border-transparent divide-y divide-border-subtle/20">
                                             <div className="space-y-0">
                                                 {/* Detectable / Undetectable */}
                                                 <div className="flex items-center justify-between px-4 py-3">
@@ -2178,17 +2377,11 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         <div>
                                                             <div className="flex items-center gap-2">
                                                                 <h3 className="text-sm font-bold text-text-primary">{t('Auto Answer')}</h3>
-                                                                {/* Solid yellow, Apple style — no border, no tint. The colours
-                                                                    are tokens because systemYellow differs per appearance. */}
-                                                                <span
-                                                                    className="text-[10px] font-semibold uppercase tracking-wide leading-none px-1.5 py-0.5 rounded-full shrink-0"
-                                                                    style={{
-                                                                        color: 'var(--badge-beta-fg)',
-                                                                        backgroundColor: 'var(--badge-beta-bg)',
-                                                                    }}
-                                                                >
-                                                                    {t('Beta')}
-                                                                </span>
+                                                                {/* The same Liquid Glass tag as Direct Assist's, so the two
+                                                                    Beta features read as one decision rather than two. It
+                                                                    replaces a bespoke solid-yellow span whose --badge-beta-*
+                                                                    tokens now have no other reader. */}
+                                                                <LiquidGlassBadge variant="sky">{t('Beta')}</LiquidGlassBadge>
                                                             </div>
                                                             <p className="text-xs text-text-secondary mt-0.5">{t('Answers appear as soon as the interviewer finishes a question')}</p>
                                                         </div>
@@ -2284,63 +2477,6 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                         className={`w-full text-left px-2 py-1.5 rounded-md text-xs flex items-center gap-2 transition-colors ${themeMode === option.mode ? 'text-text-primary bg-bg-item-active/50' : 'text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}
                                                                     >
                                                                         <span className={themeMode === option.mode ? 'text-text-primary' : 'text-text-secondary group-hover:text-text-primary'}>{option.icon}</span>
-                                                                        <span className="font-medium">{t(option.label)}</span>
-                                                                    </button>
-                                                                ))}
-                                                            </div>
-                                                        )}
-                                                    </div>
-                                                </div>
-
-                                                {/* Meeting Interface Style */}
-                                                <div className="flex items-center justify-between px-4 py-3">
-                                                    <div className="flex items-center gap-4">
-                                                        <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle text-text-primary flex items-center justify-center shrink-0">
-                                                            <Layout size={20} />
-                                                        </div>
-                                                        <div>
-                                                            <h3 className="text-sm font-bold text-text-primary">{t('Meeting Interface Style')}</h3>
-                                                            <p className="text-xs text-text-secondary mt-0.5">
-                                                                {meetingInterfaceTheme === 'liquid-glass'
-                                                                    ? t('Liquid glass — Apple-inspired transparent overlay')
-                                                                    : meetingInterfaceTheme === 'modern'
-                                                                        ? t('Modern — polished dark glass with cobalt accents')
-                                                                        : t('Default overlay appearance')}
-                                                            </p>
-                                                        </div>
-                                                    </div>
-
-                                                    <div className="relative" ref={interfaceThemeDropdownRef}>
-                                                        <button
-                                                            onClick={() => setIsInterfaceThemeDropdownOpen(!isInterfaceThemeDropdownOpen)}
-                                                            className="bg-bg-component hover:bg-bg-elevated border border-border-subtle text-text-primary px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-2 min-w-[110px] justify-between"
-                                                        >
-                                                            <span className="text-ellipsis overflow-hidden whitespace-nowrap">
-                                                                {meetingInterfaceTheme === 'liquid-glass'
-                                                                    ? 'Liquid Glass'
-                                                                    : meetingInterfaceTheme === 'modern'
-                                                                        ? 'Modern'
-                                                                        : t('Default')}
-                                                            </span>
-                                                            <ChevronDown size={12} className={`shrink-0 transition-transform ${isInterfaceThemeDropdownOpen ? 'rotate-180' : ''}`} />
-                                                        </button>
-
-                                                        {isInterfaceThemeDropdownOpen && (
-                                                            <div className="absolute right-0 top-full mt-1 w-full bg-bg-elevated border border-border-subtle rounded-lg shadow-xl overflow-hidden z-20 p-1 animated fadeIn select-none">
-                                                                {([
-                                                                    { mode: 'default' as MeetingInterfaceTheme, label: 'Default' },
-                                                                    { mode: 'liquid-glass' as MeetingInterfaceTheme, label: 'Liquid Glass' },
-                                                                    { mode: 'modern' as MeetingInterfaceTheme, label: 'Modern' },
-                                                                ] as const).map((option) => (
-                                                                    <button
-                                                                        key={option.mode}
-                                                                        onClick={() => {
-                                                                            setMeetingInterfaceTheme(option.mode);
-                                                                            setMeetingInterfaceThemeState(option.mode);
-                                                                            setIsInterfaceThemeDropdownOpen(false);
-                                                                        }}
-                                                                        className={`w-full text-left px-2.5 py-1.5 rounded-md text-xs flex items-center gap-2 transition-colors ${meetingInterfaceTheme === option.mode ? 'text-text-primary bg-bg-item-active/50' : 'text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}
-                                                                    >
                                                                         <span className="font-medium">{t(option.label)}</span>
                                                                     </button>
                                                                 ))}
@@ -2483,6 +2619,63 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 </button>
                                                 <Disclosure open={showAdvancedSettings}>
                                                 <div className="mt-1">
+                                                    {/* Meeting Interface Style */}
+                                                    <div className="flex items-center justify-between px-4 py-3">
+                                                        <div className="flex items-center gap-4">
+                                                            <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle text-text-primary flex items-center justify-center shrink-0">
+                                                                <Layout size={20} />
+                                                            </div>
+                                                            <div>
+                                                                <h3 className="text-sm font-bold text-text-primary">{t('Meeting Interface Style')}</h3>
+                                                                <p className="text-xs text-text-secondary mt-0.5">
+                                                                    {meetingInterfaceTheme === 'liquid-glass'
+                                                                        ? t('Liquid glass — Apple-inspired transparent overlay')
+                                                                        : meetingInterfaceTheme === 'modern'
+                                                                            ? t('Modern — polished dark glass with cobalt accents')
+                                                                            : t('Default overlay appearance')}
+                                                                </p>
+                                                            </div>
+                                                        </div>
+
+                                                        <div className="relative" ref={interfaceThemeDropdownRef}>
+                                                            <button
+                                                                onClick={() => setIsInterfaceThemeDropdownOpen(!isInterfaceThemeDropdownOpen)}
+                                                                className="bg-bg-component hover:bg-bg-elevated border border-border-subtle text-text-primary px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-2 min-w-[110px] justify-between"
+                                                            >
+                                                                <span className="text-ellipsis overflow-hidden whitespace-nowrap">
+                                                                    {meetingInterfaceTheme === 'liquid-glass'
+                                                                        ? 'Liquid Glass'
+                                                                        : meetingInterfaceTheme === 'modern'
+                                                                            ? 'Modern'
+                                                                            : t('Default')}
+                                                                </span>
+                                                                <ChevronDown size={12} className={`shrink-0 transition-transform ${isInterfaceThemeDropdownOpen ? 'rotate-180' : ''}`} />
+                                                            </button>
+
+                                                            {isInterfaceThemeDropdownOpen && (
+                                                                <div className="absolute right-0 top-full mt-1 w-full bg-bg-elevated border border-border-subtle rounded-lg shadow-xl overflow-hidden z-20 p-1 animated fadeIn select-none">
+                                                                    {([
+                                                                        { mode: 'default' as MeetingInterfaceTheme, label: 'Default' },
+                                                                        { mode: 'liquid-glass' as MeetingInterfaceTheme, label: 'Liquid Glass' },
+                                                                        { mode: 'modern' as MeetingInterfaceTheme, label: 'Modern' },
+                                                                    ] as const).map((option) => (
+                                                                        <button
+                                                                            key={option.mode}
+                                                                            onClick={() => {
+                                                                                setMeetingInterfaceTheme(option.mode);
+                                                                                setMeetingInterfaceThemeState(option.mode);
+                                                                                setIsInterfaceThemeDropdownOpen(false);
+                                                                            }}
+                                                                            className={`w-full text-left px-2.5 py-1.5 rounded-md text-xs flex items-center gap-2 transition-colors ${meetingInterfaceTheme === option.mode ? 'text-text-primary bg-bg-item-active/50' : 'text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}
+                                                                        >
+                                                                            <span className="font-medium">{t(option.label)}</span>
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
                                                     {/* Mouse Passthrough Toggle — Adapted from public PR #113 */}
                                                     <div className="flex items-center justify-between px-4 py-3">
                                                         <div className="flex items-center gap-4">
@@ -3032,6 +3225,11 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                Natively is our own logo component. Every option used to share one
                                                                generic <Mic>, which made the list unreadable at a glance. */
                                                             ...(hasNativelyKey ? [{ id: 'natively', label: 'Natively API', badge: 'Saved' as const, desc: t('Managed transcription via Natively backend'), color: 'blue', icon: <BrandMark provider="natively" />, neutralTile: true }] : []),
+                                                            /* Directly under Natively API: both are turnkey — no key to paste,
+                                                               nothing to configure — so they belong together at the top, ahead
+                                                               of the bring-your-own-key providers. macOS only; the mark is
+                                                               Apple's because the model runs on this machine. */
+                                                            ...(isMac ? [{ id: 'apple-speech', label: 'Apple Speech', badge: null, desc: t('On-device · macOS 26+'), color: 'green', icon: <BrandMark provider="apple" />, neutralTile: true }] : []),
                                                             { id: 'google', label: 'Google Cloud', badge: googleServiceAccountPath ? 'Saved' : null, desc: t('gRPC streaming via Service Account'), color: 'blue', icon: <BrandMark provider="google" />, neutralTile: true },
                                                             { id: 'groq', label: 'Groq Whisper', badge: hasStoredSttGroqKey ? 'Saved' : null, desc: t('Ultra-fast REST transcription'), color: 'orange', icon: <BrandMark provider="groq" />, neutralTile: true },
                                                             { id: 'nvidia_nim', label: 'Nvidia Nim', badge: hasStoredNvidiaNimKey ? 'Saved' : null, desc: t('Low-latency Nemotron / Parakeet streaming ASR'), color: 'green', icon: <BrandMark provider="nvidia_nim" />, neutralTile: true },
@@ -3053,7 +3251,6 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                Windows logo exists under a licence compatible with AGPL-3.0 (it is in
                                                                neither lobehub nor simple-icons — see the README). `isMac` is the same
                                                                platform source the rest of this panel uses. */
-                                                            ...(isMac ? [{ id: 'apple-speech', label: 'Apple Speech', badge: null, desc: 'On-device · macOS 26+ · No API key', color: 'green', icon: <BrandMark provider="apple" />, neutralTile: true }] : []),
                                                             { id: 'local-whisper', label: 'Local Models', badge: null, desc: t('Privacy-first: runs 100% on your device'), color: 'green', icon: <BrandMark provider={isMac ? 'apple' : 'microsoft'} />, neutralTile: true },
                                                         ]}
                                                     />
@@ -3378,7 +3575,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                             )}
 
                                             {sttProvider === 'apple-speech' && (
-                                                <p className="text-sm text-text-secondary">Apple Speech runs transcription on your device. macOS may download the selected language model on first use; “Auto” uses your system language.</p>
+                                                <p className="text-xs text-text-secondary">{t('Apple Speech runs transcription on your device. macOS may download the selected language model on first use; “Auto” uses your system language.')}</p>
                                             )}
                                             {/* Local Whisper Model Panel */}
                                             {sttProvider === 'local-whisper' && (
@@ -3402,6 +3599,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 onChange={handleGroupChange}
                                                 placeholder={t("Select Language")}
                                                 disabled={languageLocked}
+                                                badges={appleLanguageBadges?.group}
                                             />
 
                                             {/* Variant/Accent Selector (Conditional) — greyed out when the
@@ -3417,6 +3615,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         options={currentGroupVariants}
                                                         onChange={handleLanguageChange}
                                                         placeholder={t("Select Region")}
+                                                        badges={appleLanguageBadges?.variant}
                                                         disabled={!!localLanguageCapability && !localLanguageCapability.accentSelectable}
                                                     />
                                                 </div>
@@ -3433,6 +3632,116 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         {' '}{localLanguageCapability.accentSelectable
                                                             ? t('supports English only — language is fixed for this model.')
                                                             : t('supports English only — language and accent are fixed for this model.')}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {/* Apple Speech: the stored language may be one of the 20
+                                                Natively offers that Apple cannot transcribe. It is filtered
+                                                out of the selects above, so without this the control would
+                                                just sit on its placeholder with no explanation. */}
+                                            {appleLanguageCapability && storedLanguageUnsupported && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <AlertCircle size={14} className="text-amber-400 shrink-0" />
+                                                    <p className="text-xs text-amber-200/90">
+                                                        {`"${availableLanguages[recognitionLanguage]?.label ?? recognitionLanguage}" ${t("isn't available in Apple Speech — pick one of the listed languages.")}`}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {/* Download the selected language now, with a visible bar,
+                                                instead of letting the first meeting stall on it. Apple
+                                                reports a 0..1 fraction and no transfer size, so this is a
+                                                percentage — there is no MB figure available to show. */}
+                                            {appleLanguageCapability && selectedAppleNeedsDownload && (
+                                                <div className="mt-3 rounded-xl border border-border-subtle bg-bg-card p-3">
+                                                    {/* Gate on the locale actually downloading, not merely on
+                                                        "a download exists": switching language mid-download
+                                                        otherwise showed the NEW language's card wearing the
+                                                        OLD language's progress bar, and hid its own button. */}
+                                                    {appleInstall && appleInstall.locale === selectedAppleLocale ? (
+                                                        <>
+                                                            <div className="flex items-center justify-between mb-2">
+                                                                <span className="text-xs text-text-primary">
+                                                                    {t('Downloading language model…')}
+                                                                </span>
+                                                                <span className="text-xs tabular-nums text-text-secondary">
+                                                                    {Math.round(appleInstall.fraction * 100)}%
+                                                                </span>
+                                                            </div>
+                                                            <div className="h-1.5 w-full rounded-full bg-bg-input overflow-hidden">
+                                                                <div
+                                                                    className="h-full rounded-full bg-accent-primary transition-[width] duration-300 ease-out"
+                                                                    style={{ width: `${Math.max(2, appleInstall.fraction * 100)}%` }}
+                                                                />
+                                                            </div>
+                                                            <p className="text-[11px] text-text-secondary mt-2">
+                                                                {t('macOS is fetching this language. You can keep using Natively; the download continues in the background.')}
+                                                            </p>
+                                                        </>
+                                                    ) : (
+                                                        <div className="flex items-center justify-between gap-3">
+                                                            <div className="min-w-0">
+                                                                <p className="text-xs text-text-primary">
+                                                                    {t('This language is not downloaded yet.')}
+                                                                </p>
+                                                                <p className="text-[11px] text-text-secondary mt-0.5">
+                                                                    {t('Download it now, or the first meeting will wait while macOS fetches it.')}
+                                                                </p>
+                                                            </div>
+                                                            <button
+                                                                onClick={startAppleDownload}
+                                                                disabled={!!appleSlots?.full}
+                                                                title={appleSlots?.full ? t('Remove a downloaded language first.') : undefined}
+                                                                className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-bg-input hover:bg-bg-elevated text-text-primary border border-border-subtle transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                                                            >
+                                                                {t('Download')}
+                                                            </button>
+                                                        </div>
+                                                    )}
+                                                    {appleInstallError && (
+                                                        <p className="text-[11px] text-amber-200/90 mt-2">{appleInstallError}</p>
+                                                    )}
+                                                </div>
+                                            )}
+                                            {/* Apple allocates a fixed number of language slots per app
+                                                and an install takes one permanently, so the cap has to be
+                                                visible and recoverable — otherwise the sixth language just
+                                                fails with Apple's opaque "Too many allocated locales". */}
+                                            {appleSlots && appleSlots.entries.length > 0 && (
+                                                <div className="mt-3 rounded-xl border border-border-subtle bg-bg-card p-3">
+                                                    <div className="flex items-center justify-between mb-2">
+                                                        <span className="text-xs font-medium text-text-primary">
+                                                            {t('Downloaded languages')}
+                                                        </span>
+                                                        <span className={`text-[11px] tabular-nums ${appleSlots.full ? 'text-amber-300/90' : 'text-text-secondary'}`}>
+                                                            {appleSlots.used} / {appleSlots.max}
+                                                        </span>
+                                                    </div>
+                                                    <ul className="space-y-1">
+                                                        {appleSlots.entries.map((e) => (
+                                                            <li key={e.bcp} className="flex items-center justify-between gap-3">
+                                                                <span className="text-xs text-text-secondary truncate">{e.label}</span>
+                                                                <button
+                                                                    onClick={() => releaseAppleLanguage(e.bcp)}
+                                                                    disabled={appleReleasing === e.bcp}
+                                                                    className="shrink-0 text-[11px] px-2 py-1 rounded-md text-text-secondary hover:text-text-primary hover:bg-bg-input border border-transparent hover:border-border-subtle transition-colors disabled:opacity-40"
+                                                                >
+                                                                    {appleReleasing === e.bcp ? t('Removing…') : t('Remove')}
+                                                                </button>
+                                                            </li>
+                                                        ))}
+                                                    </ul>
+                                                    <p className="text-[11px] text-text-secondary mt-2">
+                                                        {appleSlots.full
+                                                            ? t('All language slots are in use. Remove one to download another — removing deletes the model, so it has to be downloaded again to use it.')
+                                                            : t('Apple allows a limited number of downloaded languages. Removing one deletes its model.')}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {appleLanguageCapability && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        {t('Languages marked Download are fetched by macOS the first time you use them — the first meeting starts once that finishes.')}
                                                     </p>
                                                 </div>
                                             )}
@@ -3462,11 +3771,15 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 </div>
                                             )}
 
-                                            <div className="flex gap-2 items-center mt-2 px-1">
-                                                <Info size={14} className="text-text-secondary shrink-0" />
-                                                <p className="text-xs text-text-secondary">
-                                                    {recognitionLanguage === 'auto'
-                                                        ? autoDetectedLanguage
+                                            {/* Auto mode only. The picker's own label already says this
+                                                is the meeting language, so restating it under every explicit
+                                                choice was noise — and it pushed the genuinely useful notes
+                                                (download state, slot budget) further down the panel. */}
+                                            {recognitionLanguage === 'auto' && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        {autoDetectedLanguage
                                                             ? (() => {
                                                                 const label = Object.values(availableLanguages).find((l: any) =>
                                                                     l.bcp47 === autoDetectedLanguage || l.iso639 === autoDetectedLanguage
@@ -3474,10 +3787,10 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                 return `${t('Auto mode — detected:')} ${label ?? autoDetectedLanguage}`;
                                                               })()
                                                             : t('Auto mode — language will be detected from the first few seconds of audio.')
-                                                        : t('Select the primary language being spoken in the meeting.')
-                                                    }
-                                                </p>
-                                            </div>
+                                                        }
+                                                    </p>
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
 
@@ -3956,11 +4269,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                    'retrieval' sends undefined, which is what tells the
                                    layout to leave the current sub-tab alone. */
                                 <RetrievalSettings
-                                    initialTab={
-                                        activeTab === 'reranker' ? 'reranker'
-                                            : activeTab === 'embedding' ? 'embedding'
-                                                : undefined
-                                    }
+                                    initialTab={retrievalRequest.tab}
+                                    navSeq={retrievalRequest.seq}
                                 />
                             )}
 
@@ -3975,6 +4285,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                             {activeTab === 'about' && (
                                 <AboutSection />
                             )}
+                            </ErrorBoundary>
                             </motion.div>
                         </div>
                     </div>

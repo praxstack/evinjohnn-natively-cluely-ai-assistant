@@ -281,6 +281,8 @@ const GATE_GENERIC_TOKENS = new Set<string>([
 ]);
 
 
+let appleSpeechLocalesCache: { available: boolean; supported: string[]; installed: string[]; reserved: string[]; maxReserved: number } | null = null;
+
 export function initializeIpcHandlers(appState: AppState): void {
   const safeHandle = (
     channel: string,
@@ -10842,6 +10844,55 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
     },
   );
+
+  // Which languages Apple Speech can transcribe, and which are already on
+  // disk. Settings uses this to restrict the language list and to mark the
+  // rest as a download, so nobody picks a dead end and discovers it mid-meeting.
+  // Cached for the session: the answer only changes when macOS installs an
+  // asset, and the meeting-time 'preparing' status already covers that case.
+  // Download one Apple Speech language on demand, so the wait happens in
+  // Settings with a visible bar instead of silently at the first meeting.
+  // Progress is a fraction only — Apple exposes no transfer size.
+  // Give up one allocated locale so another can be downloaded. Apple caps an
+  // app at 5 and an install takes a slot permanently, so without this a sixth
+  // language is a dead end. DESTRUCTIVE — the asset is purged and must be
+  // downloaded again — so it is only ever reached from an explicit user action.
+  safeHandle('apple-speech:release-locale', async (_e, locale: string) => {
+    if (process.platform !== 'darwin') return { ok: false, error: 'Apple Speech is macOS-only.' };
+    if (typeof locale !== 'string' || !/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)) {
+      return { ok: false, error: 'Invalid locale.' };
+    }
+    const { releaseAppleSpeechLocale } = require('./audio/AppleSpeechSTT');
+    const result = await releaseAppleSpeechLocale(locale);
+    if (result.ok) appleSpeechLocalesCache = null;
+    return result;
+  });
+
+  safeHandle('apple-speech:install-locale', async (event, locale: string) => {
+    if (process.platform !== 'darwin') return { ok: false, error: 'Apple Speech is macOS-only.' };
+    if (typeof locale !== 'string' || !/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)) {
+      return { ok: false, error: 'Invalid locale.' };
+    }
+    const { installAppleSpeechLocale } = require('./audio/AppleSpeechSTT');
+    const send = (fraction: number) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('apple-speech:install-progress', { locale, fraction });
+      }
+    };
+    const result = await installAppleSpeechLocale(locale, send);
+    // The cached inventory is now stale — the next Settings open re-reads it.
+    if (result.ok) appleSpeechLocalesCache = null;
+    return result;
+  });
+
+  safeHandle('apple-speech:get-locales', async () => {
+    if (process.platform !== 'darwin') return { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 };
+    if (!appleSpeechLocalesCache) {
+      const { readAppleSpeechLocales } = require('./audio/AppleSpeechSTT');
+      appleSpeechLocalesCache = await readAppleSpeechLocales();
+    }
+    return appleSpeechLocalesCache;
+  });
 
   safeHandle('get-stt-provider', async () => {
     try {

@@ -308,7 +308,11 @@ test('rejects unsupported platforms before spawning the helper', () => {
   assert.equal(spawnCalls.length, 0);
   assert.equal(errors.length, 1);
   assert.equal(errors[0].code, 'local_stt_unavailable');
-  assert.match(errors[0].message, /requires macOS 26 or later/i);
+  // A non-macOS host must never be handed macOS troubleshooting (CLAUDE.md
+  // cross-platform contract). Windows reaches this only via a carried-over
+  // credential store, since the settings tile is isMac-gated.
+  assert.match(errors[0].message, /macOS-only/i);
+  assert.doesNotMatch(errors[0].message, /macOS 26 or later/i);
 });
 
 test('rejects pre-macOS-26 Darwin releases before spawning the helper', () => {
@@ -323,4 +327,344 @@ test('rejects pre-macOS-26 Darwin releases before spawning the helper', () => {
   assert.equal(errors.length, 1);
   assert.equal(errors[0].code, 'local_stt_unavailable');
   assert.match(errors[0].message, /requires macOS 26 or later/i);
+});
+
+test('drops a punctuation-only final but keeps the words it already streamed', () => {
+  // A `flush` force-finalizes a still-volatile result and Apple sometimes
+  // answers with debris instead of the words. Live-reproduced against the real
+  // compiled helper: 1 run in 8 returned a final of "......." after correct
+  // partials. finalize() is the Answer button, so that debris would be
+  // attributed to the question the user just asked.
+  const { child, runtime } = createHarness();
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  const transcripts = [];
+  stt.on('transcript', (transcript) => transcripts.push(transcript));
+
+  stt.start();
+  child.stdout.emit('data', '{"type":"ready"}\n');
+  child.stdout.emit(
+    'data',
+    '{"type":"transcript","text":"Second sentence about hiring plans.","isFinal":false}\n' +
+    '{"type":"transcript","text":".......","isFinal":true}\n',
+  );
+
+  assert.deepEqual(
+    transcripts.map((t) => [t.text, t.isFinal]),
+    [['Second sentence about hiring plans.', false]],
+    'the punctuation-only final must not reach the transcript',
+  );
+});
+
+test('a real final still passes, including non-Latin scripts and digit-only answers', () => {
+  const { child, runtime } = createHarness();
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  const transcripts = [];
+  stt.on('transcript', (transcript) => transcripts.push(transcript));
+
+  stt.start();
+  child.stdout.emit('data', '{"type":"ready"}\n');
+  child.stdout.emit(
+    'data',
+    '{"type":"transcript","text":"季度收入增长了15%。","isFinal":true}\n' +
+    '{"type":"transcript","text":"42.","isFinal":true}\n' +
+    '{"type":"transcript","text":"!?…","isFinal":true}\n',
+  );
+
+  assert.deepEqual(
+    transcripts.map((t) => t.text),
+    ['季度收入增长了15%。', '42.'],
+    'the guard must key on letters/digits in ANY script, never on ASCII punctuation alone',
+  );
+});
+
+test('audio buffered before ready is trimmed, not failed, so the startup timer can fire', () => {
+  // Regression: the ten-second pending cap used to hard-fail with "could not
+  // keep up with the audio" whenever the helper was slow to start WITHOUT
+  // announcing an asset download, which made MODEL_START_TIMEOUT_MS (120s)
+  // unreachable any time audio was flowing.
+  const { child, runtime } = createHarness();
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  const errors = [];
+  stt.on('error', (error) => errors.push(error));
+
+  stt.setSampleRate(16000);
+  stt.start();
+  // No 'ready', no asset-download status: 12 seconds of 16 kHz mono Int16
+  // against a 10-second cap.
+  const oneSecond = Buffer.alloc(16000 * 2);
+  for (let i = 0; i < 12; i += 1) stt.write(oneSecond);
+
+  assert.deepEqual(errors, [], 'a slow start must not be reported as the helper failing to keep up');
+  assert.equal(child.stdin.writes.length, 1, 'only the init line — audio stays buffered until ready');
+
+  // Once ready the retained tail drains, bounded to the cap.
+  child.stdout.emit('data', '{"type":"ready"}\n');
+  const drained = protocolMessages(child.stdin.writes.slice(1));
+  assert.ok(drained.length > 0, 'the retained tail must be delivered once ready');
+  assert.ok(drained.every((m) => m.type === 'audio'));
+  const drainedBytes = drained.reduce((n, m) => n + Buffer.from(m.pcm, 'base64').length, 0);
+  assert.ok(drainedBytes <= 16000 * 2 * 10, `retained tail must stay within the 10s cap, got ${drainedBytes} bytes`);
+});
+
+// Locale resolution. Apple rejects anything that is not a real BCP-47 locale:
+// probed live against the framework, "english" -> nil and "spanish" -> nil, so
+// forwarding an unresolved settings key can only ever fail. Worse, bare "en"
+// resolves to en-IE (Irish English), so falling back to iso639 silently
+// mis-transcribes. Every other provider refuses an unknown key and keeps its
+// default (GoogleSTT warns and returns); this one has to produce a locale, so
+// it falls back to the app locale instead of forwarding garbage.
+function localeSentTo(child) {
+  return JSON.parse(child.stdin.writes[0].trim()).locale;
+}
+
+test('a legacy "english" setting resolves to a real English locale, not the literal string', () => {
+  // 'english' is what installs from before the English-variants split still
+  // have persisted; RECOGNITION_LANGUAGES has a plain key for every language
+  // EXCEPT English, which exists only as english-us/uk/in/au/ca.
+  const { child, runtime } = createHarness({ locale: 'fr-FR' });
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  stt.on('error', () => {});
+  stt.setRecognitionLanguage('english');
+  stt.start();
+  assert.equal(localeSentTo(child), 'en-US', 'a non-English app locale must not drag English to fr-FR');
+});
+
+test('"english" prefers the regional variant the machine already runs', () => {
+  const { child, runtime } = createHarness({ locale: 'en-GB' });
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  stt.on('error', () => {});
+  stt.setRecognitionLanguage('english');
+  stt.start();
+  assert.equal(localeSentTo(child), 'en-GB');
+});
+
+test('explicit region keys and plain language keys both still resolve', () => {
+  for (const [key, expected] of [['english-au', 'en-AU'], ['spanish', 'es-ES'], ['japanese', 'ja-JP']]) {
+    const { child, runtime } = createHarness({ locale: 'en-US' });
+    const stt = new AppleSpeechSTT('/fake/helper', runtime);
+    stt.on('error', () => {});
+    stt.setRecognitionLanguage(key);
+    stt.start();
+    assert.equal(localeSentTo(child), expected, `${key} must map to ${expected}`);
+  }
+});
+
+test('an unknown key falls back to the app locale instead of being forwarded', () => {
+  const { child, runtime } = createHarness({ locale: 'de-DE' });
+  const stt = new AppleSpeechSTT('/fake/helper', runtime);
+  stt.on('error', () => {});
+  stt.setRecognitionLanguage('klingon');
+  stt.start();
+  const sent = localeSentTo(child);
+  assert.equal(sent, 'de-DE');
+  assert.notEqual(sent, 'klingon', 'a settings key must never reach Apple as a locale');
+});
+
+// --- readAppleSpeechLocales: the Settings language picker's data source ------
+// Every failure must degrade to available:false, which the renderer reads as
+// "don't restrict the list and don't badge" — i.e. exactly the behaviour before
+// this existed. A picker that silently hides languages because a probe broke
+// would be worse than one that never annotated them.
+const { readAppleSpeechLocales } = await import(
+  pathToFileURL(path.resolve(__dirname, '../../../dist-electron/electron/audio/AppleSpeechSTT.js')).href
+);
+
+function stubSpawn(behaviour) {
+  return () => {
+    const child = new FakeChild();
+    queueMicrotask(() => behaviour(child));
+    return child;
+  };
+}
+
+test('locales query parses the helper answer', async () => {
+  const result = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', JSON.stringify({
+        type: 'locales', available: true, supported: ['en-US', 'es-ES'], installed: ['en-US'],
+      }) + '\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(result, {
+    available: true, supported: ['en-US', 'es-ES'], installed: ['en-US'], reserved: [], maxReserved: 0,
+  });
+});
+
+test('locales query never spawns anything off macOS', async () => {
+  let spawned = false;
+  const result = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'win32',
+    spawn: () => { spawned = true; throw new Error('must not spawn'); },
+  });
+  assert.equal(spawned, false, 'Windows must not try to run a Mach-O helper');
+  assert.deepEqual(result, { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 });
+});
+
+test('a missing helper, garbage output, or a hang all degrade to unavailable', async () => {
+  const missing = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => c.emit('error', new Error('ENOENT'))),
+  });
+  assert.deepEqual(missing, { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 });
+
+  const garbage = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => { c.stdout.emit('data', 'not json\n'); c.emit('close', 1, null); }),
+  });
+  assert.deepEqual(garbage, { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 });
+
+  const hung = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    timeoutMs: 20,
+    spawn: stubSpawn(() => { /* never answers, never closes */ }),
+  });
+  assert.deepEqual(hung, { available: false, supported: [], installed: [], reserved: [], maxReserved: 0 }, 'a hung probe must not block Settings forever');
+});
+
+test('an unavailable Mac reports no locales rather than an empty supported list it might act on', async () => {
+  const result = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', JSON.stringify({ type: 'locales', available: false, supported: [], installed: [] }) + '\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.equal(result.available, false);
+});
+
+// --- installAppleSpeechLocale: the Settings download button --------------
+const { installAppleSpeechLocale } = await import(
+  pathToFileURL(path.resolve(__dirname, '../../../dist-electron/electron/audio/AppleSpeechSTT.js')).href
+);
+
+test('install streams progress fractions and resolves ok on install-done', async () => {
+  const seen = [];
+  const result = await installAppleSpeechLocale('ko-KR', (f) => seen.push(f), '/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"install-progress","locale":"ko-KR","fraction":0.15}\n');
+      c.stdout.emit('data', '{"type":"install-progress","locale":"ko-KR","fraction":0.8}\n{"type":"install-done","locale":"ko-KR"}\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(seen, [0.15, 0.8]);
+});
+
+test('a fraction outside 0..1 is clamped before it reaches a progress bar', async () => {
+  const seen = [];
+  await installAppleSpeechLocale('ko-KR', (f) => seen.push(f), '/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"install-progress","fraction":-3}\n{"type":"install-progress","fraction":42}\n{"type":"install-done"}\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(seen, [0, 1]);
+});
+
+test('an exit without install-done is a failure, not a silent success', async () => {
+  const result = await installAppleSpeechLocale('ko-KR', () => {}, '/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"error","message":"network unreachable"}\n');
+      c.emit('close', 1, null);
+    }),
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /network unreachable/);
+});
+
+test('install never spawns a Mach-O helper off macOS', async () => {
+  let spawned = false;
+  const result = await installAppleSpeechLocale('ko-KR', () => {}, '/fake/helper', {
+    platform: 'win32',
+    spawn: () => { spawned = true; throw new Error('must not spawn'); },
+  });
+  assert.equal(spawned, false);
+  assert.equal(result.ok, false);
+});
+
+// --- releaseAppleSpeechLocale: the only way back from Apple's 5-slot cap ----
+// Apple allocates at most maximumReservedLocales (5) per app and an install
+// takes a slot permanently — a sixth download fails with "Too many allocated
+// locales, 5 maximum", reproduced live. Releasing is the only recovery and it
+// PURGES the asset (zh-CN vanished from installedLocales in testing), so it is
+// never called automatically to make room; only from an explicit user action.
+const { releaseAppleSpeechLocale } = await import(
+  pathToFileURL(path.resolve(__dirname, '../../../dist-electron/electron/audio/AppleSpeechSTT.js')).href
+);
+
+test('release resolves ok only when the helper confirms release-done', async () => {
+  const ok = await releaseAppleSpeechLocale('zh-CN', '/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"release-done","locale":"zh-CN","released":true}\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(ok, { ok: true });
+});
+
+test('an exit without release-done is a failure, never a silent success', async () => {
+  const r = await releaseAppleSpeechLocale('zh-CN', '/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"error","message":"not reserved"}\n');
+      c.emit('close', 1, null);
+    }),
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /not reserved/);
+});
+
+test('release times out rather than leaving Settings stuck on "Removing…"', async () => {
+  const r = await releaseAppleSpeechLocale('zh-CN', '/fake/helper', {
+    platform: 'darwin',
+    timeoutMs: 20,
+    spawn: stubSpawn(() => { /* never answers */ }),
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /timed out/i);
+});
+
+test('release never spawns a Mach-O helper off macOS', async () => {
+  let spawned = false;
+  const r = await releaseAppleSpeechLocale('zh-CN', '/fake/helper', {
+    platform: 'win32',
+    spawn: () => { spawned = true; throw new Error('must not spawn'); },
+  });
+  assert.equal(spawned, false);
+  assert.equal(r.ok, false);
+});
+
+test('the locales probe carries the reservation budget the picker gates on', async () => {
+  const r = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', JSON.stringify({
+        type: 'locales', available: true, supported: ['en-US'], installed: ['en-US'],
+        reserved: ['en-US', 'de-DE'], maxReserved: 5,
+      }) + '\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(r.reserved, ['en-US', 'de-DE']);
+  assert.equal(r.maxReserved, 5);
+});
+
+test('a helper that omits the reservation fields degrades to an empty budget', async () => {
+  // An older helper binary next to a newer app must not make the picker think
+  // zero slots exist and block every download.
+  const r = await readAppleSpeechLocales('/fake/helper', {
+    platform: 'darwin',
+    spawn: stubSpawn((c) => {
+      c.stdout.emit('data', '{"type":"locales","available":true,"supported":["en-US"],"installed":["en-US"]}\n');
+      c.emit('close', 0, null);
+    }),
+  });
+  assert.deepEqual(r.reserved, []);
+  assert.equal(r.maxReserved, 0);
 });
