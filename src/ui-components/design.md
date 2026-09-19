@@ -460,6 +460,180 @@ the current fill reaches 5.31:1 without touching the colour at all.
 
 Tokens: `--lg-sky-bg`, `--lg-sky-hover`, `--lg-sky-fg`.
 
+### A clear body removes the body from the model
+
+`.lg-clear` is the material with **no fill of its own** — the host's surface
+shows through and the rim is the only thing it contributes. It exists for the
+case this material was already rejected on once: the modes manager sidebar
+(`#0e0e0e` dark, `#f9f9f9` light), where a *tinted* chip read as out of place
+on a flat panel and subtracting the rim, then the cap shadow, then the contact
+shadow left nothing of the material behind. Letting the panel through is the
+move that fits a flat surface.
+
+The premise worth stating, because the instinct is that a near-black panel
+starves the rim. It does the opposite — the rim is an inset shadow composited
+over the button's **own** fill, and a transparent fill is a darker floor.
+Measured in Electron at device scale 1, both buttons `.lg-sm .lg-wide` at
+216px so the variant is the only difference (luma, 0–255):
+
+| | surround | body | top rim | bottom rim |
+| --- | --- | --- | --- | --- |
+| `neutral` on `#242424` | 36 | 85 | 104 *(+19)* | 121 *(+36)* |
+| `clear` on `#0e0e0e` | 14 | 28 | **62 *(+34)*** | **69 *(+41)*** |
+
+Absolutely darker, relatively brighter — on both faces.
+
+The cap shadow picks up a second job for free. `::after` is black, so on a
+near-black panel it pulls the caps back down *to* the surround and the ends
+dissolve into the sidebar rather than terminating against it — which is what a
+clear material should do. On a white panel the same gradient is a smudge on
+each end, so light mode takes it to `.20`.
+
+**Light mode is the one place the layer structure changes.** Everywhere else
+light mode moves the vertical mask and one box-shadow and leaves the layers
+alone, because the body is opaque and brighter than its own rim can be. Here
+two layers stop working and have to invert:
+
+| Layer | Dark | Light |
+| --- | --- | --- |
+| rim | white specular, top and bottom faces | **dark** hairline; the underside carries more |
+| lens | white bloom under the pointer | **darkening** under the pointer |
+| `::after` | full weight — the caps dissolve into the panel | `.20` — enough to turn away from the light, not enough to blot |
+| contact shadow | none | **still none** — see below |
+
+**No contact shadow, and that is where `clear` parts company with `action` and
+`sky`.** Both of those cast one on a light ground because there is a solid body
+sitting *on* the card to cast it. A chip you can see the panel through is not
+sitting on anything; a drop shadow under it claims a height the material does
+not have. The underside inset is the whole of the depth.
+
+**It is the only variant that must not pin a label colour — and the only one
+that needs `color: inherit` to say so.** The other four own their body, so each
+pins a colour against it. Here the body *is* the host's surface, so the label
+has to be the host's text colour, and that does not arrive by itself: a
+`<button>` gets `color: buttontext` from the UA stylesheet, which is an
+*initial* value, not an inherited one. The other variants never notice, because
+their `.lg-X .lg-content` rule overrides it. Measured without the line:
+`rgb(0, 0, 0)` in **both** themes — black on `#0e0e0e`. `color: inherit` goes on
+`.lg-button`, not on `.lg-content`, which would only inherit `buttontext` from
+its parent. Replacing it with a fixed colour breaks the one thing that lets a
+single class serve both themes.
+
+Derived, not measured — the reference is a dark stage of opaque pills and has
+nothing in it to sample for a fill that is mostly surround. Same standing as
+light mode and `.lg-sky`; no mean-absolute-error figure is claimed.
+
+Tokens: `--lg-clear-bg`, `--lg-clear-hover`, `--lg-clear-bg-light`,
+`--lg-clear-hover-light`. The defaults are the modes sidebar's own
+`--mm-btn-bg` / `--mm-btn-bg-hover` steps (`.06 → .10` dark, `.04 → .08`
+light), so the button carries the weight the control it replaced had.
+
+```tsx
+<LiquidGlassButton variant="clear" className="lg-sm lg-wide" icon={<Plus size={13} />}>
+    New Mode
+</LiquidGlassButton>
+```
+
+### Width is its own axis: `.lg-wide`
+
+`.lg-sm` is a *scale*. A button stretched to fill its container is a separate
+problem, and the cap fade is where it shows up. The stops are percentages of
+width, tuned on a 535x136 pill whose caps were 12.7% of it. A 30px-tall button
+filling a 240px sidebar is 216px wide, so its caps are 15px — 6.9% — while
+`--lg-cap-2` still says 26.5%:
+
+| | ends at |
+| --- | --- |
+| the cap (where curvature stops) | 15px |
+| the fade (`--lg-cap-2`) | **57px** |
+
+Between them the top face is flat and the rim is still climbing, so the
+specular never reaches full strength until well past the corner. Sampling the
+top edge of that 216px button (luma, dark theme; the light theme inverts and
+falls to its floor at the same distances):
+
+| distance from the left edge | 2 | 6 | 10 | **15** | 20 | 30 | 45 | 60 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| with `.lg-wide` | 14 | 13 | 29 | **68** | 69 | 69 | 69 | 69 |
+| without | 14 | 13 | 24 | 48 | 57 | 65 | 67 | **69** |
+
+With the lengths the rim is at full strength by 15px, which is exactly where
+the cap ends. Without them it is still climbing at 45px and arrives only at
+60px — four times past the corner. This is the third appearance of the same bug — `LiquidGlassBadge` at 42px, the Profile
+Intelligence CTA at 196px — so `.lg-wide` names it and applies the fix both of
+those landed on independently: stops as **lengths** pinned to the cap radius,
+which is width-invariant.
+
+Add it whenever the width is set by the container rather than by the label.
+It is deliberately *not* folded into `.lg-sm`, whose label-width buttons keep
+proportions the percentages still serve.
+
+### Tile scale is the rim's other failure: `.lg-tile`
+
+`.lg-sm` collapses the rim to one hairline because at 32px a 3px rim is 9% of
+the height and three rings plus the cap ring swallow the button. On a **58px
+selectable tile** that same hairline is the opposite mistake: 1.7% of the
+height, thinner in proportion than the 136px reference's own 2%, so there is no
+specular to read and the tile lands as a flat card with a faint border. That is
+what "doesn't look like glass" looks like from the inside.
+
+`.lg-tile` puts two rings back (~3.4%) and is *additive* to `.lg-sm`, which is
+still right about the font, the 12px label and its leading:
+
+```tsx
+<LiquidGlassButton variant="clear" className="lg-sm lg-tile" icon={<Terminal size={18} />}>
+    Terminal
+</LiquidGlassButton>
+```
+
+The lens moves for the same reason it had to shrink for `.lg-sm`, in the other
+direction: 90x40 is a dot in a 253x58 box and the hero's 200x150 is taller than
+the tile, so it goes to 150x70 resting / 110x52 pressed. The cap shadow drops to
+2px at `.42` — a rect's side face is the full height, so it carries further than
+a pill's semicircular cap while turning away from the light less sharply.
+
+Derived, not measured, like light mode and the other two late variants. Verified
+by rendering the Process Disguise picker (4 tiles at 253x58, `clear` resting and
+`action` selected) in both themes at device scale 2.
+
+**The body has to stay translucent for any of this to help.** That picker first
+fed `--lg-clear-bg: var(--bg-input)`, an opaque fill *darker* than the card it
+sits on, which reads as a plate in a hole no matter how good the rim is. The
+variant's own defaults — a translucent step over whatever is behind — are what
+let the card show through.
+
+### A knob has no layers: `.lg-slider`
+
+The material as a range input's thumb, and the one place it is built without
+its own element structure. `::-webkit-slider-thumb` cannot carry
+`::before`/`::after`, so the rim, the cap shadow and the contact shadow
+collapse into a single `box-shadow` list, in the button's own layer order:
+top specular, underside, hairline ring, contact.
+
+Two consequences of the shape, both the opposite of the pill's:
+
+**The ring is uniform.** On a pill the specular is masked to the top and bottom
+faces because the caps turn away from the light. A circle is *all* cap — every
+point on the perimeter curves away by the same amount — so there is nothing to
+aim, and the mask would only thin the ring on the two sides that are no
+different from the rest of it.
+
+**The contact shadow is in both themes.** `.lg-clear` has none because a body
+you can see through is not sitting on anything. A knob is sitting on the track,
+in either theme, so it casts one in either theme; only its weight changes.
+
+At 18px the three-ring falloff has nowhere to go, so it is one hairline — the
+same collapse `.lg-sm` makes, one size further down. The body reads
+`--accent-primary` the way `.lg-action` reads `--legacy-action-bg`, so the knob
+stays the host's control colour rather than importing a tint from here.
+
+```tsx
+<input type="range" className="lg-slider w-full h-1.5 rounded-full appearance-none bg-bg-input" />
+```
+
+The host still owns the track. `accent-color` does nothing once the thumb is
+styled, so drop it rather than leaving it to look load-bearing.
+
 ### Light mode is derived, not measured
 
 Everything else in this document was sampled from a reference. Light mode was
@@ -475,8 +649,11 @@ vertical mask and one box-shadow change; the layer structure is untouched.
 ## Known constraints
 
 - **`neutral` and `green` are dark-surface tints** for `#242424`, and the focus
-  ring is picked for contrast against it. Only `.lg-action` has a light-mode
-  treatment, and that one is derived rather than measured.
+  ring is picked for contrast against it. Only `.lg-action` and `.lg-clear` have
+  a light-mode treatment, and both are derived rather than measured.
+- **`.lg-clear` has been rendered on the modes sidebar only.** Its defaults are
+  that panel's control tokens; on a surface with a different resting weight,
+  feed `--lg-clear-*` rather than assuming the defaults carry over.
 - **Measured on macOS only.** Windows resolves to Inter and runs ~1.9% wide at
   the same nominal size. Rendered in Chrome only — `mask-composite: intersect`
   and `-webkit-mask-composite: source-in` are both declared, but Safari and
