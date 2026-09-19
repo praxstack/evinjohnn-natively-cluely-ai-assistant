@@ -45,6 +45,30 @@ identically in both themes. It arrives already `1em`-sized, so unlike
 Before this file existed the provider rendered an `NI` monogram, which the
 speech-selector coverage test flagged as an unrecorded fallback.
 
+### Fluxion AI
+
+The one mark here that is not from lobehub — Fluxion is a small aggregator
+gateway with no entry in any icon set. `fluxion.png` is the **F monogram** taken
+from their own wordmark logo (`https://fluxionai.world/logo.png`), cropped away
+from the "FluxionAPI" lettering with the white plate unpremultiplied to alpha.
+
+**Why not their orbital-galaxy brand mark** (`docs.fluxionai.world/brand-logo-mark.png`),
+which is the image Fluxion themselves lead with: the tile renders a **16px**
+glyph, and the galaxy is an illustration, not an icon. Rendered at true size it
+is a faint smudge on the dark tile and an unrecognisable grey blob in the light
+one — measured, not assumed. Every other mark here is a simple glyph (a star, an
+asterisk, a monogram) for exactly this reason. The only published copy is also
+flattened onto white, and since the artwork's highlights are white, unflattening
+it to alpha cannot recover the glow that carries the design.
+
+**A third asset to avoid:** `https://fluxionai.world/logo.svg` is an
+interlocking-S glyph whose own `<title>` reads **"Sub2API"** — artwork predating
+the Fluxion branding. It shipped here briefly by mistake.
+
+If Fluxion ever publishes a simplified icon-sized mark, prefer it over the
+monogram. No licence statement accompanies any of these assets, so the mark is
+used purely nominatively, as stated at the top of this file.
+
 ### Jina
 
 Added for the hosted Jina reranker in Settings → Reranker, which is the only way

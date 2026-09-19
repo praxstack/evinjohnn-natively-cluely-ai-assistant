@@ -36,6 +36,12 @@ import jinaMark from '../../assets/provider-logos/jina.svg?raw';
 // loses nothing here. Vendored from BerriAI/litellm — MIT, and outside the
 // `enterprise/` directory that their LICENSE carves out.
 import litellmMark from '../../assets/provider-logos/litellm.png';
+// Fluxion's mark is full-colour artwork, so it is a URL rendered with <img> for
+// the same reason as litellm. This is the F monogram from their wordmark, NOT
+// the orbital-galaxy brand image: the tile renders a 16px glyph, and at that
+// size the galaxy is an illegible smudge in both themes (measured). See the
+// provider-logos README.
+import fluxionMark from '../../assets/provider-logos/fluxion.png';
 // Our own app icon, for the Natively API row. Raster and full-colour, so it is a
 // URL rendered with <img> for the same reason as litellm.
 import nativelyIcon from '../../../assets/icon-512.png';
@@ -62,6 +68,9 @@ export const AI_PROVIDER_BRANDS: Record<string, { mono: string; brand: string }>
     // variants: OpenRouter lime, Voyage deep teal. The MARKS themselves take the
     // monochrome variant — see the README's "Colour vs monochrome".
     openrouter: { mono: 'OR', brand: '#C8FF00' },
+    // Sampled from the shipping asset. NOT #39D9E7 — that came from a stale
+    // interlocking-S logo the site still serves under the name "Sub2API".
+    fluxion:  { mono: 'FX', brand: '#0048D8' },
     voyage:   { mono: 'VY', brand: '#012E33' },
     // Jina's teal, taken from their own favicon (dominant non-neutral pixel,
     // 5758 of them) and confirmed against api.jina.ai's docs theme. NOT
@@ -72,9 +81,27 @@ export const AI_PROVIDER_BRANDS: Record<string, { mono: string; brand: string }>
     natively: { mono: 'NA', brand: '#7C9CF5' },
 };
 
+/**
+ * Raster marks whose artwork is WHITE on transparency, so they need the
+ * `.brand-mark-raster` light-theme flatten (`filter: brightness(0)`) to be
+ * visible on a light tile.
+ *
+ * It is opt-IN because the filter destroys a full-colour mark: it repaints every
+ * pixel black, which turned Fluxion's blue mark into a black smudge and was
+ * quietly doing the same to LiteLLM's. Only art that is genuinely white belongs
+ * here.
+ *
+ * NOT named `AI_PROVIDER_MARKS_*`: ModelPickerProviderMarkCoverage.test.mjs
+ * locates the registries by `indexOf('AI_PROVIDER_MARKS')` and brace-matching,
+ * so a constant sharing that prefix is found FIRST and parsed instead of the
+ * real map — every provider then reads as having no mark.
+ */
+export const WHITE_ON_TRANSPARENT_MARKS = new Set(['natively']);
+
 /** Raster marks, rendered as <img>. See AI_PROVIDER_MARKS for the inlined SVGs. */
 export const AI_PROVIDER_MARK_IMAGES: Record<string, string> = {
     litellm: litellmMark,
+    fluxion: fluxionMark,
     natively: nativelyIcon,
 };
 

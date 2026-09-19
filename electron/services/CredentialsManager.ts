@@ -96,7 +96,7 @@ export interface CurlProvider {
  * and setter build the key by concatenation, so adding a name here without the
  * field would silently read and write `undefined`.
  */
-export type PreferredModelProvider = 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'litellm';
+export type PreferredModelProvider = 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm';
 
 export interface StoredCredentials {
     geminiApiKey?: string;
@@ -122,10 +122,38 @@ export interface StoredCredentials {
      */
     customEmbeddingApiKey?: string;
     /**
-     * OpenRouter key, used for EMBEDDINGS. OpenRouter is otherwise reachable in
-     * this app only as a cURL/custom chat provider, which has no typed slot.
+     * ONE OpenRouter key, THREE consumers: chat/vision generation, embeddings and
+     * reranking. Deliberately not split — it is the same vendor and the same
+     * credential, and a user who set it up for retrieval should find the chat
+     * card already reading "Saved".
+     *
+     * The coupling is load-bearing in the other direction too: clearing this
+     * from the AI Providers card DEACTIVATES any hosted retrieval built on it
+     * (see setOpenrouterApiKey -> activateHostedRetrieval). That is why the
+     * remove path reports `retrievalDeactivated` and the renderer confirms
+     * first, the same shape NVIDIA NIM uses for `sttProviderCleared`.
      */
     openrouterApiKey?: string;
+    /**
+     * Fluxion AI gateway key. Unlike openrouterApiKey this backs CHAT ONLY —
+     * Fluxion exposes no embeddings or rerank endpoint — so there is no
+     * activateHostedRetrieval coupling and removing it cannot deactivate
+     * retrieval.
+     */
+    fluxionApiKey?: string;
+    /**
+     * Which wire protocol to speak to Fluxion.
+     *
+     * Absent → 'openai', which is the only protocol measured to work on EVERY
+     * group: a Claude-group key took /v1/chat/completions and /v1/messages
+     * equally (2026-09-18), while a GLM-group key took /v1/chat/completions but
+     * answered /v1/messages with a hard 403 "This group does not allow
+     * /v1/messages dispatch" (2026-09-19).
+     *
+     * So the Anthropic endpoint is the RESTRICTED one and this setting is a
+     * narrow escape hatch — not, as the docs imply, a per-group requirement.
+     */
+    fluxionProtocol?: 'openai' | 'anthropic';
     jinaApiKey?: string;
     /** Voyage AI key, used for EMBEDDINGS (Voyage is embeddings-only here). */
     voyageApiKey?: string;
@@ -156,6 +184,8 @@ export interface StoredCredentials {
     claudePreferredModel?: string;
     deepseekPreferredModel?: string;
     nvidia_nimPreferredModel?: string;
+    openrouterPreferredModel?: string;
+    fluxionPreferredModel?: string;
     /**
      * The LiteLLM model the user promoted to this provider's default, stored
      * PREFIXED (`litellm/<model>`) so it is the same id the picker, the
@@ -1104,6 +1134,33 @@ export class CredentialsManager {
         this.credentials.openrouterApiKey = key.trim() || undefined;
         this.saveCredentials();
         this.activateHostedRetrieval('openrouter', !!this.credentials.openrouterApiKey);
+        return true;
+    }
+
+    public getFluxionApiKey(): string | undefined {
+        return this.credentials.fluxionApiKey;
+    }
+
+    /**
+     * No activateHostedRetrieval call, deliberately: Fluxion is chat-only, so
+     * unlike the OpenRouter/Voyage/Jina setters this key can never be the thing
+     * a hosted embedding or reranker is running on.
+     */
+    public setFluxionApiKey(key: string): boolean {
+        if (this.refuseWriteWhileDegraded('set fluxion api key')) return false;
+        this.credentials.fluxionApiKey = key.trim() || undefined;
+        this.saveCredentials();
+        return true;
+    }
+
+    public getFluxionProtocol(): 'openai' | 'anthropic' {
+        return this.credentials.fluxionProtocol === 'anthropic' ? 'anthropic' : 'openai';
+    }
+
+    public setFluxionProtocol(protocol: 'openai' | 'anthropic'): boolean {
+        if (this.refuseWriteWhileDegraded('set fluxion protocol')) return false;
+        this.credentials.fluxionProtocol = protocol === 'anthropic' ? 'anthropic' : 'openai';
+        this.saveCredentials();
         return true;
     }
 
