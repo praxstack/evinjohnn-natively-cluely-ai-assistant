@@ -363,6 +363,13 @@ export function initializeIpcHandlers(appState: AppState): void {
         // user's real Anthropic/OpenAI/Gemini key, and nothing about the request
         // or the answer looks wrong.
         if (modelId.startsWith('fluxion/')) return 'fluxion';
+        // MUST stay above every vendor check below, same as the three gateways
+        // above. 9Router namespaces its catalogue by upstream, so
+        // `ninerouter/openai/gpt-5` is an includes('openai') match and
+        // `ninerouter/gemini/gemini-3.6-flash` would be claimed by the gemini-
+        // branch. Classified late, a 9Router model is gated by — and billed to —
+        // the user's own vendor key, and nothing about the answer looks wrong.
+        if (modelId.startsWith('ninerouter/')) return 'ninerouter';
         if (modelId.startsWith('ollama-')) return 'ollama';
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return 'gemini';
         if (isKnownGroqModel(modelId)) return 'groq';
@@ -405,7 +412,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         // what the user can pick, this one decides what routing accepts. If they
         // diverge the picker offers models the router rejects. A drift guard test
         // pins the two together.
-        const optInFamily = family === 'litellm' || family === 'openrouter';
+        const optInFamily = family === 'litellm' || family === 'openrouter' || family === 'ninerouter';
         const enabledForFamily = cm.getCloudEnabledModels?.(family) || [];
         if (optInFamily) {
           if (!enabledForFamily.includes(modelId)) return false;
@@ -422,6 +429,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Above the gemini/groq/openai/claude/deepseek lines for the reason
         // providerFamily() gives — all five would otherwise claim a Fluxion id.
         if (modelId.startsWith('fluxion/')) return has(cm.getFluxionApiKey());
+        // Above the vendor lines for the reason providerFamily() gives. Gated on
+        // the BASE URL, not a key: 9Router's own REQUIRE_API_KEY defaults to
+        // false, so a stock local instance is legitimately keyless and gating on
+        // a key would make a working install unselectable.
+        if (modelId.startsWith('ninerouter/')) return has(cm.getNinerouterBaseURL());
         if (modelId.startsWith('ollama-')) return true; // live Ollama probe happens at execution time
         if (allProviders.some((p: any) => p?.id === modelId)) return true;
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return has(cm.getGeminiApiKey());
@@ -453,6 +465,9 @@ export function initializeIpcHandlers(appState: AppState): void {
       // Same contract: stored fully prefixed (`fluxion/<model>`), the form
       // modelAvailable() classifies. Do not re-prefix.
       const fluxionFallbackModel: string | null = cm.getPreferredModel?.('fluxion') || null;
+      // Same contract again: stored fully prefixed (`ninerouter/<alias>/<model>`),
+      // the form modelAvailable() classifies. Do not re-prefix.
+      const ninerouterFallbackModel: string | null = cm.getPreferredModel?.('ninerouter') || null;
       if (has(cm.getLitellmBaseURL())) {
         try {
           const baseURL = (cm.getLitellmBaseURL() || 'http://localhost:4000/v1').replace(/\/+$/, '');
@@ -516,6 +531,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         // default went stale fell through to `allProviders.find(...)` -> null and
         // was told "No AI providers configured" while holding a working key.
         : (fluxionFallbackModel && modelAvailable(fluxionFallbackModel)) ? fluxionFallbackModel
+        // 9Router earns a rung on the same evidence, and it is the cheap kind
+        // rather than LiteLLM's: no catalogue fetch, because modelAvailable()
+        // already enforces the base URL, the disabled switch and the OPT-IN
+        // allow-list, so an id the user never ticked can never be installed as
+        // a default. Without it a 9Router-only user whose default went stale
+        // falls through to `allProviders.find(...)` -> null and is told "No AI
+        // providers configured" while holding a working instance.
+        : (ninerouterFallbackModel && modelAvailable(ninerouterFallbackModel)) ? ninerouterFallbackModel
         : antigravityFallback ? antigravityFallback
         : allProviders.find((p: any) => modelAvailable(p?.id))?.id
           || null;
@@ -1453,6 +1476,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             } catch { /* debug identity only */ }
             const modePort = createModeRetrievalPort({
               rerankSurface: 'manual',
+              // Typed turns outside a meeting may query the bundled embedder's vectors.
+              meetingActive: () => appState.getIsMeetingActive(),
               modesManager: mm,
               modeInfo,
               files,
@@ -1509,11 +1534,13 @@ export function initializeIpcHandlers(appState: AppState): void {
                 const collected = collectV3ProfileSources(llmHelper.getKnowledgeOrchestrator?.() ?? null);
                 if (collected.docs.length) {
                   const { createProfileRetrievalPort } = require('./context-intelligence/retrieval/profile-retrieval-port');
+                  const v3ProfileRawRetriever = require('./services/knowledge/v3ProfileSources').buildProfileRawRetriever(mm, collected.docs, { tokenBudget: policy.contextBudget.evidenceTokens, rerankSurface: 'manual', meetingActive: () => appState.getIsMeetingActive() });
                   v3ProfilePort = createProfileRetrievalPort({
                     docs: collected.docs,
                     allowedSourceTypes: policy.allowedSourceTypes,
                     profileSources: policy.profileSources,
                     userId: V3_USER_ID,
+                    ...(v3ProfileRawRetriever ? { rawRetriever: v3ProfileRawRetriever } : {}),
                   });
                   if (v3ProfilePort) {
                     v3ProfileCounts = collected.counts;
@@ -1648,6 +1675,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             const composed = await buildV3Prompt({
               surface: 'manual-chat',
               pathTag: 'ipc',
+              queryRewriter: require('./context-intelligence/retrieval/rewriter-binding').bindQueryRewriter(llmHelper),
               question: v3Question,
               // PR #429 Bug 002: omitted entirely, so it defaulted to false even
               // when the user attached screenshots — the V3 classifier then never
@@ -1684,6 +1712,20 @@ export function initializeIpcHandlers(appState: AppState): void {
                     activeMode: modeInfo ?? undefined,
                   }).answerType);
                 } catch { return undefined; } // fall back to the bridge's own check
+              })(),
+              // The mode's Real-time prompt, on V3's own channel (2026-09-20).
+              // This call passed NO instruction channel at all: typed chat
+              // relied on LLMHelper's mode-injection block, which is skipped
+              // for v2/universal prompts and for every coding turn. Same
+              // per-answer-type scoping as the live overlay path; the composer
+              // renders it LAST in the user message and keeps the raw text out
+              // of the system prompt (§19.2). No defaultLengthDirective: typed
+              // chat never carried the spoken-length target on this path.
+              realtimeInstruction: (() => {
+                try {
+                  const _plan = planAnswer({ question: v3Question, source: 'manual_input', speakerPerspective: 'user', activeMode: modeInfo ?? undefined });
+                  return ModesManager.getInstance().getActiveModePinnedInstructions?.(_plan.answerType, modeInfo?.id ?? undefined) || undefined;
+                } catch { return undefined; }
               })(),
               modeTemplateType: rawMode,
               modeUniqueId: modeInfo?.id ?? null,
@@ -3325,6 +3367,21 @@ export function initializeIpcHandlers(appState: AppState): void {
           //      path (formatAnswerPlanForPrompt with the full CODING_TEMPLATE) — byte
           //      unchanged from before this fix.
           const planIsCodingType = isCodingAnswerType(answerPlan.answerType);
+          // A format the user wrote in the MODE's Real-time prompt is a coding
+          // format exactly like one typed in the message (2026-09-20). Until now
+          // only `detectExplicitCodingContract(message)` fed this variable, so a
+          // mode-level "respond in exactly this format ..." got the six-section
+          // contract here, AND the repair below rewrote an obedient answer into
+          // it. Resolved HERE — not at the declaration — because this variable
+          // also gates the prompt contract with no coding check of its own; the
+          // mode's format may only ever bind a genuine coding turn. What the
+          // user typed this turn still wins.
+          if (!explicitCodingContract && (planIsCodingType || codingFollowupResolved)) {
+            try {
+              const { getRegisteredUserInstructions, resolveCodingFormatFromInstructions } = require('./llm/userInstructionContract') as typeof import('./llm/userInstructionContract');
+              explicitCodingContract = resolveCodingFormatFromInstructions(getRegisteredUserInstructions(manualActiveMode?.id ?? undefined));
+            } catch { /* the mode's format is best-effort; the default contract stands */ }
+          }
           if (explicitCodingContract) {
             const includeVerification = explicitContractProducesCode(explicitCodingContract) && isCodeVerificationEnabled();
             const codingContract = buildCodingContractPrompt(explicitCodingContract, {
@@ -8037,6 +8094,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     const customEndpoint = SettingsManager.getInstance().get('customEmbeddingEndpoint') || '';
     // Public listing: fetched with the key when present, without it otherwise.
     const { listOpenRouterEmbeddingModels } = require('./rag/openrouterEmbeddingModels');
+    const { listNinerouterEmbeddingModels } = require('./rag/ninerouterEmbeddingModels');
 
     /* CONCURRENT, not one await after another.
      *
@@ -8052,12 +8110,19 @@ export function initializeIpcHandlers(appState: AppState): void {
      * swallow their own errors and resolve to [] — none of them can reject, so
      * this cannot fail where the sequential version would have succeeded.
      */
-    const [ollamaModels, customModels, openrouterModels] = await Promise.all([
+    const [ollamaModels, customModels, openrouterModels, ninerouterModels] = await Promise.all([
       listOllamaEmbeddingModels(url),
       customEndpoint
         ? require('./rag/customEmbeddingModels').listCustomEmbeddingModels(customEndpoint, cm.getCustomEmbeddingApiKey?.())
         : Promise.resolve([]),
       listOpenRouterEmbeddingModels({ apiKey: cm.getOpenrouterApiKey?.() }),
+      // Only when an instance is configured — otherwise this would probe
+      // localhost:20128 on every catalogue open for everyone who has never
+      // heard of 9Router, which is the speculative-probe cost the comment
+      // above exists to avoid.
+      cm.getNinerouterBaseURL?.()
+        ? listNinerouterEmbeddingModels({ baseUrl: cm.getNinerouterBaseURL(), apiKey: cm.getNinerouterApiKey?.() })
+        : Promise.resolve([]),
     ]);
 
     // Still sequential, deliberately: this only runs when Ollama listed nothing,
@@ -8080,6 +8145,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenrouterKey: !!cm.getOpenrouterApiKey?.(),
         hasVoyageKey: !!cm.getVoyageApiKey?.(),
         openrouterModels,
+        ninerouterModels,
+        ninerouterConfigured: !!cm.getNinerouterBaseURL?.(),
+        ninerouterEndpoint: cm.getNinerouterBaseURL?.() || undefined,
         hasOpenaiKey: !!cm.getOpenaiApiKey(),
         hasGeminiKey: !!cm.getGeminiApiKey(),
         hasNativelyKey: !!cm.getNativelyApiKey(),
@@ -8132,6 +8200,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           case 'ollama':     return { ...base, ollamaEmbeddingModel: choice.model, ollamaEmbeddingDims: undefined };
           case 'voyage':     return { ...base, voyageEmbeddingModel: choice.model, voyageEmbeddingDims: undefined };
           case 'openrouter': return { ...base, openrouterEmbeddingModel: choice.model, openrouterEmbeddingDims: undefined };
+          case 'ninerouter': return { ...base, ninerouterEmbeddingModel: choice.model, ninerouterEmbeddingDims: undefined };
           case 'openai':     return { ...base, openaiEmbeddingModel: choice.model, openaiEmbeddingDims: undefined };
           case 'gemini':     return { ...base, geminiEmbeddingModel: choice.model, geminiEmbeddingDims: undefined };
           case 'custom':     return { ...base, customEmbeddingModel: choice.model, customEmbeddingDims: undefined };
@@ -8142,10 +8211,12 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Measure EVERY provider's width, not just Ollama's: resolve() calls all
         // four helpers, so a test path that calls one reports a reachable
         // custom/OpenRouter/Voyage model as 'not configured'.
-      const measured = await EmbeddingProviderResolver.withMeasuredVoyageDims(
-        await EmbeddingProviderResolver.withMeasuredOpenRouterDims(
-          await EmbeddingProviderResolver.withMeasuredCustomDims(
-            await EmbeddingProviderResolver.withMeasuredOllamaDims(config),
+      const measured = await EmbeddingProviderResolver.withMeasuredNinerouterDims(
+        await EmbeddingProviderResolver.withMeasuredVoyageDims(
+          await EmbeddingProviderResolver.withMeasuredOpenRouterDims(
+            await EmbeddingProviderResolver.withMeasuredCustomDims(
+              await EmbeddingProviderResolver.withMeasuredOllamaDims(config),
+            ),
           ),
         ),
       );
@@ -9859,6 +9930,161 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+
+  safeHandle('set-ninerouter-config', async (_, config: { apiKey: string; baseURL: string; maxTokens?: number; thinking?: string }) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      // Change detection, so the Hindsight restart-nudge only fires on a real
+      // change — same guard, same reason, as set-litellm-config.
+      const prevKey = cm.getNinerouterApiKey() || '';
+      const prevUrl = cm.getNinerouterBaseURL() || '';
+      const prevMaxTokens = cm.getNinerouterMaxTokens();
+      const newUrl = config?.baseURL || '';
+      const requestedKey = config?.apiKey || '';
+      const effectiveNewKey = newUrl.trim() ? (requestedKey.trim() || prevKey) : '';
+      const requestedMaxTokens = Number(config?.maxTokens);
+      const effectiveNewMaxTokens = Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0
+        ? Math.floor(requestedMaxTokens)
+        : undefined;
+      const changed = prevKey !== effectiveNewKey
+        || prevUrl !== newUrl
+        || (prevMaxTokens || undefined) !== effectiveNewMaxTokens;
+      cm.setNinerouterConfig(requestedKey, newUrl, config?.maxTokens, config?.thinking);
+
+      // The discovered catalogue belongs to ONE instance: which models a
+      // 9Router serves is a function of which upstream accounts its owner has
+      // connected, so a cache carried across a repoint lists models that
+      // instance has never heard of.
+      if (!newUrl.trim() || prevUrl !== newUrl) {
+        cm.setNinerouterModels([]);
+        cm.setNinerouterVisionModels([]);
+      }
+
+      // Push the EFFECTIVE stored key — a blank apiKey on re-save means "keep
+      // the stored one" (the field is masked), so read back what was persisted.
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      llmHelper.setNinerouterConfig(cm.getNinerouterApiKey() || '', newUrl, config?.maxTokens, cm.getNinerouterThinking() || null);
+
+      appState.getIntelligenceManager().resetEngine();
+      appState.getIntelligenceManager().initializeLLMs();
+
+      if (changed) {
+        try { require('./services/HindsightManager').HindsightManager.getInstance().notifyHindsightOfKeyChange('9Router'); } catch { /* optional */ }
+        await refreshRuntimeDefaultIfUnavailable();
+        broadcastCredentialsChanged();
+      }
+
+      return { success: true };
+    } catch (error: any) {
+      console.error('Error saving 9Router config:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Discover models from the configured 9Router instance.
+  //
+  // /v1/models answers WITHOUT a key on a stock instance (REQUIRE_API_KEY
+  // defaults to false), so discovery can succeed on a configuration that cannot
+  // actually answer a question. That is precisely why it is not the connection
+  // test — see test-ninerouter-connection below.
+  const discoverNinerouterModels = async (timeoutMs: number): Promise<string[]> => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    // Nothing configured -> never probe localhost:20128 speculatively.
+    const configuredURL = (cm.getNinerouterBaseURL() || '').trim();
+    if (!configuredURL) return [];
+    const root = configuredURL.replace(/\/+$/, '');
+    const url = /\/v1$/.test(root) ? `${root}/models` : `${root}/v1/models`;
+    const apiKey = cm.getNinerouterApiKey();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const resp = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(timeoutMs) });
+    if (!resp.ok) return [];
+    const data: any = await resp.json();
+    // typeof, not Boolean: a numeric id is truthy, would be persisted, and
+    // then string-concatenated into `ninerouter/42` by the pickers.
+    const models: string[] = (data?.data || []).map((m: any) => m?.id).filter((id: any) => typeof id === 'string' && id);
+    // Per-model vision, captured in the SAME call rather than guessed later.
+    // VisionProviderRegistry reads this back to decide whether a screenshot
+    // should be routed here at all — 17 of the 47 models a stock instance
+    // serves are text-only.
+    const visionModels: string[] = (data?.data || [])
+      .filter((m: any) => typeof m?.id === 'string' && m.id && m?.capabilities?.vision === true)
+      .map((m: any) => m.id);
+    // Per-model reasoning capability, so the settings dropdown can adapt its
+    // options to the selected model with no extra round-trip.
+    const meta: Record<string, { reasoning?: boolean; thinkingCanDisable?: boolean; thinkingFormat?: string }> = {};
+    for (const m of (data?.data || [])) {
+      if (typeof m?.id !== 'string' || !m.id || !m?.capabilities) continue;
+      // Field names deliberately MATCH the catalogue's own, so the renderer can
+      // hand this straight to ninerouterThinkingOptions with no translation —
+      // a rename in between is a silent fall-back to generic levels.
+      meta[m.id] = {
+        reasoning: m.capabilities.reasoning === true,
+        thinkingCanDisable: m.capabilities.thinkingCanDisable !== false,
+        // The format decides WHICH levels exist — minimax is binary, deepseek
+        // has no middle, gemini-level has no off. Without it the picker falls
+        // back to a generic scale and offers levels the backend lacks.
+        thinkingFormat: typeof m.capabilities.thinkingFormat === 'string' ? m.capabilities.thinkingFormat : undefined,
+      };
+    }
+    if (models.length > 0) {
+      cm.setNinerouterModels(models);
+      cm.setNinerouterVisionModels(visionModels);
+      cm.setNinerouterModelMeta(meta);
+    }
+    return models;
+  };
+
+  safeHandle('get-available-ninerouter-models', async () => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cached = CredentialsManager.getInstance().getNinerouterModels();
+      if (cached.length > 0) return cached;
+      // Cold start: pay the fetch once rather than showing an empty list until
+      // the user finds the refresh control.
+      return await discoverNinerouterModels(5000);
+    } catch {
+      return [];
+    }
+  });
+
+  safeHandle('refresh-ninerouter-models', async () => {
+    try {
+      const models = await discoverNinerouterModels(8000);
+      broadcastCredentialsChanged();
+      return models;
+    } catch (error) {
+      console.error('[IPC] refresh-ninerouter-models failed:', error);
+      return [];
+    }
+  });
+
+  // Test Connection for the 9Router card.
+  //
+  // Deliberately NOT the `GET /v1/models` shape every other gateway uses: on a
+  // real 9Router every GET answers without a key while every POST requires one,
+  // so a GET-based test reports success for a config that cannot answer a
+  // question. probeNinerouter POSTs an unroutable model id instead — auth is
+  // checked before model validation, so a 401 means the key is wrong and
+  // anything else means it was accepted, at zero upstream cost.
+  safeHandle('test-ninerouter-connection', async (_, config?: { apiKey?: string; baseURL?: string }) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      const { probeNinerouter } = require('./llm/ninerouterProbe');
+      // Prefer what the user currently has typed in the card, so Test
+      // Connection answers for the config in front of them rather than the last
+      // saved one.
+      const baseURL = (config?.baseURL ?? cm.getNinerouterBaseURL() ?? '').trim();
+      const apiKey = (config?.apiKey || '').trim() || (cm.getNinerouterApiKey() || '');
+      return await probeNinerouter(baseURL, apiKey, { timeoutMs: 8000 });
+    } catch (error: any) {
+      return { ok: false, reason: 'unreachable', error: error?.message || 'Connection test failed' };
+    }
+  });
+
   safeHandle('get-disabled-providers', async () => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -10484,6 +10710,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   // End trial via BYOK path: wipe Pro-ingested data, clear trial token + natively key.
   safeHandle('trial:end-byok', async () => {
+    // Profile raw-text indexes hold the résumé/JD text and vectors; clear them even if the orchestrator is absent.
+    try { require('./services/knowledge/v3ProfileSources').wipeProfileRawIndexes(); } catch { /* non-fatal */ }
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
@@ -10524,6 +10752,8 @@ export function initializeIpcHandlers(appState: AppState): void {
           const { DocType } = require('../premium/electron/knowledge/types');
           orchestrator.deleteDocumentsByType(DocType.RESUME);
           orchestrator.deleteDocumentsByType(DocType.JD);
+          // …and their raw-text indexes (text + vectors under profile:<kind>:<version>).
+          try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ }
         }
       } catch {
         /* ignore */
@@ -10583,6 +10813,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   // trial token or natively key. Called automatically when trial expires so that
   // profile intelligence data can't linger in SQLite after the trial window closes.
   safeHandle('trial:wipe-profile-data', async () => {
+    // Profile raw-text indexes hold the résumé/JD text and vectors; clear them even if the orchestrator is absent.
+    try { require('./services/knowledge/v3ProfileSources').wipeProfileRawIndexes(); } catch { /* non-fatal */ }
     try {
       // 1. Disable knowledge mode + wipe orchestrator in-memory caches
       try {
@@ -10592,6 +10824,8 @@ export function initializeIpcHandlers(appState: AppState): void {
           const { DocType } = require('../premium/electron/knowledge/types');
           orchestrator.deleteDocumentsByType(DocType.RESUME);
           orchestrator.deleteDocumentsByType(DocType.JD);
+          // …and their raw-text indexes (text + vectors under profile:<kind>:<version>).
+          try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ }
         }
       } catch {
         /* ignore — orchestrator may not be initialised */
@@ -10854,10 +11088,16 @@ export function initializeIpcHandlers(appState: AppState): void {
         // a wrong-but-invisible protocol is the failure this setting exists to stop.
         fluxionProtocol: creds.fluxionProtocol === 'anthropic' ? 'anthropic' : 'openai',
         hasLitellmBaseURL: hasKey(creds.litellmBaseURL),
+        hasNinerouterBaseURL: hasKey(creds.ninerouterBaseURL),
+        hasNinerouterKey: hasKey(creds.ninerouterApiKey),
         // The base URL is config, not a secret — returned in full so Settings can
         // prefill it (unlike API keys, which are only reported as booleans).
         litellmBaseURL: creds.litellmBaseURL || null,
         litellmMaxTokens: creds.litellmMaxTokens || null,
+        ninerouterBaseURL: creds.ninerouterBaseURL || null,
+        ninerouterMaxTokens: creds.ninerouterMaxTokens || null,
+        ninerouterThinking: creds.ninerouterThinking || null,
+        ninerouterModelMeta: creds.ninerouterModelMeta || {},
         hasNativelyKey: hasKey(creds.nativelyApiKey),
         googleServiceAccountPath: creds.googleServiceAccountPath || null,
         sttProvider: creds.sttProvider || 'none',
@@ -10907,6 +11147,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         fluxionPreferredModel: creds.fluxionPreferredModel || undefined,
         // Stored prefixed (`litellm/<model>`) — see StoredCredentials.litellmPreferredModel.
         litellmPreferredModel: creds.litellmPreferredModel || undefined,
+        ninerouterPreferredModel: creds.ninerouterPreferredModel || undefined,
         disabledProviders: creds.disabledProviders || [],
         cloudEnabledModels: creds.cloudEnabledModels || {},
       };
@@ -10925,6 +11166,12 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasLitellmBaseURL: false,
         litellmBaseURL: null,
         litellmMaxTokens: null,
+        hasNinerouterBaseURL: false,
+        hasNinerouterKey: false,
+        ninerouterBaseURL: null,
+        ninerouterMaxTokens: null,
+        ninerouterThinking: null,
+        ninerouterModelMeta: {},
         hasNativelyKey: false,
         googleServiceAccountPath: null,
         sttProvider: 'none',
@@ -11022,7 +11269,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'set-provider-preferred-model',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm', modelId: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm' | 'ninerouter', modelId: string) => {
       try {
         const { CredentialsManager } = require('./services/CredentialsManager');
         CredentialsManager.getInstance().setPreferredModel(provider, modelId);
@@ -14415,6 +14662,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.RESUME);
+      // Index the raw text for the profile path's semantic arm (fire and forget).
+      if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
       if (!result?.success && path.extname(resolvedPath).toLowerCase() === '.doc') {
         return { success: false, error: 'Legacy Word .doc files are not supported. Save the file as .docx and upload it again.' };
       }
@@ -14639,6 +14888,8 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(resolvedPath, DocType.JD);
+      // Index the raw text for the profile path's semantic arm (fire and forget).
+      if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
       if (!result?.success && path.extname(resolvedPath).toLowerCase() === '.doc') {
         return { success: false, error: 'Legacy Word .doc files are not supported. Save the file as .docx and upload it again.' };
       }
@@ -14775,9 +15026,17 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  safeHandle('profile:research-company', async (_, companyName: string) => {
+  // forceRefresh defaults to FALSE — the cheap call (2026-09-21). This used to
+  // hardcode `true`, which skipped the 24h company_dossiers cache on every
+  // click. That mattered because a JD upload ALREADY researches the company:
+  // ingest step 9 fires the AOT pipeline, whose Phase 1 is this same engine,
+  // spending 7-10 Tavily queries at depth 'advanced' (2 credits each). The
+  // renderer had no way to learn that dossier had landed, so it showed the
+  // "Research Now" CTA, and the CTA bought the identical dossier a second time.
+  // Only the explicit "Refresh" pill passes true now.
+  safeHandle('profile:research-company', async (_, companyName: string, forceRefresh: boolean = false) => {
     try {
-      console.log(`[CompanyIntel-research] invoked for companyName="${companyName}"`);
+      console.log(`[CompanyIntel-research] invoked for companyName="${companyName}" forceRefresh=${forceRefresh}`);
       // Premium gate
       if (!isProOrTrialActive()) {
         return {
@@ -14816,7 +15075,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             min_years_experience: activeJD.min_years_experience,
           }
         : {};
-      const dossier = await engine.researchCompany(companyName, jdCtx, true);
+      const dossier = await engine.researchCompany(companyName, jdCtx, forceRefresh);
       console.log(`[CompanyIntel-research] engine returned dossier=${dossier ? 'YES (' + (dossier.hiring_strategy?.length || 0) + 'b)' : 'NULL'}`);
       const searchQuotaExhausted = (engine.searchProvider as any)?.quotaExhausted === true;
       return { success: true, dossier, searchQuotaExhausted };
@@ -15189,6 +15448,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(resolved, DocType.JD);
+      // Index the raw text for the profile path's semantic arm (fire and forget).
+      if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
       if (result?.success) {
         try {
           orchestrator.setKnowledgeMode(true);
@@ -15250,6 +15511,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       const { DocType } = require('../premium/electron/knowledge/types');
       const result = await orchestrator.ingestDocument(staged, DocType.JD);
+      // Index the raw text for the profile path's semantic arm (fire and forget).
+      if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
       if (result?.success) {
         try {
           orchestrator.setKnowledgeMode(true);
@@ -17360,6 +17623,8 @@ export function initializeIpcHandlers(appState: AppState): void {
         const { DocType } = require('../premium/electron/knowledge/types');
         const dt = params.docType === 'jd' ? DocType.JD : DocType.RESUME;
         const result = await orchestrator.ingestDocument(params.filePath, dt);
+        // Index the raw text for the profile path's semantic arm (fire and forget).
+        if (result?.success) { try { require('./services/knowledge/v3ProfileSources').kickProfileRawIndex(orchestrator); } catch { /* non-fatal */ } }
         if (result?.success) {
           try {
             orchestrator.setKnowledgeMode(true);
@@ -17418,6 +17683,14 @@ export function initializeIpcHandlers(appState: AppState): void {
           resumeName: activeResume?.identity?.name ?? null,
           resumeExperienceCount: Array.isArray(activeResume?.experience) ? activeResume.experience.length : 0,
           resumeProjectCount: Array.isArray(activeResume?.projects) ? activeResume.projects.length : 0,
+          // Structuring-completeness visibility (retrieval-scale campaign, 2026-09-20):
+          // how much of a LONG résumé survives the structuring LLM, and whether the
+          // ingest silently fell back to the heuristic extractor.
+          resumeBulletCount: Array.isArray(activeResume?.experience)
+            ? activeResume.experience.reduce((n: number, e: any) => n + (Array.isArray(e?.bullets) ? e.bullets.length : 0), 0) : 0,
+          resumeCertificationCount: Array.isArray(activeResume?.certifications) ? activeResume.certifications.length : 0,
+          resumeAchievementCount: Array.isArray(activeResume?.achievements) ? activeResume.achievements.length : 0,
+          resumeExtractionMode: activeResume?._extraction_mode ?? null,
           // Education/skills extraction visibility (E2E diagnosis of retrieval gaps).
           resumeEducationCount: Array.isArray(activeResume?.education) ? activeResume.education.length : 0,
           resumeEducation: Array.isArray(activeResume?.education)

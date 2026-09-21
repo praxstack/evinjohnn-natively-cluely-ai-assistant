@@ -941,9 +941,12 @@ interface ElectronAPI {
   knowledgeExportProfilePack: () => Promise<{ success: boolean; path?: string; fileCount?: number; error?: string; violations?: Array<{ path: string; reason: string }> }>;
   knowledgeListProfilePacks: () => Promise<{ success: boolean; error?: string; packs: Array<{ id: string; fileName: string; cardCount: number; entityCount: number; packVersion: number; updatedAt: string; cardsByType: Record<string, number> }> }>;
   knowledgeGetProfilePack: (kind: string) => Promise<{ success: boolean; error?: string; pack?: { id: string; fileName: string; packVersion: number; updatedAt: string; cards: Array<{ id: string; type: string; title: string; conceptId: string; body: string; confidence: string; tags: string[]; entities: string[]; sourceQuotes: string[]; pii: boolean }> } }>;
+  // forceRefresh omitted/false serves the cached dossier — which the JD-upload
+  // AOT run has usually already paid for. Only the Refresh pill passes true.
   profileResearchCompany: (
     companyName: string,
-  ) => Promise<{ success: boolean; dossier?: any; error?: string }>;
+    forceRefresh?: boolean,
+  ) => Promise<{ success: boolean; dossier?: any; error?: string; searchQuotaExhausted?: boolean }>;
   profileGenerateNegotiation: (
     force?: boolean,
   ) => Promise<{ success: boolean; script?: any; error?: string }>;
@@ -1612,6 +1615,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setLitellmConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number }) => ipcRenderer.invoke('set-litellm-config', config),
   getAvailableLiteLLMModels: () => ipcRenderer.invoke('get-available-litellm-models'),
   refreshLiteLLMModels: () => ipcRenderer.invoke('refresh-litellm-models'),
+  setNinerouterConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number; thinking?: string }) => ipcRenderer.invoke('set-ninerouter-config', config),
+  getAvailableNinerouterModels: () => ipcRenderer.invoke('get-available-ninerouter-models'),
+  refreshNinerouterModels: () => ipcRenderer.invoke('refresh-ninerouter-models'),
+  testNinerouterConnection: (config?: { apiKey?: string; baseURL?: string }) => ipcRenderer.invoke('test-ninerouter-connection', config),
   getCloudFetchedModels: () => ipcRenderer.invoke('get-cloud-fetched-models'),
   getDisabledProviders: () => ipcRenderer.invoke('get-disabled-providers'),
   setDisabledProviders: (providers: string[]) => ipcRenderer.invoke('set-disabled-providers', providers),
@@ -2753,8 +2760,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   knowledgeExportProfilePack: () => ipcRenderer.invoke('knowledge:export-profile-pack'),
   knowledgeListProfilePacks: () => ipcRenderer.invoke('knowledge:list-profile-packs'),
   knowledgeGetProfilePack: (kind: string) => ipcRenderer.invoke('knowledge:get-profile-pack', kind),
-  profileResearchCompany: (companyName: string) =>
-    ipcRenderer.invoke('profile:research-company', companyName),
+  profileResearchCompany: (companyName: string, forceRefresh?: boolean) =>
+    ipcRenderer.invoke('profile:research-company', companyName, forceRefresh === true),
   profileGenerateNegotiation: (force?: boolean) =>
     ipcRenderer.invoke('profile:generate-negotiation', force),
   profileGenerateCoverLetter: (force?: boolean) =>
@@ -2786,7 +2793,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Dynamic Model Discovery
   fetchProviderModels: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion', apiKey: string) =>
     ipcRenderer.invoke('fetch-provider-models', provider, apiKey),
-  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm', modelId: string) =>
+  setProviderPreferredModel: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'openrouter' | 'fluxion' | 'litellm' | 'ninerouter', modelId: string) =>
     ipcRenderer.invoke('set-provider-preferred-model', provider, modelId),
 
   // License Management
