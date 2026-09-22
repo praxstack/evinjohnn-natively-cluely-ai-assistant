@@ -149,6 +149,11 @@ import { renderUserInstructionSystemLayer } from './llm/userInstructionContract'
 // Groq rejects a request carrying more than 5 images. Every other vision
 // provider here takes as many as we send, so the cap lives on the Groq path.
 const GROQ_VISION_MAX_IMAGES = 5
+// How long the vision chain waits for a cold Ollama vision-model probe before
+// seating the other providers without it, and how long an empty result is
+// trusted. The probe itself can take 5s per request against a hung daemon.
+const OLLAMA_VISION_CHAIN_PROBE_BUDGET_MS = 1500
+const OLLAMA_VISION_NEGATIVE_TTL_MS = 30_000
 const OPENAI_MODEL = "gpt-5.4"
 const CLAUDE_MODEL = "claude-sonnet-4-6"
 const DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -611,6 +616,10 @@ export class LLMHelper {
   private ollamaVisionCache: Map<string, boolean> = new Map();
   // Dedupe concurrent refreshOllamaVisionModel() calls (init + switch + lazy).
   private ollamaVisionRefreshInFlight: Promise<string | null> | null = null;
+  // Until this time (ms epoch), the vision chain skips its bounded Ollama probe:
+  // the last one found nothing vision-capable or ran out of budget. Without it a
+  // user with Ollama selected and no vision model re-paid the probe per screenshot.
+  private ollamaVisionNegativeUntil = 0;
   private ollamaStartedByApp: boolean = false;
   private geminiModel: string = GEMINI_FLASH_MODEL
   private customProvider: CustomProvider | null = null;
@@ -7250,11 +7259,18 @@ let isMultimodal = !!(imagePaths?.length);
       }
     }
     // Ollama: use the resolved vision-capable model (which may differ from the
-    // primary text model). Synchronously trust the cached resolution; kick off
-    // a refresh for next time if we haven't probed yet.
-    const ollamaVisionModel = this.useOllama ? this.ollamaVisionModel : null;
+    // primary text model). If not yet resolved, await the probe so the very first
+    // screenshot request finds any installed vision model instead of dead-ending.
+    // The wait is bounded (resolveOllamaVisionModelForChain): it runs before ANY
+    // provider is seated, cloud included, and an unbounded probe against a hung
+    // daemon cost 5s on every screenshot.
+    let ollamaVisionModel = this.useOllama ? this.ollamaVisionModel : null;
     if (this.useOllama && !ollamaVisionModel) {
-      this.refreshOllamaVisionModel().catch(() => { }); // populate for the next request
+      try {
+        ollamaVisionModel = await this.resolveOllamaVisionModelForChain();
+      } catch (err: any) {
+        console.warn('[LLMHelper] Failed to probe Ollama vision model:', err?.message || err);
+      }
     }
     if (ollamaVisionModel) {
       local.push({ id: 'ollama', name: `Ollama (${ollamaVisionModel})`, isLocal: true, priority: 101,
@@ -11745,6 +11761,28 @@ let isMultimodal = !!(imagePaths?.length);
   }
 
   /**
+   * The vision chain's view of refreshOllamaVisionModel(): the same probe, but
+   * capped at OLLAMA_VISION_CHAIN_PROBE_BUDGET_MS and remembered when it comes up
+   * empty. On a timeout the probe keeps running in the background (and is shared
+   * with any concurrent caller), so a slow-but-alive daemon still populates
+   * ollamaVisionModel for the next screenshot.
+   */
+  private async resolveOllamaVisionModelForChain(): Promise<string | null> {
+    if (!this.useOllama) return null;
+    if (this.ollamaVisionModel) return this.ollamaVisionModel;
+    if (Date.now() < this.ollamaVisionNegativeUntil) return null;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), OLLAMA_VISION_CHAIN_PROBE_BUDGET_MS);
+    });
+    const model = await Promise.race([this.refreshOllamaVisionModel(), timedOut]);
+    clearTimeout(timer);
+    if (!model) this.ollamaVisionNegativeUntil = Date.now() + OLLAMA_VISION_NEGATIVE_TTL_MS;
+    return model;
+  }
+
+  /**
    * Resolve a vision-capable installed Ollama model and cache it in
    * `this.ollamaVisionModel`. Prefers the currently-active model when it is
    * itself vision-capable (no behavior change for users already on a vision
@@ -13124,6 +13162,7 @@ let isMultimodal = !!(imagePaths?.length);
     // URL/model change invalidates the per-model vision cache from a prior host.
     this.ollamaVisionCache.clear();
     this.ollamaVisionModel = null;
+    this.ollamaVisionNegativeUntil = 0;
 
     if (model) {
       this.ollamaModel = model;
@@ -13134,7 +13173,7 @@ let isMultimodal = !!(imagePaths?.length);
 
     // Resolve the best vision-capable installed model for screenshots (may
     // differ from the primary text model). Fire-and-forget; the vision chain
-    // also refreshes lazily on first image request.
+    // also probes (bounded) on the first image request.
     this.refreshOllamaVisionModel().catch(() => { });
 
     console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel} at ${this.ollamaUrl}`);

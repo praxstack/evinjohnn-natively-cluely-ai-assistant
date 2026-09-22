@@ -19,6 +19,7 @@ import { FatalMainProcessCoordinator } from "./utils/fatalMainProcess"
 import { installResilientDnsLookup } from "./utils/resilientDnsLookup"
 import { MeetingLifecycleQueue, type MeetingLifecycleState } from "./audio/meetingLifecycleQueue"
 import { autoUpdater } from "electron-updater"
+import { summarizeUpdateDownload } from "./update/updateDownloadSummary"
 
 import {
   classifyServiceAccountFile,
@@ -1374,6 +1375,8 @@ export class AppState {
   private updateAvailable: boolean = false
   private updateDownloadState: 'idle' | 'available' | 'downloading' | 'downloaded' = 'idle'
   private updateDownloadPromise: Promise<unknown> | null = null
+  // Last `total` from download-progress; smaller than the file when the download was differential.
+  private lastUpdateProgressTotal: number | null = null
   private downloadedUpdateInfo: any = null
   private disguiseMode: 'terminal' | 'settings' | 'activity' | 'none' = 'none'
 
@@ -2865,11 +2868,17 @@ export class AppState {
       log_message = log_message + " - Downloaded " + progressObj.percent + "%"
       log_message = log_message + " (" + progressObj.transferred + "/" + progressObj.total + ")"
       console.log("[AutoUpdater] " + log_message)
+      this.lastUpdateProgressTotal = progressObj.total
       this.broadcast("download-progress", progressObj)
     })
 
     autoUpdater.on("update-downloaded", (info) => {
       console.log("[AutoUpdater] Update downloaded:", info.version)
+      let downloadedFileBytes: number | null = null
+      try {
+        downloadedFileBytes = fs.statSync(info.downloadedFile).size
+      } catch { /* summary reports the size as unknown */ }
+      console.log(`[AutoUpdater] ${summarizeUpdateDownload(this.lastUpdateProgressTotal, downloadedFileBytes).message}`)
       this.updateDownloadState = 'downloaded'
       this.updateDownloadPromise = null
       // info.filePath is the public path of the staged update zip from Squirrel.Mac.
@@ -3155,6 +3164,7 @@ export class AppState {
 
     console.log('[AutoUpdater] Starting download...')
     this.updateDownloadState = 'downloading'
+    this.lastUpdateProgressTotal = null
     try {
       // Errors during download are surfaced via autoUpdater.on("error") which
       // already broadcasts "update-error". Do not broadcast here to avoid duplicates.
@@ -8831,6 +8841,21 @@ if (process.env.THINKING_MATRIX === '1') {
     windowCount: BrowserWindow.getAllWindows().length,
   });
 
+  // A saved Natively key whose plan includes Pro, with no Pro licence on this
+  // device, used to stay that way forever (activation ran once, at key save, and a
+  // 5xx ended it). Reconcile shortly after launch — late enough to stay off the
+  // startup path, and the reconciler makes no request at all unless a real key is
+  // stored and Pro is inactive. See services/ProEntitlementReconciler.ts.
+  const proReconcileTimer = setTimeout(() => {
+    try {
+      const { getProEntitlementReconciler } = require('./services/proEntitlementWiring');
+      void getProEntitlementReconciler().run('startup');
+    } catch (e: any) {
+      console.warn('[Main] Pro entitlement reconcile could not start:', e?.message);
+    }
+  }, 8000);
+  proReconcileTimer.unref?.();
+
   // Opt-in: NATIVELY_LOG_GPU_STATUS=1 logs Chromium's GPU feature status once
   // at boot (whether gpu_compositing/rasterization are 'enabled' vs.
   // 'software'/'disabled') — useful when diagnosing a renderer that freezes
@@ -9300,7 +9325,11 @@ if (process.env.THINKING_MATRIX === '1') {
     // synchronously — so a renderer crash cannot corrupt it. We only close the
     // DB on TERMINAL paths (quit / non-crash / give-up).
     const reason = details?.reason;
-    const isCrash = reason === 'crashed' || reason === 'abnormal-exit';
+    const isCrash =
+      reason === 'crashed' ||
+      reason === 'abnormal-exit' ||
+      reason === 'oom' ||
+      reason === 'integrity-failure';
 
     // Never fight an intentional teardown, and don't reload a clean/intentional
     // exit or an intentional kill.
@@ -9323,10 +9352,10 @@ if (process.env.THINKING_MATRIX === '1') {
     // Only auto-reload real user-facing windows. Transient/hidden helpers
     // (cropper = screenshot overlay; model-selector = hidden preload with a
     // known forceRestartOllama side-effect) should NOT be blindly reloaded —
-    // they get recreated on next open. Reload launcher / settings / overlay.
+    // they get recreated on next open. Reload launcher / settings / overlay / aux floating chrome.
     const isRecoverableWindow =
       urlNow === '' /* URL unavailable — assume the main launcher */ ||
-      /[?&]window=(launcher|settings|overlay)\b/.test(urlNow) ||
+      /[?&]window=(launcher|settings|overlay|overlay-pill|overlay-toggle)\b/.test(urlNow) ||
       !/[?&]window=/.test(urlNow) /* no window tag → the default launcher */;
     if (!isRecoverableWindow) {
       logToFile(`[main] render-process-gone: not auto-reloading transient window (${urlNow})`);
