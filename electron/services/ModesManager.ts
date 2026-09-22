@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
 import { isRetrievalFixEnabled } from '../context-intelligence/contracts/retrieval-flags';
 import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
-import { ModeContextRetriever, type ModeRetrievalOptions, type RetrieveOptions } from './ModeContextRetriever';
+import { ModeContextRetriever, RETRY_ELIGIBLE_INDEX_STATUSES, type ModeRetrievalOptions, type RetrieveOptions } from './ModeContextRetriever';
 import type { ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
@@ -1216,14 +1216,13 @@ export class ModesManager {
      *  retry-eligible state, so a user with many fully-indexed modes doesn't pay
      *  an O(modes × files) re-scan + per-file indexFile entry on every kick. */
     public async retryAllLexicalOnlyFiles(): Promise<void> {
-        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
         for (const mode of this.getModes()) {
             const files = this.getReferenceFiles(mode.id);
             if (files.length === 0) continue;
             // Cheap status read (no embedding work) gates the expensive retry.
             const hasEligible = files.some(f => {
                 try {
-                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                    return RETRY_ELIGIBLE_INDEX_STATUSES.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
                 } catch {
                     return true; // status lookup failed → let the retry decide
                 }
@@ -1237,14 +1236,13 @@ export class ModesManager {
      *  main process to broadcast 'done' only for modes that were actually
      *  re-indexed (LOW #8), instead of spamming every mode on every kick. */
     public getModesWithRetryEligibleFiles(): string[] {
-        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
         const out: string[] = [];
         for (const mode of this.getModes()) {
             const files = this.getReferenceFiles(mode.id);
             if (files.length === 0) continue;
             const hasEligible = files.some(f => {
                 try {
-                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                    return RETRY_ELIGIBLE_INDEX_STATUSES.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
                 } catch {
                     return true;
                 }

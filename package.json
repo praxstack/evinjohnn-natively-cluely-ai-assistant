@@ -1,6 +1,6 @@
 {
   "name": "natively",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "main": "dist-electron/electron/main.js",
   "engines": {
     "node": ">=22.6.0"
@@ -186,8 +186,8 @@
         "from": "resources/models/",
         "to": "models/",
         "filter": [
-          "Xenova/all-MiniLM-L6-v2/**",
           "Xenova/ms-marco-MiniLM-L-6-v2/**",
+          "Xenova/multilingual-e5-small/**",
           "pipecat-ai/**"
         ]
       }

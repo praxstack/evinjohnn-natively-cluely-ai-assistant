@@ -9456,8 +9456,39 @@ if (process.env.THINKING_MATRIX === '1') {
     logToFile('[DIAG:gpu-info-update] GPU process info changed');
   });
 
+  // Local embedding workers must be idle before the process exits (2026-09-22):
+  // quitting while one was inside a native ONNX call aborted the app with
+  // SIGABRT (see LocalEmbeddingProvider.shutdownForQuit). Deferred ONCE, only
+  // when a worker still owes a reply, and bounded so a wedged worker cannot
+  // hold the quit hostage. Same code path on macOS and Windows: both run the
+  // worker on a Node worker_thread that process exit tears down.
+  let localEmbeddingQuitDrainStarted = false;
+  const LOCAL_EMBEDDING_QUIT_DRAIN_MS = 5_000;
+  /** True when the quit was deferred; before-quit returns and re-runs on app.quit(). */
+  const deferQuitForLocalEmbeddingDrain = (event: Electron.Event): boolean => {
+    if (localEmbeddingQuitDrainStarted) return false;
+    localEmbeddingQuitDrainStarted = true;
+    try {
+      const { LocalEmbeddingProvider } = require('./rag/providers/LocalEmbeddingProvider');
+      if (!LocalEmbeddingProvider.hasInFlightWorkForQuit()) return false;
+      event.preventDefault();
+      appState.setQuitting(true);
+      const startedAt = Date.now();
+      console.log('[Main] Quit deferred: waiting for the local embedding worker to finish its current batch...');
+      void LocalEmbeddingProvider.shutdownAllForQuit(LOCAL_EMBEDDING_QUIT_DRAIN_MS)
+        .then((outcomes: string[]) => console.log(`[Main] Local embedding workers stopped for quit in ${Date.now() - startedAt}ms: ${outcomes.join(', ')}`))
+        .catch((e: unknown) => console.warn('[Main] Local embedding quit drain failed; quitting anyway:', e))
+        .finally(() => app.quit());
+      return true;
+    } catch (e) {
+      console.warn('[Main] Local embedding quit drain unavailable; quitting normally:', e);
+      return false;
+    }
+  };
+
   // Scrub API keys from memory on quit to minimize exposure window
   app.on("before-quit", (event) => {
+    if (deferQuitForLocalEmbeddingDrain(event)) return;
     console.log("App is quitting, cleaning up resources...");
     appState.setQuitting(true);
 

@@ -9115,9 +9115,16 @@ export function initializeIpcHandlers(appState: AppState): void {
     const settings = SettingsManager.getInstance();
     const storedEmbedding = (settings.get('embedding') as any) || {};
     const isLocalProvider = (storedEmbedding.provider || 'local') === 'local';
-    const selectedId = isLocalProvider
-      ? (settings.get('localEmbeddingModelId') || storedEmbedding.localModelId || storedEmbedding.model || 'minilm-l6-v2')
+    const { BUNDLED_CATALOG_ID } = require('./rag/embeddingModelCatalog');
+    const { isBundledLocalModelId } = require('./rag/bundledLocalEmbedding');
+    // A saved id that names a PREVIOUSLY bundled model (a released install
+    // stored 'Xenova/all-MiniLM-L6-v2' as `embedding.model`) is served by the
+    // bundled model, so it must show the bundled row as selected, not the MiniLM
+    // download row that happens to share its repo.
+    const rawSelectedId = isLocalProvider
+      ? (settings.get('localEmbeddingModelId') || storedEmbedding.localModelId || storedEmbedding.model || BUNDLED_CATALOG_ID)
       : null;
+    const selectedId = rawSelectedId && isBundledLocalModelId(rawSelectedId) ? BUNDLED_CATALOG_ID : rawSelectedId;
 
     // Pre-read the acknowledged set once, outside the map.
     const ackedSet: unknown = settings.get('embeddingCatalogAcknowledged');
@@ -9147,7 +9154,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       activatable: m.supported,
     }));
 
-    return { models, selectedId, builtInSelected: selectedId === 'minilm-l6-v2' };
+    return { models, selectedId, builtInSelected: selectedId === BUNDLED_CATALOG_ID };
   });
 
   safeHandle('embedding:install-local-model', async (event: any, id: string) => {
@@ -9224,7 +9231,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     const settings = SettingsManager.getInstance();
     const stored = (settings.get('embedding') as any) || {};
     const previousLocalId = settings.get('localEmbeddingModelId') ?? stored.localModelId ?? null;
-    const targetId = id || 'minilm-l6-v2';
+    const targetId = id || require('./rag/embeddingModelCatalog').BUNDLED_CATALOG_ID;
 
     const model = findEmbeddingCatalogModel(targetId);
     if (!model) return { success: false, error: 'unknown_model' };

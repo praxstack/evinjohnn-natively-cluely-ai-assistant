@@ -12,11 +12,14 @@ import { parentPort } from 'worker_threads';
 import { getBoundedOnnxSessionOptions } from '../../utils/onnxThreadConfig';
 import { classifyWorkerFailure } from '../../utils/workerStatus';
 import { finalizeGgufVector } from './ggufEmbeddingVector';
+import { sliceEmbeddingTensor } from './embeddingTensorSlice';
+import { BUNDLED_LOCAL_EMBEDDING } from '../bundledLocalEmbedding';
+import { BUNDLED_CATALOG_ID } from '../embeddingModelCatalog';
 
 if (!parentPort) throw new Error('localEmbeddingWorker must be run as a Worker thread');
 
 let runtime: 'onnx' | 'gguf' = 'onnx';
-let currentModelId = 'minilm-l6-v2';
+let currentModelId = BUNDLED_CATALOG_ID;
 let currentDimensions = 384;
 let currentPooling: 'mean' | 'cls' | 'last' = 'mean';
 
@@ -95,7 +98,7 @@ async function ggufEmbedOne(text: string): Promise<ArrayLike<number>> {
 async function ensureLoaded(msg: any): Promise<void> {
   if (msg) lastConfig = { ...msg };
   const targetRuntime = msg.runtime === 'gguf' ? 'gguf' : 'onnx';
-  const targetModelId = msg.modelId || 'minilm-l6-v2';
+  const targetModelId = msg.modelId || BUNDLED_CATALOG_ID;
 
   if (targetRuntime === runtime && currentModelId === targetModelId) {
     if (runtime === 'onnx' && pipe) return;
@@ -108,7 +111,7 @@ async function ensureLoaded(msg: any): Promise<void> {
 
   loadingPromise = (async () => {
     runtime = msg.runtime === 'gguf' ? 'gguf' : 'onnx';
-    currentModelId = msg.modelId || 'minilm-l6-v2';
+    currentModelId = msg.modelId || BUNDLED_CATALOG_ID;
     currentDimensions = Number(msg.dimensions) || 384;
     currentPooling = msg.pooling || 'mean';
 
@@ -141,7 +144,7 @@ async function ensureLoaded(msg: any): Promise<void> {
       targetIdentifier = modelPath;
     } else {
       env.localModelPath = modelPath;
-      targetIdentifier = msg.hfModelId || 'Xenova/all-MiniLM-L6-v2';
+      targetIdentifier = msg.hfModelId || BUNDLED_LOCAL_EMBEDDING.modelId;
     }
 
     console.log(`[LocalEmbeddingWorker] Loading ONNX embedding model (${currentModelId}) from ${modelPath}...`);
@@ -211,13 +214,12 @@ parentPort.on('message', async (msg: any) => {
 
       // ONNX inference
       const output = await pipe(texts, { pooling: currentPooling, normalize: true });
-      const batchSize = texts.length;
-      const dims = output.dims && output.dims[1] ? output.dims[1] : currentDimensions;
-      const vectors: number[][] = [];
-      for (let i = 0; i < batchSize; i++) {
-        vectors.push(Array.from(output.data.slice(i * dims, (i + 1) * dims)) as number[]);
-      }
-      parentPort!.postMessage({ type: 'result', requestId: msg.requestId, vectors });
+      // Width from the tensor, and batch x width ASSERTED (embeddingTensorSlice).
+      // A hardcoded width once handed every 768-d vector the bytes of another
+      // batch item; item 0 still looked perfect, so a first-vector check could
+      // not see it.
+      const vectors = sliceEmbeddingTensor(output, texts.length, currentDimensions, currentModelId);
+      parentPort!.postMessage({ type: 'result', requestId: msg.requestId, vectors, dimensions: vectors[0]?.length });
       return;
     }
 

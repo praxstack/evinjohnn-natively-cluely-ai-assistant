@@ -467,7 +467,7 @@ export const EmbeddingSettings: React.FC<EmbeddingSettingsProps> = ({ renderPart
                 return;
             }
         }
-        setBusyLocalModelId(id ?? 'minilm-l6-v2');
+        setBusyLocalModelId(id ?? localModels.find(m => m.bundled)?.id ?? 'multilingual-e5-small');
         setLocalModelError(null);
         try {
             // No renderer-side deadline: the main process bounds the switch
@@ -718,10 +718,10 @@ export const EmbeddingSettings: React.FC<EmbeddingSettingsProps> = ({ renderPart
     const activeLocalModel = useMemo(() => {
         if (active.provider !== 'local') return null;
         const key = active.catalogId || active.model;
-        if (!key) return localModels.find(m => m.id === 'minilm-l6-v2') ?? null;
-        return localModels.find(m => m.id === key || m.repo === key)
-            ?? (key === 'Xenova/all-MiniLM-L6-v2' ? localModels.find(m => m.id === 'minilm-l6-v2') : null)
-            ?? null;
+        // The built-in row is whichever catalog entry is `bundled` (multilingual-e5-small
+        // since 2026-09-22), never a hardcoded id.
+        if (!key) return localModels.find(m => m.bundled) ?? null;
+        return localModels.find(m => m.id === key || m.repo === key) ?? null;
     }, [active, localModels]);
 
     const filteredLocalModels = useMemo(() => {
@@ -805,7 +805,9 @@ export const EmbeddingSettings: React.FC<EmbeddingSettingsProps> = ({ renderPart
         if (!active.configured) return null;
 
         const providerId = active.provider || 'local';
-        const modelId = active.model || active.catalogId || 'Xenova/all-MiniLM-L6-v2';
+        // Display fallback only, when the status carries no model. Names the
+        // model actually bundled since 2026-09-22 (electron/rag/bundledLocalEmbedding.ts).
+        const modelId = active.model || active.catalogId || 'Xenova/multilingual-e5-small';
 
         if (providerId === 'local') {
             const modelName = activeLocalModel?.name || (active.catalogId ? localModels.find(m => m.id === active.catalogId)?.name : null) || bareModelName(modelId);
@@ -1201,7 +1203,7 @@ export const EmbeddingSettings: React.FC<EmbeddingSettingsProps> = ({ renderPart
         const isSelected = active.provider === 'local' && (
             (activeLocalModel ? m.id === activeLocalModel.id : false) ||
             m.selected ||
-            (m.id === 'minilm-l6-v2' && (!selectedLocalModel || selectedLocalModel.id === 'minilm-l6-v2'))
+            (m.bundled && (!selectedLocalModel || selectedLocalModel.bundled))
         );
 
         const acceptLicence = async () => {
