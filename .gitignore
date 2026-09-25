@@ -503,6 +503,9 @@ tools/
 !docs/
 docs/*
 !docs/VISION_MODEL_BENCHMARK.md
+# The local embedding model benchmark (2026-09-21/22): code comments across
+# electron/rag cite its sections (bundled-model choice, catalog recipes, caps).
+!docs/local-embedding-benchmark.md
 # Per-release notes are published artifacts (linked from the README), not scratch notes.
 !docs/releases/
 !docs/releases/**
@@ -638,3 +641,11 @@ resources/models/Xenova/multilingual-e5-small/*
 # that is not recoverable from the vendor's docs, plus the reasoning behind the
 # `ninerouter` internal id. A later session changing this provider needs it.
 !docs/ninerouter-provider-design-2026-09-20.md
+
+# Live RAG probe scratch userdata — the probes mkdir these and the app fills
+# them with a multi-MB natively.db. Generated output, not a fixture.
+tests/e2e-modes/live-userdata/
+tests/e2e-modes/hosted-userdata-*/
+
+# Written by `npm run dev:agent` — per-worktree CDP port + session id.
+agent-browser.json
