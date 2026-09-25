@@ -153,6 +153,10 @@ export class IntelligenceManager extends EventEmitter {
         return this.session.getLastAssistantMessage(surface);
     }
 
+    getContextEpoch(): number {
+        return this.session.getContextEpoch();
+    }
+
     getFormattedContext(lastSeconds: number = 120): string {
         return this.session.getFormattedContext(lastSeconds);
     }
