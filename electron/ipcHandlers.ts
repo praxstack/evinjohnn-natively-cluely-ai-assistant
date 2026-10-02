@@ -12,6 +12,9 @@ import { CARDS, OUTCOMES } from '../src/lib/cards/cardPolicy.mjs';
 import { TRIAL_CAMPAIGN, TRIAL_PROMO_ID, runTrialCampaignReset } from '../src/lib/trialCampaign.mjs';
 import { stripGistTrailer } from '../src/lib/displayMarkup';
 import { CardLedger } from './services/cards/CardLedger';
+import { funnelTelemetry } from './services/FunnelTelemetry';
+import { checkFunnelProps, SURFACES as FUNNEL_SURFACES } from '../src/lib/funnel/funnelCatalog.mjs';
+import { mapTrialStartResult, resolveEntitlement, resolveMeetingAi, trialCardActionForChoice, usesLocalModel } from '../src/lib/funnel/funnelState.mjs';
 import { nativePromptsBlocked, UNDETECTABLE_REFUSAL_ERROR, UNDETECTABLE_REFUSAL_MESSAGES } from './services/stealthPromptGate';
 import { TEXT_PLACEHOLDER_RE } from './utils/curlPlaceholderPolicy';
 import { routeOverlayUiAction } from './utils/overlayUiActionRouter';
@@ -352,6 +355,64 @@ export function initializeIpcHandlers(appState: AppState): void {
       return false;
     }
   };
+
+  // ── Funnel telemetry (electron/services/FunnelTelemetry.ts) ─────────────
+  // The one place that answers "what can this install do right now" for a
+  // funnel event. Booleans and enums only: no key, no email, no model name.
+  funnelTelemetry.setSnapshotResolver(() => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    const nativelyKey = cm.getNativelyApiKey();
+    const hasApiKey = !!nativelyKey && nativelyKey !== TRIAL_SENTINEL_KEY;
+    const defaultModel = cm.getDefaultModel();
+    // A selected local model is the user's own AI too (hasOwnAiKey leaves Ollama out on purpose).
+    const hasOwnAi = hasOwnAiKey(cm.getAllCredentials(), { codexReady: codexRouteReady() }) || usesLocalModel(defaultModel);
+    const hasPro = isLicensed();
+    const trialExpiresAt = cm.getTrialExpiresAt();
+    return {
+      entitlement: resolveEntitlement({
+        licensed: hasPro,
+        hasRealApiKey: hasApiKey,
+        hasTrialToken: !!cm.getTrialToken(),
+        trialExpired: !!trialExpiresAt && new Date(trialExpiresAt).getTime() <= Date.now(),
+        hasOwnAi,
+      }),
+      hasOwnAi,
+      hasApiKey,
+      hasPro,
+      meetingAi: resolveMeetingAi({ defaultModel, hasOwnAi }),
+    };
+  });
+  // Who this is. The device id is the hardware id the app already sends for
+  // trials and licences; the trial token and the key go out as headers, and the
+  // server works the trial and the account out from them. The trial sentinel is
+  // not a key and is never sent as one.
+  // The hardware id comes from the native module, synchronously, and this
+  // resolver runs for every event on the main thread: a good id is read once
+  // per process. A failed read is not remembered, so it is tried again.
+  let funnelDeviceId: string | undefined;
+  funnelTelemetry.setIdentityResolver(() => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const cm = CredentialsManager.getInstance();
+    if (!funnelDeviceId) {
+      try {
+        const { LicenseManager } = require('../premium/electron/services/LicenseManager');
+        const hwid = LicenseManager.getInstance().getHardwareId();
+        // 'unavailable' is what every machine without the native module holds:
+        // the absence of an id, not an id.
+        if (typeof hwid === 'string' && hwid && hwid !== 'unavailable') funnelDeviceId = hwid;
+      } catch { /* premium module absent: no device id */ }
+    }
+    const nativelyKey = cm.getNativelyApiKey();
+    return {
+      deviceId: funnelDeviceId,
+      trialToken: cm.getTrialToken() || undefined,
+      apiKey: nativelyKey && nativelyKey !== TRIAL_SENTINEL_KEY ? nativelyKey : undefined,
+    };
+  });
+  /** Where in the app something was clicked, when the renderer says; 'other' when it does not. */
+  const funnelSurface = (v: unknown): string =>
+    typeof v === 'string' && (FUNNEL_SURFACES as readonly string[]).includes(v) ? v : 'other';
 
   /**
    * Remove the Pro-only profile data a free trial left behind (résumé/JD
@@ -958,6 +1019,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         premium = LicenseManager.getInstance().isPremium();
       } catch { /* premium module absent — treat as not premium */ }
       if (!premium) clearActiveModeOnLicenseLoss();
+      funnelTelemetry.track('trial_expired');
     } catch (e: any) {
       console.warn('[IPC] endExpiredTrialRuntime failed:', e?.message);
       return false;
@@ -1026,6 +1088,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const { LicenseManager } = require('../premium/electron/services/LicenseManager');
       const result = await LicenseManager.getInstance().activateLicense(key);
+      funnelTelemetry.keyEntered('pro_licence', result?.success ? 'ok' : 'invalid');
       if (result?.success) {
         BrowserWindow.getAllWindows().forEach((win) => {
           if (!win.isDestroyed())
@@ -1604,7 +1667,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
 
         // Log Usage
-        intelligenceManager.logUsage('chat', message, result);
+        intelligenceManager.logUsage('chat', message, result, imagePaths);
 
         return result;
       } catch (error: any) {
@@ -1994,7 +2057,18 @@ export function initializeIpcHandlers(appState: AppState): void {
                 // caches and hits exactly like a single-image one.
                 const cacheKey = screenStore.hashImageSet(imagePaths);
                 if (cacheKey) {
-                  v3ScreenDescription = screenStore.getScreenshotDescription(cacheKey)?.description ?? '';
+                  const cachedDescription = screenStore.getScreenshotDescription(cacheKey)?.description ?? '';
+                  // A description made while this screenshot was being kept on
+                  // this device feeds THIS turn's prompt only when the turn
+                  // stays on this device. Otherwise it is a miss: the pre-pass
+                  // below reads the screen again under today's setting (or not
+                  // at all, when that setting is still on).
+                  const { hasOnDeviceScreenText } = require('./context-intelligence/question/on-device-screen') as
+                    typeof import('./context-intelligence/question/on-device-screen');
+                  const turnOnDevice = (() => {
+                    try { return appState.processingHelper.getLLMHelper().selectionStaysOnDevice() === true; } catch { return false; }
+                  })();
+                  v3ScreenDescription = hasOnDeviceScreenText(cachedDescription) && !turnOnDevice ? '' : cachedDescription;
                 }
                 const {
                   getScreenUnderstandingService,
@@ -2595,9 +2669,10 @@ export function initializeIpcHandlers(appState: AppState): void {
                     answer: finalText,
                     source: 'manual_chat',
                     synthetic: true,
+                    imagePaths,
                   });
                 } else {
-                  im?.logUsage?.('chat', String(message || ''), finalText);
+                  im?.logUsage?.('chat', String(message || ''), finalText, imagePaths);
                 }
               } catch { /* session transcript only */ }
             }
@@ -2703,7 +2778,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               /* noop */
             }
             intelligenceManager.addAssistantMessage(identityHit, undefined, 'manual_chat');
-            intelligenceManager.logUsage('chat', message, identityHit);
+            intelligenceManager.logUsage('chat', message, identityHit, imagePaths);
             // Observe-only trace for the app-identity canned reply (common path). The
             // hoisted iTrace is still the NOOP here (real trace is created post-planAnswer),
             // so begin a dedicated one. Zero-cost when the flag is off.
@@ -3394,7 +3469,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           try { PhoneMirrorService.getInstance().publishToken(String(myStreamId), clarification); } catch (_) { /* noop */ }
           try { PhoneMirrorService.getInstance().publishDone(String(myStreamId), clarification); } catch (_) { /* noop */ }
           intelligenceManager.addAssistantMessage(clarification, undefined, 'manual_chat');
-          intelligenceManager.logUsage('chat', message, clarification);
+          intelligenceManager.logUsage('chat', message, clarification, imagePaths);
           chatTrace.markFirstUseful({ via: 'context_free_clarification' });
           chatTrace.mark('response_completed', { chars: clarification.length, deterministic: true });
           chatTrace.finish({ chars: clarification.length });
@@ -3480,7 +3555,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             try { PhoneMirrorService.getInstance().publishDone(String(myStreamId), clarify); } catch (_) { /* noop */ }
             const clarifyWrite = decideSessionWritePolicy({ finalGenerationMode: 'source_safe_refusal', validationOk: true, sourceContractHonored: true });
             intelligenceManager.addAssistantMessage(clarify, clarifyWrite, 'manual_chat');
-            intelligenceManager.logUsage('chat', message, clarify);
+            intelligenceManager.logUsage('chat', message, clarify, imagePaths);
             chatTrace.markFirstUseful({ via: 'context_os_clarification' });
             chatTrace.mark('response_completed', { chars: clarify.length, deterministic: true, finalGenerationMode: 'source_safe_refusal' });
             chatTrace.finish({ chars: clarify.length });
@@ -3717,7 +3792,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             try { PhoneMirrorService.getInstance().publishDone(String(myStreamId), clarify); } catch (_) { /* noop */ }
             const clarifyWrite = decideSessionWritePolicy({ finalGenerationMode: 'source_safe_refusal', validationOk: true, sourceContractHonored: true });
             intelligenceManager.addAssistantMessage(clarify, clarifyWrite, 'manual_chat');
-            intelligenceManager.logUsage('chat', message, clarify);
+            intelligenceManager.logUsage('chat', message, clarify, imagePaths);
             chatTrace.markFirstUseful({ via: 'source_switch_clarification' });
             chatTrace.mark('response_completed', { chars: clarify.length, deterministic: false, finalGenerationMode: 'source_safe_refusal' });
             chatTrace.finish({ chars: clarify.length });
@@ -6510,7 +6585,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                 && !contextChangedSinceAsk()) {
               intelligenceManager.addAssistantMessage(fullResponse, sessionWriteDecision, 'manual_chat');
               // Log Usage for streaming chat
-              intelligenceManager.logUsage('chat', message, fullResponse);
+              intelligenceManager.logUsage('chat', message, fullResponse, imagePaths);
               // CONTEXT OS memory safety (Phase 9, 2026-07-10): persist the
               // answer's factual CLAIMS separately from the conversational
               // message, default validation_status='unverified'. Only VERIFIED
@@ -7079,6 +7154,28 @@ export function initializeIpcHandlers(appState: AppState): void {
     return persisted ? { success: true } : { success: false, error: 'settings_write_refused' };
   });
 
+  // Usage statistics: the one switch behind every optional report this app
+  // makes about itself (funnel events, checkout-link tagging, Auto Answer
+  // diagnostics, TelemetryService). On unless the user turned it off.
+  safeHandle('get-usage-statistics', async () => {
+    return SettingsManager.getInstance().get('telemetryEnabled') !== false;
+  });
+
+  safeHandle('set-usage-statistics', async (_, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') return { success: false, error: 'invalid_value' };
+    // SettingsManager refuses rather than half-applies: when the write does not
+    // reach disk the in-memory value is put back, so `success: false` here means
+    // the setting did NOT change and the switch must say so.
+    const persisted = SettingsManager.getInstance().set('telemetryEnabled', enabled);
+    if (!persisted) return { success: false, error: 'settings_store_degraded' };
+    try {
+      require('./services/telemetry/TelemetryService').telemetryService.configure({ enabled });
+    } catch { /* that service reads the setting again at the next launch */ }
+    // Turning it off discards what was queued now, not at the next timer tick.
+    if (!enabled) void funnelTelemetry.tick();
+    return { success: true };
+  });
+
   safeHandle('get-stealth-shortcut-guard', async () => {
     return appState.getStealthShortcutGuardEnabled();
   });
@@ -7410,13 +7507,22 @@ export function initializeIpcHandlers(appState: AppState): void {
       // read-only cache probe — every actual dispatch still goes through the
       // full validation below.
       const describedByTurn = new Map<number, string>();
+      const { hasOnDeviceScreenText: keptOnDeviceText, ON_DEVICE_SCREEN_WITHHELD } = require('./context-intelligence/question/on-device-screen') as
+        typeof import('./context-intelligence/question/on-device-screen');
+      const directSelectionOnDevice = (() => {
+        try { return appState.processingHelper.getLLMHelper().selectionStaysOnDevice() === true; } catch { return false; }
+      })();
       const screenStorePre = require('./services/screen/ScreenshotDescriptionStore') as
         typeof import('./services/screen/ScreenshotDescriptionStore');
       for (let i = rawTurns.length - 1; i >= 0; i -= 1) {
         if (!rawTurns[i].imagePaths.length) continue;
         try {
           const described = screenStorePre.getDescriptionForImageSet(rawTurns[i].imagePaths);
-          if (described) describedByTurn.set(i, described);
+          // A description made while that screenshot was being kept on this
+          // device goes only to a provider on this device; anyone else gets a
+          // note that a screenshot was there (never a silent gap). The note
+          // also keeps the image's bytes from being carried instead.
+          if (described) describedByTurn.set(i, keptOnDeviceText(described) && !directSelectionOnDevice ? ON_DEVICE_SCREEN_WITHHELD : described);
         } catch { /* a cache miss is the normal case */ }
       }
 
@@ -7860,8 +7966,8 @@ export function initializeIpcHandlers(appState: AppState): void {
               sequence: lastSequence + 1,
               partial: lastSequence > 0,
               error: directAssistError(
-                'INCOMPLETE_STREAM',
-                'The Direct Assist stream ended before completion.',
+                'INTERNAL_ERROR',
+                'Natively lost track of this answer.',
                 true,
               ),
             });
@@ -7881,8 +7987,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             sequence: lastSequence + 1,
             partial: lastSequence > 0,
             error: directAssistError(
-              'INCOMPLETE_STREAM',
-              'The Direct Assist stream failed before completion.',
+              'INTERNAL_ERROR',
+              'Natively lost track of this answer.',
               true,
             ),
           });
@@ -11505,6 +11611,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
       }
 
+      // A cleared key is not a key entered; the trial sentinel never comes
+      // through this handler (trial:start writes it directly).
+      if (apiKey) funnelTelemetry.keyEntered('api_key', keyRejection ? 'invalid' : 'ok');
+
       return keyRejection
         ? { success: false, error: keyRejection.error }
         : proPending
@@ -11512,6 +11622,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           : { success: true };
     } catch (error: any) {
       console.error('Error saving Natively API key:', error);
+      if (apiKey) funnelTelemetry.keyEntered('api_key', 'error');
       return { success: false, error: error.message };
     } finally {
       // Always bust the cache when the key changes so the next usage fetch is fresh
@@ -11617,7 +11728,10 @@ export function initializeIpcHandlers(appState: AppState): void {
   // ── Free Trial IPC ───────────────────────────────────────────────────────────
 
   // Start or resume a free trial. Fetches HWID, calls server, persists token locally.
-  safeHandle('trial:start', async () => {
+  safeHandle('trial:start', async (_event, surface?: unknown) => {
+    const startSurface = funnelSurface(surface);
+    const reportStart = (r: Parameters<typeof mapTrialStartResult>[0]) =>
+      funnelTelemetry.track('trial_start_result', { surface: startSurface, result: mapTrialStartResult(r) });
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
@@ -11644,18 +11758,33 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       if (!hwid || hwid === 'unavailable') {
         console.error('[Trial] Refusing to start a trial without a real hardware id (native module unavailable).');
+        reportStart({ hwidUnavailable: true });
         return { ok: false, error: 'hardware_id_unavailable' };
+      }
+
+      // install_id / app_version / platform let the server tie this trial to
+      // the install that started it (natively-api lib/funnel.js). They are sent
+      // only while telemetry is on; the server starts the trial the same either way.
+      const analytics: Record<string, string> = {};
+      if (funnelTelemetry.isEnabled()) {
+        try {
+          const installId = require('./services/InstallPingManager').getOrCreateInstallId();
+          if (installId) analytics.install_id = installId;
+        } catch { /* no install id: the trial still starts */ }
+        analytics.app_version = app.getVersion();
+        analytics.platform = process.platform;
       }
 
       const res = await fetch(`${NATIVELY_API_BASE}/v1/trial/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hwid }),
+        body: JSON.stringify({ hwid, ...analytics }),
         signal: AbortSignal.timeout(10_000),
       });
 
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as any;
+        reportStart({ status: res.status, error: body.error });
         return { ok: false, error: body.error || 'request_failed', status: res.status };
       }
 
@@ -11716,6 +11845,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         });
       }
 
+      // Reported here, after the token is stored, so the event carries the
+      // entitlement the start produced rather than the one it began with.
+      reportStart({ body: data });
+      if (data.ok && data.trial_token && !data.expired && !data.already_used) funnelTelemetry.trialStarted();
+
       const { trial_token, ...safeData } = data;
       // `persisted:false` means "running now, gone after a restart" — a real
       // state the UI has to be able to say out loud, and the reason the trial
@@ -11723,6 +11857,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { ok: true, ...safeData, hasToken: Boolean(data.trial_token), persisted };
     } catch (error: any) {
       console.error('[IPC] trial:start failed:', error);
+      reportStart({ threw: true });
       return { ok: false, error: error.message || 'network_error' };
     }
   });
@@ -11886,7 +12021,16 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('trial:convert', async (_, choice: string) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      const token = CredentialsManager.getInstance().getTrialToken();
+      const cm = CredentialsManager.getInstance();
+      const token = cm.getTrialToken();
+      // Every plan-tile click, not only the first: the server keeps one
+      // `converted_to` per trial, which hides a second look at the plans.
+      const action = trialCardActionForChoice(choice);
+      if (action && action !== 'byok') {
+        const expiresAt = cm.getTrialExpiresAt();
+        const live = !!token && !!expiresAt && new Date(expiresAt).getTime() > Date.now();
+        funnelTelemetry.track('trial_card', { mode: live ? 'active' : 'expired', action });
+      }
       if (!token) return { ok: true }; // no token to report
 
       await fetch(`${NATIVELY_API_BASE}/v1/trial/convert`, {
@@ -12069,11 +12213,18 @@ export function initializeIpcHandlers(appState: AppState): void {
       // After repeated failures (a full disk, a locked database) the card offers
       // "End trial anyway" (force): the trial ends and the card says honestly
       // that some data was left behind, so nobody is walled in for good.
+      const byokExpiresAt = cm.getTrialExpiresAt();
+      const byokMode = !!cm.getTrialToken() && !!byokExpiresAt && new Date(byokExpiresAt).getTime() > Date.now() ? 'active' : 'expired';
       const wiped = wipeTrialProfileData();
       if (!wiped.success) {
         console.warn('[IPC] trial:end-byok: wipe incomplete:', wiped.failed.join(', '), opts?.force ? '(ending anyway)' : '');
-        if (!opts?.force) return { success: false, error: 'wipe_failed' };
+        if (!opts?.force) {
+          funnelTelemetry.track('trial_card', { mode: byokMode, action: 'wipe_failed' });
+          return { success: false, error: 'wipe_failed' };
+        }
       }
+      funnelTelemetry.track('trial_card', { mode: byokMode, action: wiped.success ? 'byok' : 'end_anyway' });
+      funnelTelemetry.byokExited();
       // No once-marker needed: the token is cleared below, so the expiry
       // settle never sees this trial again.
 
@@ -12124,6 +12275,25 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // ── Funnel events from the renderer ──────────────────────────────────────
+  // Events only the renderer can see: a card on screen, a locked feature opened.
+  // The event name is checked against this list and its properties against the
+  // catalogue, so the renderer cannot send anything the catalogue does not hold.
+  const RENDERER_FUNNEL_EVENTS = new Set(['trial_card', 'upgrade_prompt', 'paywall_hit', 'onboarding_stage', 'feature_used']);
+  safeHandle('funnel:track', async (_, eventType: unknown, props: unknown) => {
+    if (typeof eventType !== 'string' || !RENDERER_FUNNEL_EVENTS.has(eventType)) return { ok: false, error: 'unknown_event' };
+    const checked = checkFunnelProps(eventType, props);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    // The card's decisions (a plan, own keys) are reported by the handlers that
+    // carry them out; the renderer may only say the card appeared or was closed.
+    if (eventType === 'trial_card' && checked.props.action !== 'shown' && checked.props.action !== 'dismissed') {
+      return { ok: false, error: 'bad_prop:action' };
+    }
+    // Once per feature per day, however often the renderer says it.
+    if (eventType === 'feature_used') return { ok: true, result: funnelTelemetry.featureUsed(String(checked.props.feature)) };
+    return { ok: true, result: funnelTelemetry.track(eventType, checked.props) };
+  });
+
   // ── Card ledger (toaster policy, src/lib/cards/cardPolicy.mjs) ──────────
   // Outcomes arrive from the renderer, so everything is validated here: an
   // unknown card, outcome or payload is refused without writing.
@@ -12158,6 +12328,8 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const ledger = CardLedger.getInstance().record(id, outcome, until);
       broadcastCardsChanged(ledger);
+      // Every card the app raises, at the one place all of them report to.
+      funnelTelemetry.track('card', { id, outcome });
       return { ok: true, ledger };
     } catch (e: any) {
       return { ok: false, error: e?.message || 'record_failed' };
@@ -14148,6 +14320,34 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { ids: ids.filter((id) => typeof id === 'string' && llmHelper.canDispatchFastModel(id)) };
   });
 
+  // ── "Reads images: Auto / On / Off" per model (2026-10-01) ────────────────
+  // Main answers for the same reason as above: the renderer sends picker ids
+  // and main, which owns the classifiers and the saved answers, says what each
+  // one is. The listener is (re)attached on every call so it follows the live
+  // helper; it tells every window to ask again when an answer changed — a
+  // setting, or a one-time image test that finished in the background.
+  const visionHelper = () => {
+    const llmHelper = appState.processingHelper.getLLMHelper();
+    llmHelper.onVisionCapabilityChanged(() => {
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('vision-capability-changed');
+      });
+    });
+    return llmHelper;
+  };
+  safeHandle('vision-capability:describe', async (_, ids: string[]) => {
+    if (!Array.isArray(ids)) return { states: {} };
+    return { states: visionHelper().describeVisionModels(ids.filter((id) => typeof id === 'string')) };
+  });
+  safeHandle('vision-capability:set', async (_, id: string, setting: 'auto' | 'on' | 'off') => {
+    if (typeof id !== 'string' || !['auto', 'on', 'off'].includes(setting)) return { state: null };
+    return { state: visionHelper().setVisionSetting(id, setting) };
+  });
+  safeHandle('vision-capability:retest', async (_, id: string) => {
+    if (typeof id !== 'string') return { state: null };
+    return { state: await visionHelper().retestVision(id) };
+  });
+
   safeHandle('get-fast-model', async () => {
     const { CredentialsManager } = require('./services/CredentialsManager');
     return { model: CredentialsManager.getInstance().getFastModel() };
@@ -14755,7 +14955,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   // Answers whether the page actually opened, so a card can say so when it
   // did not (toaster policy §6 row 9). Existing callers ignore the answer.
-  safeHandle('open-external', async (event, url: string): Promise<{ ok: boolean }> => {
+  safeHandle('open-external', async (event, url: string, opts?: { surface?: unknown }): Promise<{ ok: boolean }> => {
     try {
       if (typeof url !== 'string') {
         console.warn('[IPC] Blocked invalid open-external request', { reason: 'non-string' });
@@ -14772,7 +14972,27 @@ export function initializeIpcHandlers(appState: AppState): void {
         parsed.protocol === 'x-apple.systempreferences:' && process.platform === 'darwin';
 
       if (allowedWebUrl || allowedSystemSettingsUrl) {
-        await shell.openExternal(url);
+        // A checkout link leaves with the install id, the surface and the
+        // product on it, so a purchase can be tied back to where it started
+        // (src/lib/funnel/checkoutLinks.mjs). Every other link is untouched.
+        const tagged = allowedWebUrl
+          ? funnelTelemetry.tagOutgoingUrl(url, funnelSurface(opts?.surface))
+          : { url, checkout: false, product: null as string | null, surface: 'other' };
+        let opened = true;
+        try {
+          await shell.openExternal(tagged.url);
+        } catch (e) {
+          opened = false;
+          throw e;
+        } finally {
+          if (tagged.checkout) {
+            funnelTelemetry.track('checkout_opened', {
+              ...(tagged.product ? { product: tagged.product } : {}),
+              surface: tagged.surface,
+              opened,
+            });
+          }
+        }
         return { ok: true };
       }
       console.warn('[IPC] Blocked open-external request', {

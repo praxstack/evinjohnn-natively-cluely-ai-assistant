@@ -173,8 +173,9 @@ export class IntelligenceManager extends EventEmitter {
         return this.session.getFullTranscript().map(s => ({ speaker: s.speaker, text: s.text, timestamp: s.timestamp, ...(s.origin ? { origin: s.origin } : {}) }));
     }
 
-    logUsage(type: string, question: string, answer: string): void {
-        this.session.logUsage(type, question, answer);
+    /** `imagePaths`: the screenshots the answer used; the Usage tab shows previews of them. */
+    logUsage(type: string, question: string, answer: string, imagePaths?: readonly string[]): void {
+        this.session.logUsage(type, question, answer, imagePaths);
     }
 
     /**
@@ -228,6 +229,14 @@ export class IntelligenceManager extends EventEmitter {
     noteAutoAnswerCandidate(questionId: string, candidateGeneration: number): void {
         this.engine.noteAutoAnswerCandidate(questionId, candidateGeneration);
     }
+    /**
+     * How many answers the session log holds. A count only: the funnel reports
+     * how many answers a meeting produced, never what they were.
+     */
+    getAnswerCount(): number {
+        try { return this.session.getFullUsage().length; } catch { return 0; }
+    }
+
     getSpeculativeSnapshot(): { questionId: string | null; text: string | null } {
         return this.engine.getSpeculativeSnapshot();
     }

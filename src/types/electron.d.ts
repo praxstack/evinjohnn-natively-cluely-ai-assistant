@@ -61,6 +61,22 @@ export interface DirectAssistError {
   code: string
   message: string
   retryable: boolean
+  /** HTTP status of the failure, when the provider gave one. */
+  status?: number
+  /** The provider's own explanation: one line, keys removed, capped in main. */
+  detail?: string
+  /** The provider was never reached (offline, connection refused). */
+  unreachable?: boolean
+  /** Every provider tried, when more than one was and none answered. */
+  attempts?: Array<{
+    provider: string
+    model: string
+    reason: string
+    status?: number
+    detail?: string
+    unreachable?: boolean
+    waitedMs: number
+  }>
 }
 
 export type DirectAssistEvent =
@@ -74,10 +90,33 @@ export type DirectAssistEvent =
       from: { provider: string; model: string }
       to: { provider: string; model: string }
       reason: string
+      status?: number
+      detail?: string
+      /** How long `from` was given, retries included. */
+      waitedMs: number
+      unreachable?: boolean
     }
   | { type: 'done'; requestId: string; sequence: number; provider: string; model: string; fullText?: string }
   | { type: 'error'; requestId: string; sequence: number; partial: boolean; error: DirectAssistError }
   | { type: 'cancel'; requestId: string; sequence: number }
+
+/** Mirrors electron/llm/visionResolver.ts VisionModelState (the renderer never imports from electron/*). */
+export interface VisionModelState {
+  /** The user's own answer; `auto` leaves it to Natively. */
+  setting: 'auto' | 'on' | 'off'
+  /** The answer in force, the setting included, and where it came from. */
+  reads: 'yes' | 'no' | 'unknown'
+  source: 'override' | 'route' | 'provider' | 'test' | 'names' | null
+  /** What Natively itself can tell. */
+  auto: { reads: 'yes' | 'no' | 'unknown'; source: 'override' | 'route' | 'provider' | 'test' | 'names' | null; testedAt?: number }
+  provider: string
+  /** A one-time image test of this model is running now. */
+  checking: boolean
+  /** The one-time test may ask this model now. */
+  testable: boolean
+  /** Only on the answer to "Test again": the test ran and could not finish. */
+  inconclusive?: boolean
+}
 
 export interface ElectronAPI {
   updateContentDimensions: (dimensions: {
@@ -175,7 +214,7 @@ export interface ElectronAPI {
   onMeetingStateChanged: (callback: (data: { isActive: boolean }) => void) => () => void
   onWindowMaximizedChanged: (callback: (isMaximized: boolean) => void) => () => void
   onEnsureExpanded: (callback: () => void) => () => void
-  openExternal: (url: string) => Promise<{ ok: boolean }>
+  openExternal: (url: string, opts?: { surface?: string }) => Promise<{ ok: boolean }>
   // Genie snapshots (electron/genieSnapshots.ts): pictures of popup cards the genie warps.
   genieSnapshotCapture?: (rect: { x: number; y: number; width: number; height: number }) => Promise<{ png: Uint8Array; width: number; height: number } | null>
   genieSnapshotSave?: (key: string, png: Uint8Array) => Promise<boolean>
@@ -307,7 +346,7 @@ export interface ElectronAPI {
 
   // Free Trial
   /** `persisted: false` = started and live for THIS session, but the credential store could not write it, so a restart loses it. The server keeps the trial and re-issues it (idempotent per hardware id). */
-  startTrial:     () => Promise<{ ok: boolean; hasToken?: boolean; persisted?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
+  startTrial:     (surface?: string) => Promise<{ ok: boolean; hasToken?: boolean; persisted?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
   getTrialStatus: () => Promise<{ ok: boolean; expired?: boolean; showEndedCard?: boolean; remaining_ms?: number; started_at?: string; expires_at?: string; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: object; error?: string }>
   getLocalTrial:  () => Promise<{ hasToken: boolean; trialClaimed?: boolean; expiresAt?: string; startedAt?: string; expired?: boolean; showEndedCard?: boolean; superseded?: boolean }>
   convertTrial:   (choice: string) => Promise<{ ok: boolean }>
@@ -315,6 +354,8 @@ export interface ElectronAPI {
   // Card ledger (toaster policy, src/lib/cards/cardPolicy.mjs)
   cardsGet: () => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
   cardsRecord: (id: string, outcome: string, meta?: { until?: number }) => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
+  /** Report a funnel event only the renderer can see (a card on screen, a locked feature opened). */
+  funnelTrack: (eventType: string, props?: Record<string, string | number | boolean>) => Promise<{ ok: boolean; result?: string; error?: string }>
   cardsImportLegacy: (legacy: import('../lib/cards/cardPolicy.mjs').LegacyCardHistory) => Promise<{ ok: boolean; ledger?: import('../lib/cards/cardPolicy.mjs').Ledger; error?: string }>
   onCardsChanged: (cb: (ledger: import('../lib/cards/cardPolicy.mjs').Ledger) => void) => () => void
   onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
@@ -798,6 +839,13 @@ export interface ElectronAPI {
   setFastModel: (modelId: string | null) => Promise<{ success: boolean; error?: string }>;
   /** Narrows picker options to the ids the fast path can actually dispatch. */
   filterFastModelCandidates: (ids: string[]) => Promise<{ ids: string[] }>;
+  /** "Reads images: Auto / On / Off" per model. Keyed by picker id; null = that id has no row control. */
+  getVisionModelStates: (ids: string[]) => Promise<{ states: Record<string, VisionModelState | null> }>;
+  setVisionSetting: (id: string, setting: 'auto' | 'on' | 'off') => Promise<{ state: VisionModelState | null }>;
+  /** Forget the saved image test and ask the model again now. */
+  retestVision: (id: string) => Promise<{ state: VisionModelState | null }>;
+  /** An answer changed (a setting, or a background image test finished): ask again. */
+  onVisionCapabilityChanged: (callback: () => void) => () => void;
   toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
   // NOTE: this interface and the one in electron/preload.ts are maintained
@@ -1032,6 +1080,8 @@ export interface ElectronAPI {
   // Verbose / Debug Logging
   getVerboseLogging: () => Promise<boolean>;
   setVerboseLogging: (enabled: boolean) => Promise<{ success: boolean }>;
+  getUsageStatistics: () => Promise<boolean>;
+  setUsageStatistics: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   exportDebugLogs: () => Promise<{ success: boolean; path?: string; files?: string[]; error?: string }>;
 
   // Windows shortcut guard — the always-on WH_KEYBOARD_LL hook that swallows
