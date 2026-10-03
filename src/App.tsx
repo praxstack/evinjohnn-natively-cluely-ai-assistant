@@ -9,6 +9,7 @@ import ModelSelectorWindow from "./components/ModelSelectorWindow"
 import { OverlayPillWindow, OverlayToggleWindow } from "./components/OverlayAuxWindows"
 import SettingsOverlay from "./components/SettingsOverlay"
 import StartupSequence from "./components/StartupSequence"
+import { EXIT_MS, launcherLanding } from "./components/startup/splashTimeline"
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion"
 import UpdateBanner from "./components/UpdateBanner"
 import { NativelyQuotaBanner } from "./components/NativelyQuotaBanner"
@@ -48,6 +49,7 @@ import { GenieModal } from "./components/ui/GenieModal"
 import { GENIE_CLOSE_MS } from "./components/onboarding/useGenieCard"
 import { ProfileIntelligenceSettings } from "./components/ProfileIntelligenceSettings"
 import { useResolvedTheme } from "./hooks/useResolvedTheme"
+import { useDiagramRenderHost } from "./lib/diagram/diagramRuntime"
 import { WelcomeFlow } from "./components/onboarding/WelcomeFlow"
 import { shouldShowWelcome, hasOnboardingHistory, WELCOME_SEEN_KEY, LEGACY_PERMS_SHOWN_KEY, ONBOARDING_STATE_KEY } from "./lib/onboarding/welcomeGate.mjs"
 
@@ -94,6 +96,10 @@ function getLauncherIsolation(): LauncherIsolation {
 
 const App: React.FC = () => {
   const isLight = useResolvedTheme() === 'light';
+  // The launcher and the overlay both mount App, and both can be asked by the
+  // main process to draw a diagram for the Phone Mirror (it has no DOM).
+  // Mermaid itself loads only when such a request actually arrives.
+  useDiagramRenderHost();
   const isSettingsWindow = new URLSearchParams(window.location.search).get('window') === 'settings';
   const isLauncherWindow = new URLSearchParams(window.location.search).get('window') === 'launcher';
   const isOverlayWindow = new URLSearchParams(window.location.search).get('window') === 'overlay';
@@ -265,6 +271,29 @@ const App: React.FC = () => {
   const managerDialogRef = useRef<HTMLDivElement>(null);
   const managerOpenerRef = useRef<HTMLElement | null>(null);
   const reduceManagerMotion = useReducedMotion() ?? false;
+
+  // The launcher's entrance after the splash: it is laid out under the black
+  // at once, held slightly off its size, and lands as the black lifts (the
+  // exit in splashTimeline.ts). Run as a Web Animation on `transform` so it
+  // stays on the compositor while the launcher is still mounting, and nothing
+  // is left on the element afterwards. After the welcome, or with reduced
+  // motion, the launcher keeps its plain fade-up instead.
+  const cameFromWelcome = useRef(false);
+  if (showWelcome) cameFromWelcome.current = true;
+  const launcherLands = !cameFromWelcome.current && !reduceManagerMotion;
+  const launcherLanded = useRef(false);
+  const landLauncher = useCallback((el: HTMLDivElement | null) => {
+    if (!el || launcherLanded.current) return;
+    launcherLanded.current = true;
+    if (typeof el.animate !== 'function') {
+      reportRevealComplete();
+      return;
+    }
+    const { keyframes, delay, duration } = launcherLanding();
+    // The landing ends after the splash has been removed, so its end is what
+    // tells main the reveal is over (see reportRevealComplete).
+    el.animate(keyframes, { delay, duration, fill: 'backwards' }).finished.then(reportRevealComplete, reportRevealComplete);
+  }, [reportRevealComplete]);
 
   const rememberManagerOpener = useCallback(() => {
     const activeElement = document.activeElement;
@@ -1278,18 +1307,16 @@ const App: React.FC = () => {
             // so the splash faded to black and the launcher then cut in, already
             // at the end of an entrance nobody saw. Out of the flow, the launcher
             // (or the welcome) is laid out underneath from the moment the splash
-            // is dismissed, and rises behind the logo as it lets go. z-[100]
-            // keeps the splash in front of it for that moment.
+            // is dismissed. z-[100] keeps the splash in front of it until the
+            // black has lifted.
             className="absolute inset-0 z-[100]"
             // The splash draws its own entrance and exit: the window is already
-            // black, and on the way out a ring of characters leaves the logo and
-            // the black opens behind it, uncovering the launcher, while the
-            // logo dissolves into characters in front of the launcher. So this
-            // layer animates nothing visible. It only keeps the splash mounted
-            // for the length of that reveal (EXIT_MS in splashTimeline.ts), and
-            // stops it taking clicks at once.
+            // black, and on the way out the logo leaves on the black, which then
+            // lifts off the launcher. So this layer animates nothing visible.
+            // It only keeps the splash mounted until that exit has ended
+            // (EXIT_MS in splashTimeline.ts), and stops it taking clicks at once.
             initial={false}
-            exit={{ opacity: 0, pointerEvents: "none", transition: { opacity: { delay: 1.32, duration: 0.05 } } }}
+            exit={{ opacity: 0, pointerEvents: "none", transition: { opacity: { delay: EXIT_MS / 1000, duration: 0.05 } } }}
           >
             <StartupSequence onComplete={dismissStartup} />
           </motion.div>
@@ -1307,8 +1334,10 @@ const App: React.FC = () => {
           <motion.div
             key="main"
             className="h-full w-full"
-            initial={{ opacity: 0, scale: 0.99, y: 8 }} // "Linear" style entry: slightly down and scaled down
-            animate={{ opacity: 1, scale: 1, y: 0 }}    // Slide up and snap to place
+            // After the splash the launcher lands (landLauncher); otherwise:
+            ref={launcherLands ? landLauncher : undefined}
+            initial={launcherLands ? false : { opacity: 0, scale: 0.99, y: 8 }} // "Linear" style entry: slightly down and scaled down
+            animate={launcherLands ? undefined : { opacity: 1, scale: 1, y: 0 }} // Slide up and snap to place
             transition={{
               duration: 0.6,
               ease: [0.19, 1, 0.22, 1], // Expo-out: snappy start, smooth landing
