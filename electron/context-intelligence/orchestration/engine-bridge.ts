@@ -36,6 +36,7 @@ import type { AnswerSurface, EvidenceScope } from '../contracts/types';
 import type { ProviderDataScope } from '../../llm/ProviderRouter';
 import { describeUserInstructionDelivery } from '../../llm/userInstructionContract';
 import { readSelectionStaysOnDevice } from '../../llm/activeCustomProvider';
+import { SPEECH_WINDOW_HISTORY_CHARGE_MAX } from '../../llm/conversationHistoryPolicy';
 
 /**
  * Credential-scrub a [V3] trace payload before stringifying. Keeps every
@@ -90,6 +91,8 @@ export interface BridgeInput {
   /** Estimated tokens of the active mode's attached text (referenceCorpusTokens);
    *  null when a file has no text yet. Lets a small corpus be read whole. */
   attachedCorpusTokens?: number | null;
+  /** profileWholeInfo(collected docs): the résumé / JD are handed over whole this turn; null = retrieval as before. */
+  profileWhole?: { tokens: number; docs: number } | null;
   /**
    * Bounded fast-model query rewrite for low-confidence retrieval — see
    * retrieval/llm-query-rewrite.ts. The CALLER binds the model (this module has
@@ -317,6 +320,7 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
       profileOnlyDocuments: (input.attachedSourceCount ?? 0) === 0 && (input.profileSourceCount ?? 0) > 0,
       attachedSourceCount: input.attachedSourceCount,
       attachedCorpusTokens: input.attachedCorpusTokens ?? null,
+      profileWhole: input.profileWhole ?? null,
       queryRewriter: input.queryRewriter,
       attachedFileNames: input.attachedFileNames,
       screenText: input.screenText,
@@ -477,7 +481,10 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
           const speech = String(convoSummary ?? '');
           const budgetChars = Math.max(0, (policy.contextBudget?.conversationTokens ?? 600) * 4);
           const rendered = renderHistory(ringTurns, {
-            budgetChars: Math.max(0, budgetChars - speech.length),
+            // The speech window is charged against the shared budget only up to
+            // what it used to cost (E12): it grew to 6,000 chars, and earlier
+            // answers and screens keep the room they had.
+            budgetChars: Math.max(0, budgetChars - Math.min(speech.length, SPEECH_WINDOW_HISTORY_CHARGE_MAX)),
             digestBudgetChars: budgetChars,
             // BUDGETED like the ring branch. Unbudgeted, 10 screen turns once
             // put 80,000 characters of screen text into an 83,072-character

@@ -26,6 +26,7 @@ import { classifyTurn, isBareFollowUp, stripSttFillers, isProspectiveJobQuestion
 import type { AnswerTrace, RetrievalAttemptTrace } from '../observability/answer-trace';
 import { mergeRewrittenEvidence, type QueryRewriter, type QueryRewriteOutcome } from '../retrieval/llm-query-rewrite';
 import { SMALL_CORPUS_MAX_TOKENS, WHOLE_PACK_MAX_TOKENS } from '../retrieval/mode-retrieval-port';
+import { PROFILE_WHOLE_MAX_TOKENS } from '../retrieval/profile-retrieval-port';
 
 export interface AnswerRequest {
   requestId: string;
@@ -74,6 +75,9 @@ export interface AnswerRequest {
   /** Estimated tokens of the mode's attached text (mode-retrieval-port referenceCorpusTokens).
    *  Set by the engine bridge; absent/null = unknown = no whole-corpus handling. */
   attachedCorpusTokens?: number | null;
+  /** Size and count of the profile documents the profile port hands over whole this turn
+   *  (profile-retrieval-port profileWholeInfo). Set by the engine bridge; absent/null = retrieval as before. */
+  profileWhole?: { tokens: number; docs: number } | null;
   /**
    * One bounded fast-model call that restates the question in the vocabulary a
    * document would use (see retrieval/llm-query-rewrite.ts). Injected by the engine
@@ -138,7 +142,13 @@ function resolveQuestion(req: AnswerRequest): { resolved: string; source: 'manua
   // routed FAST because the classifier could not see "what is the <noun>".
   // Stripped here, once, so the classifier, the retrieval query and the
   // model all see the same clean question. rawQuestion keeps the original.
-  if (manual) return { resolved: stripSttFillers(manual) || manual, source: 'manual', confidence: 1 };
+  // TYPED chat is not transcriber output (2026-10-04, owner's decision): the
+  // stripper turned "the right answer" into "the answer" and dropped
+  // "basically", "I mean" and a repeated word from what the user typed. Typed
+  // text goes to the model verbatim. 'manual' alone does not mean typed: the
+  // what-to-answer surface hands SPOKEN questions over as manual (Auto Answer,
+  // speculative and pinned questions), and those keep the cleaning.
+  if (manual) return { resolved: req.surface === 'manual-chat' ? manual : (stripSttFillers(manual) || manual), source: 'manual', confidence: 1 };
   const t = req.transcriptQuestion?.trim() ?? '';
   if (!t) return { resolved: t, source: 'transcript', confidence: 0 };
   // Honour the extractor's own confidence when the caller supplied it; fall
@@ -216,6 +226,8 @@ export const MULTI_FILE_EVIDENCE = { accepted: 8, tokens: 2400 } as const;
 
 /** Tags and separators around one whole file in the evidence block, in packer tokens. */
 export const WHOLE_PACK_ITEM_OVERHEAD = 120;
+/** The same, around one whole profile document (résumé or job description). */
+export const PROFILE_WHOLE_ITEM_OVERHEAD = 120;
 
 /** Best-evidence score under which a non-FULL first pass counts as low-confidence (see the rewrite trigger). */
 const LOW_CONFIDENCE_TOP_SCORE = 0.3;
@@ -292,8 +304,18 @@ export function decide(req: AnswerRequest): Readonly<TurnDecision> {
   // that number in front of me". No claim is added, exactly as below.
   const smallCorpus = typeof req.attachedCorpusTokens === 'number'
     && req.attachedCorpusTokens > 0 && req.attachedCorpusTokens <= SMALL_CORPUS_MAX_TOKENS;
+  // A PACK THAT FITS is read on such a turn too (2026-10-04). When packs up to
+  // WHOLE_PACK_MAX_TOKENS began to be handed over whole, a turn the classifier
+  // answers from general knowledge was left reading nothing from them. Measured
+  // on main: 10 of 333 benchmark turns, in General, Sales, Team Meet, Recruiting
+  // and Looking for work ("They need the NetSuite link and SSO. Can both be had
+  // on Operations?" → "I'll confirm how the NetSuite link and SSO work", with
+  // the integration matrix loaded and unread). The cost is the pack's tokens on
+  // every such turn of a mode that has one.
+  const packFits = typeof req.attachedCorpusTokens === 'number'
+    && req.attachedCorpusTokens > 0 && req.attachedCorpusTokens <= WHOLE_PACK_MAX_TOKENS;
   const sourcePrimaryTurn = cls.path === 'FAST' && !cls.shouldRetrieve
-    && (policy.attachedMaterialIsPrimary === true || smallCorpus)
+    && (policy.attachedMaterialIsPrimary === true || smallCorpus || packFits)
     && req.hasAttachedDocuments === true && req.profileOnlyDocuments !== true
     && !cls.questionTypes.includes('META_REQUEST')
     && policy.retrievalPolicy.enabled
@@ -328,9 +350,15 @@ export function decide(req: AnswerRequest): Readonly<TurnDecision> {
     && typeof req.attachedCorpusTokens === 'number'
     && req.attachedCorpusTokens > SMALL_CORPUS_MAX_TOKENS && req.attachedCorpusTokens <= WHOLE_PACK_MAX_TOKENS;
   const packFiles = wholePack ? Math.max(1, req.attachedSourceCount ?? 1) : 0;
+  // The résumé and the job description, each handed over whole by the profile
+  // port (PROFILE_WHOLE_MAX_TOKENS), ride on top in the same way: one item per
+  // document, the budget grown by their size, and the pack keeps its own room.
+  const wholeProfile = retrieves && !!req.profileWhole
+    && req.profileWhole.docs > 0 && req.profileWhole.tokens > 0 && req.profileWhole.tokens <= PROFILE_WHOLE_MAX_TOKENS;
+  const profileDocs = wholeProfile ? (req.profileWhole as { docs: number }).docs : 0;
   const acceptedBase = (multiFile
     ? Math.max(policy.retrievalPolicy.maximumAcceptedEvidence, MULTI_FILE_EVIDENCE.accepted)
-    : policy.retrievalPolicy.maximumAcceptedEvidence) + packFiles;
+    : policy.retrievalPolicy.maximumAcceptedEvidence) + packFiles + profileDocs;
 
   // A source-primary turn reads the reference files, plus the meeting when one
   // is live (the meeting rule above would otherwise have been the whole plan).
@@ -388,15 +416,17 @@ export function decide(req: AnswerRequest): Readonly<TurnDecision> {
     maximumAcceptedEvidence: acceptedBase * (cls.exhaustive && cls.shouldRetrieve ? 3 : 1),
     // A whole small corpus must fit next to the meeting's evidence, or the
     // packer drops the file outright (it skips an item that does not fit).
-    ...(multiFile || (smallCorpus && retrieves) || wholePack
+    ...(multiFile || (smallCorpus && retrieves) || wholePack || wholeProfile
       ? { evidenceTokens: Math.max(
         policy.contextBudget.evidenceTokens,
         multiFile ? MULTI_FILE_EVIDENCE.tokens : 0,
         smallCorpus && retrieves ? (req.attachedCorpusTokens as number) + SMALL_CORPUS_EVIDENCE_HEADROOM : 0,
-      ) + (wholePack ? (req.attachedCorpusTokens as number) + WHOLE_PACK_ITEM_OVERHEAD * packFiles : 0) }
+      ) + (wholePack ? (req.attachedCorpusTokens as number) + WHOLE_PACK_ITEM_OVERHEAD * packFiles : 0)
+        + (wholeProfile ? (req.profileWhole as { tokens: number }).tokens + PROFILE_WHOLE_ITEM_OVERHEAD * profileDocs : 0) }
       : {}),
     timeoutMs: cls.exhaustive && cls.shouldRetrieve ? 2400 : 1200,
     ...(cls.exhaustive && cls.shouldRetrieve ? { exhaustive: true } : {}),
+    ...(wholeProfile ? { wholeProfile: true } : {}),
   };
 
   return freezeTurnDecision({

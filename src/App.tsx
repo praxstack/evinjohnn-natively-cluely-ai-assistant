@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react" // forcing refresh
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { ToastProvider, ToastViewport } from "./components/ui/toast"
-import NativelyInterface from "./components/NativelyInterface"
 import HindsightStatusBanner from "./components/HindsightStatusBanner"
 import SettingsPopup from "./components/SettingsPopup" // Keeping for legacy/specific window support if needed
 import Launcher, { type LauncherRequest } from "./components/Launcher"
@@ -13,7 +12,7 @@ import { EXIT_MS, launcherLanding } from "./components/startup/splashTimeline"
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion"
 import UpdateBanner from "./components/UpdateBanner"
 import { NativelyQuotaBanner } from "./components/NativelyQuotaBanner"
-import { FreeTrialBanner }      from "./components/trial/FreeTrialBanner"
+import { useTrialExpiry }       from "./components/trial/useTrialExpiry"
 import type { TrialUsage, TrialLimits } from './types/nativelyUsage';
 import { FreeTrialModal }       from "./components/trial/FreeTrialModal"
 import { OrchestratorProvider, OrchestratedToasterHost, setUserState as setOrchestratorUserState, emitOrchestratorEvent } from "./components/onboarding/OrchestratedToasterHost"
@@ -60,6 +59,25 @@ const CARD_INPUTS_FOCUS_REFRESH_MS = 5 * 60_000;
 
 const queryClient = new QueryClient()
 const CropperWindow = React.lazy(() => import('./components/Cropper'))
+
+// The meeting overlay's component is by far the largest in the app and only
+// the overlay window renders it, but a static import put it in the one bundle
+// that all seven windows load (launcher, overlay, pill, toggle, settings
+// popup, model selector, cropper). Loaded on demand, the other six never
+// parse it. The overlay window starts the request while this module is still
+// evaluating, so its content is not held back to the first render.
+//
+// Only this component is split. The pill and toggle stay static on purpose:
+// the main process replays the overlay's state to them when they finish
+// loading (WindowHelper's did-finish-load handler), and a component that
+// mounts a moment later would miss that replay. The settings popup and model
+// selector are left static as well; they are sized on first open and that has
+// not been checked against a later mount.
+const loadNativelyInterface = () => import('./components/NativelyInterface')
+const NativelyInterface = React.lazy(loadNativelyInterface)
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('window') === 'overlay') {
+  void loadNativelyInterface().catch(() => { /* surfaced by the lazy boundary on render */ })
+}
 
 type LauncherIsolation = 'onboarding' | 'global-surfaces' | 'permissions-toaster' | 'no-modals' | null
 type ManagerPanel = 'modes' | 'profile' | null
@@ -425,7 +443,7 @@ const App: React.FC = () => {
   const [activeTrial, setActiveTrial] = useState<{
     expiresAt: string;
     usage: TrialUsage;
-    /** Carried from /v1/trial/status so the banner does not hardcode allowances. */
+    /** The trial's allowances, carried from /v1/trial/status. */
     limits?: TrialLimits;
   } | null>(null);
   // Dev-only: `?forceTrialEnded=1` opens the end-of-trial card for a design check.
@@ -435,14 +453,20 @@ const App: React.FC = () => {
   // The card is due (expired at launch) but still inside its 10 s delay: it
   // already owns the card slot, so no other card can open under it.
   const [trialEndedDue, setTrialEndedDue] = useState(false);
-  // 0:00 on the banner: settle the expiry from the LOCAL clock and open the
-  // card at once, offline included, instead of waiting for the next poll
-  // (toaster policy §5 row 2).
+  // 0:00: settle the expiry from the LOCAL clock and open the card at once,
+  // offline included, instead of waiting for the next poll (toaster policy §5
+  // row 2).
   const handleTrialClockExpired = useCallback(() => {
     window.electronAPI?.getLocalTrial?.().then((local: any) => {
       if (local?.showEndedCard) { setActiveTrial(null); setShowTrialExpiredModal(true); }
     }).catch(() => {});
   }, []);
+  // Launcher only, like the trial poll (toaster policy §7.5). Nothing is drawn
+  // here: the time left is on the trial card in Settings › Plans.
+  useTrialExpiry(
+    !isolateGlobalSurfaces && (isLauncherWindow || isDefault) && activeTrial ? activeTrial.expiresAt : null,
+    handleTrialClockExpired,
+  );
 
   const isManagerOpen = activeManagerPanel !== null;
   const managerContentVariants = {
@@ -781,7 +805,7 @@ const App: React.FC = () => {
         }
         return;
       }
-      // Seed the banner from the LOCAL token before the first poll answers.
+      // Seed the trial from the LOCAL token before the first poll answers.
       //
       // This is the "closed the app and reopened it inside the 30 minutes and
       // the trial was gone" report. The trial was fine — the countdown just
@@ -1267,11 +1291,15 @@ const App: React.FC = () => {
                 } as React.CSSProperties}
               >
                 <HindsightStatusBanner />
-                <NativelyInterface
-                  onMeetingEnded={handleMeetingEnded}
-                  overlayOpacity={overlayOpacity}
-                  interfaceTheme={meetingInterfaceTheme}
-                />
+                {/* fallback={null}: the overlay window is transparent, so
+                    anything painted while the chunk loads would flash. */}
+                <React.Suspense fallback={null}>
+                  <NativelyInterface
+                    onMeetingEnded={handleMeetingEnded}
+                    overlayOpacity={overlayOpacity}
+                    interfaceTheme={meetingInterfaceTheme}
+                  />
+                </React.Suspense>
               </div>
               <ToastViewport />
             </ToastProvider>
@@ -1291,7 +1319,7 @@ const App: React.FC = () => {
           startPreviewingOpacity/stopPreviewingOpacity so the Interface
           Opacity live-preview hides every global banner/toast/modal along
           with #launcher-container, instead of leaving whichever one happens
-          to be visible (update/quota/trial banners, onboarding toasts, ad
+          to be visible (update/quota banners, onboarding toasts, ad
           promos) painted opaque on top of the "transparent" preview. */}
       {!isolateGlobalSurfaces && showHindsightBanner && (
         <div data-opacity-preview-surface="">
@@ -1467,17 +1495,6 @@ const App: React.FC = () => {
           </OrchestratorProvider>
         )}
 
-
-        {/* Free trial countdown banner — only in launcher window while trial is active */}
-        {!isolateGlobalSurfaces && (isLauncherWindow || isDefault) && activeTrial && (
-          <FreeTrialBanner
-            expiresAt={activeTrial.expiresAt}
-            usage={activeTrial.usage}
-            limits={activeTrial.limits}
-            onUpgrade={() => openSettingsExclusive('plans')}
-            onExpired={handleTrialClockExpired}
-          />
-        )}
 
         {/* Post-trial upgrade modal — shown when trial expires */}
         {!isolateModals && (isLauncherWindow || isDefault) && showTrialExpiredModal && (

@@ -38,7 +38,7 @@ import { HARD_SYSTEM_PROMPT } from './llm/prompts';
 import type { ActiveModeInfo } from './llm/modeProfiles';
 import type { WhatToAnswerRequestSnapshot } from './llm/whatToAnswerRequestSnapshot';
 import { resolveCanonicalTurn } from './llm/resolveCanonicalTurn';
-import { speechWindowForPrompt } from './llm/conversationHistoryPolicy';
+import { speechWindowForPrompt, SPEECH_WINDOW_SECONDS } from './llm/conversationHistoryPolicy';
 import { performanceHooks, applyAdaptiveTtft, secondaryStreamObserver, slowWorkloadAdvice } from './llm/performance/wiring';
 import { estimateTokens } from './llm/modelCapabilities';
 import { mintTurnId } from './llm/turnIdentity';
@@ -282,8 +282,10 @@ export class IntelligenceEngine extends EventEmitter {
         signal: AbortSignal | undefined,
         fallbackSystemPrompt?: string,
         fallbackScopes: any[] = [],
+        maxInheritedChars?: number,
     ): Parameters<LLMHelper['streamChat']> {
-        const replayed = (this.llmHelper as any).replayAnswerCall?.(turnKey, repairPrompt, signal);
+        const replayed = (this.llmHelper as any).replayAnswerCall?.(turnKey, repairPrompt, signal,
+            maxInheritedChars ? { maxInheritedChars } : undefined);
         if (replayed) {
             // A repair site that supplies its OWN system prompt means it: the
             // doc-grounded repair pass, for one, deliberately runs under a
@@ -397,7 +399,7 @@ export class IntelligenceEngine extends EventEmitter {
             material: opts.material,
             budgetMs: h.replayedAnswerHasImages?.(opts.turnKey) === true ? cv.CLAIM_VERIFIER_IMAGE_BUDGET_MS : cv.CLAIM_VERIFIER_BUDGET_MS,
             startStream: (body, signal) => this.llmHelper.streamChat(...(canReplay
-                ? this.repairCallArgs(opts.turnKey, cv.claimVerifierDraftMessage(body), signal, system)
+                ? this.repairCallArgs(opts.turnKey, cv.claimVerifierDraftMessage(body), signal, system, [], cv.CLAIM_VERIFIER_MATERIAL_MAX_CHARS)
                 : this.repairCallArgs(undefined, cv.claimVerifierStandaloneMessage(opts.material, body), signal, system))) as AsyncGenerator<string>,
             parentSignal: opts.signal,
             isSuperseded: opts.isSuperseded,
@@ -4011,6 +4013,7 @@ export class IntelligenceEngine extends EventEmitter {
                         modeName: _ctx.modeName,
                         attachedSourceCount: _ctx.attachedSourceCount,
                         attachedCorpusTokens: _ctx.attachedCorpusTokens,
+                        profileWhole: _ctx.profileWhole,
                         attachedFileNames: _ctx.attachedFileNames,
                         profileSourceCount: _ctx.profileSourceCount,
                         resolvedProfileSources: _ctx.resolvedProfileSources,
@@ -4426,7 +4429,7 @@ export class IntelligenceEngine extends EventEmitter {
             // provider failure or the runaway cap was still written to the
             // session transcript and usage, and fed to the NEXT turn as
             // prior_assistant_responses evidence.
-            const wtaTruncation = { truncated: false };
+            const wtaTruncation: { truncated: boolean; reason?: string } = { truncated: false };
             const stream = this.whatToAnswerLLM.generateStream(preparedTranscript, temporalContext, intentResult, imagePaths, screenContext, options?.promptInstruction, options?.activeSkill, options?.domContext, candidateProfile || undefined, answerPlan, modeContextPromise, requestSnapshot, whatToAnswerCancellationToken.signal, wtaTruncation);
             let streamAborted = false;
             let emittedStreamingToken = false;
@@ -5139,7 +5142,9 @@ export class IntelligenceEngine extends EventEmitter {
                     if (tail.stripped) { console.log('[IntelligenceEngine] canned tail stripped from the final answer'); fullAnswer = tail.text; }
                 } catch { /* never block the emit */ }
                 // Phase 4 defense-in-depth (forensic-report §6b): carry generationId.
-                this.emit('suggested_answer', fullAnswer, question || extractedQuestion.latestQuestion || 'inferred', confidence, generationId, _c3SourceLabel);
+                // The stop reason rides along so the overlay can say the answer was
+                // cut off (length limit / repetition, 2026-10-04).
+                this.emit('suggested_answer', fullAnswer, question || extractedQuestion.latestQuestion || 'inferred', confidence, generationId, _c3SourceLabel, wtaTruncation.truncated ? wtaTruncation.reason : undefined);
                 this.setMode('idle');
                 return fullAnswer;
             }
@@ -5781,6 +5786,10 @@ export class IntelligenceEngine extends EventEmitter {
                                                 whatToAnswerCancellationToken.signal,
                                                 wtaRepairSystemPrompt,
                                                 ['reference_files'],
+                                                // The whole answer prompt, like the claim pass (E5). At the
+                                                // 24,000 default a turn that read files whole lost their
+                                                // tails here: measured on every repair since E1 (E10).
+                                                (require('./llm/claimVerifier') as typeof import('./llm/claimVerifier')).CLAIM_VERIFIER_MATERIAL_MAX_CHARS,
                                             )
                                         ) as AsyncGenerator<string>,
                                         firstUsefulDeadlineMs: this.repairFirstUsefulMs(7000, whatToAnswerCancellationToken.signal),
@@ -7218,6 +7227,8 @@ export class IntelligenceEngine extends EventEmitter {
         attachedFileNames: string[];
         /** referenceCorpusTokens(files): a small corpus is read whole (see mode-retrieval-port). */
         attachedCorpusTokens: number | null;
+        /** profileWholeInfo(docs): the résumé / JD are handed over whole (see profile-retrieval-port). */
+        profileWhole: { tokens: number; docs: number } | null;
         profileSourceCount: number;
         resolvedProfileSources: Array<{ role: string; id: string }>;
         extraAllowedSourceTypes: string[];
@@ -7260,13 +7271,14 @@ export class IntelligenceEngine extends EventEmitter {
             // site; additive, so a failure degrades to attachments only.
             let profilePort: unknown = null;
             let profileSourceCount = 0;
+            let profileWhole: { tokens: number; docs: number } | null = null;
             let resolvedProfileSources: Array<{ role: string; id: string }> = [];
             try {
                 if (policy.profileSources?.length) {
                     const { collectV3ProfileSources } = require('./services/knowledge/v3ProfileSources');
                     const collected = collectV3ProfileSources(this.llmHelper.getKnowledgeOrchestrator?.() ?? null);
                     if (collected.docs.length) {
-                        const { createProfileRetrievalPort } = require('./context-intelligence/retrieval/profile-retrieval-port');
+                        const { createProfileRetrievalPort, profileWholeInfo } = require('./context-intelligence/retrieval/profile-retrieval-port');
                         // Semantic arm over the documents' raw text (see v3ProfileSources).
                         const { buildProfileRawRetriever } = require('./services/knowledge/v3ProfileSources');
                         const profileRawRetriever = buildProfileRawRetriever(_mm, collected.docs, {
@@ -7282,6 +7294,7 @@ export class IntelligenceEngine extends EventEmitter {
                         });
                         if (profilePort) {
                             profileSourceCount = collected.docs.length;
+                            profileWhole = profileWholeInfo(collected.docs, policy.allowedSourceTypes, policy.profileSources);
                             resolvedProfileSources = collected.resolved;
                         }
                     }
@@ -7355,6 +7368,7 @@ export class IntelligenceEngine extends EventEmitter {
                 attachedSourceCount: _files.length,
                 attachedFileNames: (_files as Array<{ fileName?: string }>).map((f) => f.fileName ?? '').filter(Boolean),
                 attachedCorpusTokens: referenceCorpusTokens(_files as Array<{ content?: string }>),
+                profileWhole,
                 profileSourceCount,
                 resolvedProfileSources,
                 extraAllowedSourceTypes: extraSourceTypes,
@@ -7366,8 +7380,18 @@ export class IntelligenceEngine extends EventEmitter {
                 // section of a composed prompt — it does not substitute for a
                 // source decision, and evidence still comes only from the port.
                 // Speech only, whole lines — see speechWindowForPrompt.
-                conversationWindow: (sec: number) =>
-                    speechWindowForPrompt(String((this.session as any)?.getFormattedContext?.(sec) ?? '')),
+                // From the DURABLE transcript (2026-10-04, E12): the rolling
+                // context is evicted after 180 s and this was asked for 60–90 s
+                // of it, so a line said two minutes ago was already gone. The
+                // caller's `sec` is kept as the fallback for a session object
+                // without the durable reader.
+                conversationWindow: (sec: number) => {
+                    const s: any = this.session;
+                    const formatted = typeof s?.getFormattedSpeech === 'function'
+                        ? s.getFormattedSpeech(SPEECH_WINDOW_SECONDS)
+                        : s?.getFormattedContext?.(sec);
+                    return speechWindowForPrompt(String(formatted ?? ''));
+                },
             };
         } catch { return null; }
     }
@@ -7442,6 +7466,7 @@ export class IntelligenceEngine extends EventEmitter {
                 modeName: ctx.modeName,
                 attachedSourceCount: ctx.attachedSourceCount,
                 attachedCorpusTokens: ctx.attachedCorpusTokens,
+                profileWhole: ctx.profileWhole,
                 attachedFileNames: ctx.attachedFileNames,
                 profileSourceCount: ctx.profileSourceCount,
                 resolvedProfileSources: ctx.resolvedProfileSources,
@@ -7989,6 +8014,7 @@ export class IntelligenceEngine extends EventEmitter {
                         modeName: _ctx.modeName,
                         attachedSourceCount: _ctx.attachedSourceCount,
                         attachedCorpusTokens: _ctx.attachedCorpusTokens,
+                        profileWhole: _ctx.profileWhole,
                         profileSourceCount: _ctx.profileSourceCount,
                         resolvedProfileSources: _ctx.resolvedProfileSources,
                         // See ClassificationInput.inLiveMeeting (task 7b, issue

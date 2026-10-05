@@ -51,6 +51,8 @@ export interface ModeRetrievedChunk {
     anchorScore?: number;
     /** Structural/property answerability boost, same story as above. */
     answerabilityScore?: number;
+    /** Pre-E11 answerability, read by the confidence gate only (see DocumentAnswerabilityScore.gateScore). */
+    answerabilityGateScore?: number;
 }
 
 /**
@@ -340,10 +342,12 @@ const CONF_MIN_QUERY_TOKENS = 3;     // ignore trivially short queries for the "
 // total, well inside the retrieval budget.
 const RERANK_BATCH_SIZE = 6;
 
-function keylessManualRetrievalUsesLexical(): boolean {
+// The July hotfix (keyword-only retrieval while the bundled local embedder is
+// the provider and a meeting is running) can be forced back for every turn:
+// NATIVELY_KEYLESS_LEXICAL_MANUAL_RETRIEVAL=1. See shouldUseLexicalForLocalManualQuery.
+function keylessManualRetrievalForcedLexical(): boolean {
     const raw = String(process.env.NATIVELY_KEYLESS_LEXICAL_MANUAL_RETRIEVAL || '').trim().toLowerCase();
-    if (['0', 'false', 'off', 'disabled', 'no'].includes(raw)) return false;
-    return true;
+    return ['1', 'true', 'on', 'enabled', 'yes'].includes(raw);
 }
 
 // Escape XML special characters in text content
@@ -423,6 +427,8 @@ interface ChunkCandidate {
      */
     rerankScore?: number;
     answerabilityScore?: number;
+    /** Pre-E11 answerability, read by the confidence gate only (see DocumentAnswerabilityScore.gateScore). */
+    answerabilityGateScore?: number;
     /**
      * ANCHOR_BOOST × (coverage of the query's rare terms)² — see
      * lexicalTokens.anchorCoverage. Part of rankScore and of admission; absent
@@ -1312,21 +1318,22 @@ export class ModeHybridRetriever {
      * streaming. Use the existing lexical fallback for manual turns unless the
      * env escape hatch disables this mitigation.
      */
-    private shouldUseLexicalForLocalManualQuery(hasTranscript: boolean, meetingActive?: boolean): boolean {
+    private shouldUseLexicalForLocalManualQuery(hasTranscript: boolean, meetingActive?: boolean, surface?: 'live' | 'manual'): boolean {
         if (hasTranscript) return false;
-        if (!keylessManualRetrievalUsesLexical()) return false;
         const provider = this.embeddingPipeline.getActiveProviderName?.();
         if (provider !== 'local') return false;
         // OUTSIDE A MEETING THE PRESSURE THIS GUARDS AGAINST DOES NOT EXIST
-        // (2026-09-19, owner's decision). The hotfix is about ONNX arena pressure
-        // stacked with local STT and streaming during a live meeting — but under
-        // forceDocumentGrounding `hasTranscript` is always false, so the rule had
-        // swallowed EVERY V3 turn: a key-less user's vectors were built and never
-        // queried. Measured: of 162 questions at 70k tokens the answer chunk
-        // reached the prompt for 149 lexical-only vs 160 with the same MiniLM
-        // vectors. Only an EXPLICIT "no meeting" lifts it; an unknown state keeps
-        // the conservative behaviour.
-        return meetingActive !== false;
+        // (2026-09-19, owner's decision): only an EXPLICIT "no meeting" lifts it.
+        if (meetingActive === false) return false;
+        if (keylessManualRetrievalForcedLexical()) return true;
+        // IN A MEETING (2026-10-04, owner's pick "smart search for typed too"): a
+        // TYPED question queries the vectors. A heard turn keeps the keyword
+        // search it has had since July — with it the confidence gate reads
+        // "low" and the bundled rerank is awaited, which the owner decided on
+        // 2026-10-03 to keep as it is. Lifting the rule for every turn (the
+        // first version of this change) gave heard turns vector scores, the
+        // gate stopped firing, and the rerank stopped running on them.
+        return surface !== 'manual';
     }
 
     /**
@@ -1423,10 +1430,18 @@ export class ModeHybridRetriever {
         // Adding only the positive answerability term never LOWERS a chunk's
         // confidence, so a genuinely weak retrieval still trips the gate. Generic:
         // no document, entity, or question text is special-cased.
+        // THE GATE READS THE PRE-E11 SCORE (2026-10-04). E11 made a named match
+        // worth more in the RANKING; read here, the higher top score satisfied
+        // this gate on most heard turns and the bundled rerank stopped being
+        // awaited (heard pre-dispatch 500 ms → 24 ms on the dev run) — the
+        // opposite of the owner's decision of 2026-10-03 to keep it as it is.
+        // The two best gate scores are taken over the whole list, because the
+        // list is ordered by the new ranking score.
         const scoreOf = (c: ChunkCandidate) =>
-            this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT) + Math.max(0, c.answerabilityScore ?? 0);
-        const topScore = sorted.length > 0 ? scoreOf(sorted[0]) : 0;
-        const secondScore = sorted.length > 1 ? scoreOf(sorted[1]) : 0;
+            this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT) + Math.max(0, c.answerabilityGateScore ?? c.answerabilityScore ?? 0);
+        const gateScores = sorted.map(scoreOf).sort((x, y) => y - x);
+        const topScore = gateScores[0] ?? 0;
+        const secondScore = gateScores[1] ?? 0;
         const margin = topScore - secondScore;
         const clearedCount = sorted.length;
         const reasons: RetrievalConfidence['reasons'] = [];
@@ -1609,6 +1624,8 @@ export class ModeHybridRetriever {
         queryEmbedRetryBudgetMs?: number;
         /** Is a meeting / STT session running? Only an explicit `false` lets the bundled embedder's vectors be queried. */
         meetingActive?: boolean;
+        /** Packer cost per item beyond its text, counted against tokenBudget (E11). */
+        perItemOverheadTokens?: number;
     }): Promise<ModeRetrievedContext> {
         const {
             query,
@@ -1622,6 +1639,7 @@ export class ModeHybridRetriever {
             rerankDeadlineMs,
             rerankPoolMultiplier,
             queryEmbedRetryBudgetMs,
+            perItemOverheadTokens = 0,
         } = params;
         // Unsearchable placeholder files (deep-run 2, issue 12): an image-only
         // PDF's "[Page 1] [Page 2]" extraction is not evidence — served as a
@@ -1712,7 +1730,7 @@ export class ModeHybridRetriever {
 
         let candidates: ChunkCandidate[] = [];
 
-        const usingLexicalForLocalManualQuery = this.shouldUseLexicalForLocalManualQuery(hasTranscript, params.meetingActive);
+        const usingLexicalForLocalManualQuery = this.shouldUseLexicalForLocalManualQuery(hasTranscript, params.meetingActive, rerankSurface);
         let degradedReason: RetrievalDegradedReason | undefined;
 
         const h4StageTrace = process.env.NATIVELY_E2E === '1'
@@ -1895,6 +1913,7 @@ export class ModeHybridRetriever {
                         ? {
                             ...c,
                             answerabilityScore: (c.answerabilityScore ?? 0) + 0.6,
+                            answerabilityGateScore: (c.answerabilityGateScore ?? c.answerabilityScore ?? 0) + 0.6,
                             answerabilityBoosts: [...(c.answerabilityBoosts ?? []), 'positional_locator_match'],
                         }
                         : c));
@@ -1950,6 +1969,7 @@ export class ModeHybridRetriever {
                     return {
                         ...candidate,
                         answerabilityScore: (candidate.answerabilityScore ?? 0) + 1.2,
+                        answerabilityGateScore: (candidate.answerabilityGateScore ?? candidate.answerabilityScore ?? 0) + 1.2,
                         answerabilityBoosts: [...(candidate.answerabilityBoosts ?? []), 'table_of_contents_navigation_match'],
                     };
                 });
@@ -2091,7 +2111,7 @@ export class ModeHybridRetriever {
         // guarantee each file contributes its best chunk so a large dataset can't
         // starve a small one out of the retrieved set.
         const guaranteePerFile = forceDocumentGrounding && files.length > 1;
-        const selected = this.enforceTokenBudget(deduped, tokenBudget, reranked, topK, guaranteePerFile, forceDocumentGrounding);
+        const selected = this.enforceTokenBudget(deduped, tokenBudget, reranked, topK, guaranteePerFile, forceDocumentGrounding, perItemOverheadTokens);
         markH4HybridStage('selection_complete', { chunkCount: selected.length });
 
         // Format output with citations
@@ -2680,6 +2700,7 @@ export class ModeHybridRetriever {
             return {
                 ...c,
                 answerabilityScore: a.score + targetBoost,
+                answerabilityGateScore: a.gateScore + targetBoost,
                 answerabilityBoosts: targetBoost > 0
                     ? [...a.boosts, `target_section:${targetBoost.toFixed(2)}`]
                     : a.boosts,
@@ -2826,7 +2847,7 @@ export class ModeHybridRetriever {
      * Enforce token budget by selecting highest-scoring chunks that fit. When
      * `byRerank` is true, "highest" is the cross-encoder order.
      */
-    private enforceTokenBudget(candidates: ChunkCandidate[], budget: number, byRerank: boolean = false, topK: number = DEFAULT_TOP_K, guaranteePerFile = false, forceDocumentGrounding = false): ChunkCandidate[] {
+    private enforceTokenBudget(candidates: ChunkCandidate[], budget: number, byRerank: boolean = false, topK: number = DEFAULT_TOP_K, guaranteePerFile = false, forceDocumentGrounding = false, perItemOverheadTokens = 0): ChunkCandidate[] {
         const sorted = [...candidates].sort((a, b) => this.rankScore(b, byRerank) - this.rankScore(a, byRerank));
 
         const selected: ChunkCandidate[] = [];
@@ -2834,7 +2855,11 @@ export class ModeHybridRetriever {
         let totalTokens = 0;
         const tryAdd = (candidate: ChunkCandidate): boolean => {
             if (picked.has(candidate)) return false;
-            const tokens = estimateTokens(candidate.text);
+            // What the packer will charge for this item: its text AND its tag
+            // (perItemOverheadTokens, E11). Counting the text alone selected
+            // 1–2 more chunks than the packer could fit; it then dropped the
+            // lowest-ranked ones whole.
+            const tokens = estimateTokens(candidate.text) + perItemOverheadTokens;
             if (totalTokens + tokens > budget && selected.length > 0) return false;
             selected.push(candidate);
             picked.add(candidate);
